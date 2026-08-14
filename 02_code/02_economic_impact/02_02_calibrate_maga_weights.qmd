@@ -1,0 +1,1425 @@
+---
+title: "Calibrate Agricultural Data with MAGA Statistics"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script calibrates the cleaned agricultural data from ENCOVI 2023 to match official MAGA (Ministry of Agriculture) departmental statistics. The calibration aligns weighted totals for cultivated land and maize production with national agricultural census data, enabling representative analysis of white maize farmers across Guatemala.
+
+## Main Operations
+
+1. Load cleaned agricultural data and merge with survey design variables
+2. Define MAGA 2023 departmental targets (production in quintales, land in manzanas)
+3. Apply survey weight calibration
+4. Expand high-weight farmers into multiple records with controlled jitter to smooth distributions
+5. Validate calibrated totals and export final dataset
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Environment setup
+# =============================================================================
+
+# Clean environment
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  haven,          # Manage Stata labels from parquet conversion
+  gt,             # Professional table formatting
+  scales,         # Number formatting (percent, comma)
+  tidyverse       # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to keep namespace clean)
+# janitor  — clean_names() in data loading
+# survey   — calibrate(), svydesign() via 00_functions.R
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(
+  scipen = 999,
+  digits = 4
+)
+
+# Load utility functions from centralized file
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and MAGA Targets
+
+This phase loads the cleaned agricultural dataset from Script 02_01, recovers survey design variables (weights and clusters) from the original ENCOVI household file, and defines MAGA departmental targets for calibration.
+
+## A1. Load Cleaned Agricultural Data
+
+Load the cleaned farmer dataset produced by Script 02_01, covering production, land, inputs, revenue, and demographics for the white maize farmer population. Outliers have been treated and missing values imputed.
+
+Additionally, load the complete agricultural module to calculate the farmer population scaling factor.
+
+```{r}
+#| label: a1-load-data-and-weights
+
+# =============================================================================
+# A1. Load Cleaned Agricultural Data and Recover Survey Weights
+# =============================================================================
+
+# Load cleaned farmer data from Script 02_01
+df_farmers_raw <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "02_01_agricultural_data_clean.parquet")
+)
+
+# Load household data to extract survey weights
+df_hogares_raw <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023",
+       "encovi_2023_hogares.parquet")
+) |>
+  janitor::clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Crop production details (cultivation, harvest, costs, sales)
+df_produccion_raw <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023",
+       "encovi_2023_c16sbc_produccion.parquet")
+) |>
+  janitor::clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Extract and merge survey design variables
+df_farmers_with_weights <- df_farmers_raw |>
+  left_join(
+    df_hogares_raw |>
+      filter(no_hogar %in% df_farmers_raw$no_hogar) |>
+      select(no_hogar, upm, factor),
+    by = "no_hogar"
+  )
+```
+
+## A2. Calculate Farmer Population Scaling Factor
+
+Calculate the scaling factor to align ENCOVI agricultural household estimates with official INE statistics. The reference value of 1,299,377 total agricultural households comes from INE (2011) national agricultural census.
+
+The scaling factor is calculated as the ratio between the INE reference and the ENCOVI weighted total of agricultural households. This factor is then applied to white maize farmer weights, assuming the proportion of maize farmers within agricultural households is correctly represented in ENCOVI.
+
+```{r}
+#| label: a2-calculate-scaling-factor
+
+# =============================================================================
+# A2. Calculate Farmer Population Scaling Factor
+# =============================================================================
+
+# Reference: Total agricultural households in Guatemala (INE 2011)
+total_farmers_ine <- 1299377
+
+# Calculate total agricultural households represented in ENCOVI
+# Using households with any crop production record
+vec_hogares_agricultores <- df_produccion_raw |>
+  distinct(no_hogar) |>
+  pull(no_hogar)
+
+total_farmers_encovi <- df_hogares_raw |>
+  filter(no_hogar %in% vec_hogares_agricultores) |>
+  summarise(total = sum(factor, na.rm = TRUE)) |>
+  pull(total)
+
+# Calculate scaling factor
+farmer_scaling_factor <- total_farmers_ine / total_farmers_encovi
+
+# Clean up
+rm(vec_hogares_agricultores)
+```
+
+```{r}
+#| label: tbl-a2-scaling-factor
+#| tbl-cap: "Farmer Population Scaling Factor Calculation"
+
+# Display scaling factor calculation
+tbl_a2_scaling_factor <- tibble(
+  metric = c(
+    "INE reference (2011)",
+    "ENCOVI weighted total",
+    "Scaling factor"
+  ),
+  value = c(
+    total_farmers_ine,
+    round(total_farmers_encovi, 0),
+    round(farmer_scaling_factor, 4)
+  )
+)
+
+export(
+  tbl_a2_scaling_factor,
+  here("01_data", "02_processed",
+       "web_resources", "02_02_tbl_a2_scaling_factor.rds")
+)
+
+tbl_a2_scaling_factor |>
+  gt() |>
+  tab_header(
+    title = "A2: Farmer Population Scaling Factor",
+    subtitle = "Alignment of ENCOVI estimates with INE agricultural census"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = 1:2,
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = 3,
+    decimals = 4
+  ) |>
+  tab_source_note(
+    source_note = "Source: INE (2011) - Distribución de hogares agropecuarios según tipología"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_a2_scaling_factor)
+```
+
+## A3. Define MAGA Departmental Targets
+
+Define official production and land statistics from MAGA 2023 report. These values serve as calibration targets, so that sample estimates match administrative records.
+
+**Unit conversions:**
+- Production: Reported in quintales (qq), no conversion needed
+- Land: Reported in hectares, converted to manzanas (× 1.43)
+
+**Note:** The original ENCOVI weights underestimate total farmers relative to MAGA records. The scaling factor derived in A2 is applied to initial weights before departmental calibration.
+
+```{r}
+#| label: a3-define-maga-targets
+
+# =============================================================================
+# A3. Define MAGA 2023 Departmental Targets
+# =============================================================================
+
+# MAGA 2023 official statistics by department
+# Source: Ministerio de Agricultura, Ganadería y Alimentación - Guatemala
+df_maga_targets <- tribble(
+  ~departamento,       ~production_maga_qq, ~land_maga_ha,
+  "Petén",             10658141.56,         249313.25,
+  "Alta Verapaz",      5296633.86,          176908.28,
+  "Quiché",            5171701.66,          157146.81,
+  "Huehuetenango",     4023702.90,          109458.73,
+  "Jutiapa",           2646774.92,          60208.71,
+  "Quetzaltenango",    2580710.42,          43563.65,
+  "San Marcos",        2538993.85,          52318.03,
+  "Chiquimula",        1518843.64,          45955.93,
+  "Izabal",            1254753.47,          21059.98,
+  "Retalhuleu",        1129300.16,          20521.54,
+  "Jalapa",            1095142.77,          28181.75,
+  "Chimaltenango",     1065263.63,          24360.32,
+  "Totonicapán",       999140.87,           29534.17,
+  "Santa Rosa",        886464.36,           16133.37,
+  "Guatemala",         816778.30,           20237.32,
+  "Sololá",            810482.59,           17167.60,
+  "Zacapa",            774129.73,           16612.23,
+  "Baja Verapaz",      720541.61,           28135.17,
+  "Suchitepéquez",     555180.22,           8174.39,
+  "Escuintla",         528827.57,           7144.39,
+  "El Progreso",       367087.33,           14184.21,
+  "Sacatepéquez",      321894.92,           8737.65
+) |>
+  mutate(
+    # Convert hectares to manzanas (1 ha = 1.43 mz)
+    land_maga_mz = land_maga_ha * 1.43,
+    # Calculate implied yield (qq/mz)
+    yield_maga = production_maga_qq / land_maga_mz
+  )
+
+# Prepare targets in format required by calibrate_weights_by_group()
+df_calibration_targets <- df_maga_targets |>
+  transmute(
+    departamento,
+    target_total_production = production_maga_qq,
+    target_land_wtcorn = land_maga_mz
+  )
+```
+
+## A4. Create Department Labels and Prepare Data
+
+Convert numeric department codes to labeled factors matching MAGA nomenclature. Apply the calculated scaling factor to align ENCOVI total farmer count with INE estimates before departmental calibration.
+
+```{r}
+#| label: a4-prepare-data-with-labels
+
+# =============================================================================
+# A4. Create Department Labels and Apply Initial Weight Scaling
+# =============================================================================
+
+# Prepare data with labels and scaled weights
+df_farmers_labeled <- df_farmers_with_weights |>
+  mutate(
+    # Create department factor with labels
+    departamento = factor(
+      depto,
+      levels = 1:22,
+      labels = c(
+        "Guatemala", "El Progreso", "Sacatepéquez", "Chimaltenango",
+        "Escuintla", "Santa Rosa", "Sololá", "Totonicapán",
+        "Quetzaltenango", "Suchitepéquez", "Retalhuleu", "San Marcos",
+        "Huehuetenango", "Quiché", "Baja Verapaz", "Alta Verapaz",
+        "Petén", "Izabal", "Zacapa", "Chiquimula", "Jalapa", "Jutiapa"
+      ),
+      ordered = FALSE
+    ),
+    # Apply scaling factor to original weights
+    factor_scaled = factor * farmer_scaling_factor,
+    .after = depto
+  )
+```
+
+## A5. Initial Comparison: ENCOVI vs MAGA
+
+Compare current ENCOVI weighted estimates against MAGA targets before calibration. This diagnostic reveals the magnitude of discrepancies that calibration must correct.
+
+```{r}
+#| label: tbl-a5-encovi-vs-maga
+#| tbl-cap: "Pre-calibration comparison: ENCOVI 2023 weighted estimates vs MAGA 2023 targets"
+
+# =============================================================================
+# A4. Diagnostic Table: ENCOVI vs MAGA Before Calibration
+# =============================================================================
+
+# Calculate weighted totals by department
+df_comparison <- df_farmers_labeled |>
+  summarise(
+    n_farmers = n(),
+    n_farmers_weighted = sum(factor_scaled),
+    production_encovi = sum(total_production * factor_scaled),
+    land_encovi = sum(land_wtcorn * factor_scaled),
+    .by = departamento
+  ) |>
+  left_join(
+    df_maga_targets |> 
+      select(departamento, production_maga_qq, land_maga_mz),
+    by = "departamento"
+  ) |>
+  mutate(
+    ratio_production = production_encovi / production_maga_qq,
+    ratio_land = land_encovi / land_maga_mz
+  ) |>
+  arrange(departamento)
+
+# Generate comparison table
+export(
+  df_comparison,
+  here("01_data", "02_processed",
+       "web_resources", "02_02_tbl_a5_encovi_vs_maga.rds")
+)
+
+df_comparison |>
+  select(
+    departamento, n_farmers,
+    production_encovi, production_maga_qq, ratio_production,
+    land_encovi, land_maga_mz, ratio_land
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Pre-Calibration: ENCOVI vs MAGA Comparison",
+    subtitle = "Weighted estimates before departmental calibration"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers = "N (sample)",
+    production_encovi = "ENCOVI",
+    production_maga_qq = "MAGA",
+    ratio_production = "Ratio",
+    land_encovi = "ENCOVI",
+    land_maga_mz = "MAGA",
+    ratio_land = "Ratio"
+  ) |>
+  tab_spanner(
+    label = "Production (qq)",
+    columns = c(production_encovi, production_maga_qq, ratio_production)
+  ) |>
+  tab_spanner(
+    label = "Land (mz)",
+    columns = c(land_encovi, land_maga_mz, ratio_land)
+  ) |>
+  fmt_number(
+    columns = c(production_encovi, production_maga_qq, land_encovi, land_maga_mz),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(ratio_production, ratio_land),
+    decimals = 2
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  tab_style(
+    style = cell_fill(color = "#FFCCCC"),
+    locations = cells_body(
+      columns = ratio_production,
+      rows = ratio_production < 0.5 | ratio_production > 2.0
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCCCC"),
+    locations = cells_body(
+      columns = ratio_land,
+      rows = ratio_land < 0.5 | ratio_land > 2.0
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_farmers, production_encovi, production_maga_qq, 
+                land_encovi, land_maga_mz),
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Ratio** = ENCOVI / MAGA. Values far from 1.0 indicate large discrepancies requiring calibration.<br>
+                      Red highlight: ratio < 0.5 or > 2.0")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(df_comparison)
+```
+
+---
+
+# Phase B: Weight Calibration to MAGA Targets
+
+This phase applies survey weight calibration to adjust farmer weights so that weighted totals for production and land match MAGA departmental statistics. The calibration preserves individual farmer characteristics while producing nationally representative aggregates.
+
+## B1. Apply Weight Calibration by Department
+
+Apply `calibrate_weights_by_group()` to calibrate survey weights so that weighted totals for production (`total_production`) and cultivated land (`land_wtcorn`) match MAGA departmental statistics. The function uses linear calibration with an intercept constraint to preserve the weighted number of farmers per department.
+
+```{r}
+#| label: b1-apply-calibration
+
+# =============================================================================
+# B1. Apply Weight Calibration to Match MAGA Targets
+# =============================================================================
+
+df_farmers_calibrated <- calibrate_weights_by_group(
+  df = df_farmers_labeled,
+  group_var = "departamento",
+  id_var = "no_hogar",
+  weight_var = "factor_scaled",
+  calibration_vars = c("total_production", "land_wtcorn"),
+  df_targets = df_calibration_targets,
+  preserve_total = TRUE
+)
+```
+
+## B2. Validate Calibration Results
+
+Verify that weighted totals after calibration match MAGA departmental targets. A successful calibration should produce ratios very close to 1.0 for both production and land across all departments.
+
+```{r}
+#| label: tbl-b2-calibration-validation
+#| tbl-cap: "Post-calibration validation: Calibrated ENCOVI estimates vs MAGA targets"
+
+# =============================================================================
+# B2. Validate Calibration: Compare Calibrated Totals vs MAGA Targets
+# =============================================================================
+
+# Calculate calibrated weighted totals by department
+df_validation <- df_farmers_calibrated |>
+  summarise(
+    n_farmers = n(),
+    production_calibrated = sum(total_production * weight_calibrated),
+    land_calibrated = sum(land_wtcorn * weight_calibrated),
+    .by = departamento
+  ) |>
+  left_join(
+    df_maga_targets |> 
+      select(departamento, production_maga_qq, land_maga_mz),
+    by = "departamento"
+  ) |>
+  mutate(
+    ratio_production = production_calibrated / production_maga_qq,
+    ratio_land = land_calibrated / land_maga_mz,
+    diff_production_pct = (ratio_production - 1) * 100,
+    diff_land_pct = (ratio_land - 1) * 100
+  ) |>
+  arrange(departamento)
+
+# Generate validation table
+export(
+  df_validation,
+  here("01_data", "02_processed",
+       "web_resources", "02_02_tbl_b2_calibration_validation.rds")
+)
+
+df_validation |>
+  select(
+    departamento, n_farmers,
+    production_calibrated, production_maga_qq, ratio_production,
+    land_calibrated, land_maga_mz, ratio_land
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Post-Calibration Validation: ENCOVI vs MAGA",
+    subtitle = "Calibrated weighted estimates should match MAGA targets (ratio ≈ 1.00)"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers = "N (sample)",
+    production_calibrated = "Calibrated",
+    production_maga_qq = "MAGA",
+    ratio_production = "Ratio",
+    land_calibrated = "Calibrated",
+    land_maga_mz = "MAGA",
+    ratio_land = "Ratio"
+  ) |>
+  tab_spanner(
+    label = "Production (qq)",
+    columns = c(production_calibrated, production_maga_qq, ratio_production)
+  ) |>
+  tab_spanner(
+    label = "Land (mz)",
+    columns = c(land_calibrated, land_maga_mz, ratio_land)
+  ) |>
+  fmt_number(
+    columns = c(production_calibrated, production_maga_qq, 
+                land_calibrated, land_maga_mz),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(ratio_production, ratio_land),
+    decimals = 4
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = c(ratio_production, ratio_land),
+      rows = abs(ratio_production - 1) < 0.001 & abs(ratio_land - 1) < 0.001
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_farmers, production_calibrated, production_maga_qq,
+                land_calibrated, land_maga_mz),
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Ratio** = Calibrated / MAGA. Values of 1.0000 confirm exact calibration.<br>
+                      Green highlight: both ratios within ±0.1% of target.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(df_validation)
+```
+
+---
+
+# Phase C: Expansion with Controlled Jitter
+
+Calibration adjusts weights while keeping one record per farmer. Where individual weights are very large, the cumulative distribution advances in steps, and the cutpoints of threshold-based segmentation can fall on those steps.
+
+This phase splits farmers with high calibrated weights into multiple records with redistributed weights and controlled jitter on continuous variables, producing smoother distributions while maintaining correct weighted totals.
+
+## C1. Calibration Diagnostics and Weight Distribution
+
+Before applying expansion, we diagnose the calibrated weight distribution to quantify the concentration of weight. Key metrics include the coefficient of variation (CV), design effect (DEFF), and the proportion of farmers with extreme adjustment ratios. High-weight farmers are identified as candidates for expansion.
+
+**Expansion parameters:**
+- **Threshold**: 500 (farmers with weight > 500 will be expanded)
+- **Target weight**: 100 (each expanded record will have approximately this weight)
+
+```{r}
+#| label: c1-weight-diagnostics
+
+# =============================================================================
+# C1. Calculate Weight Diagnostics and Define Expansion Parameters
+# =============================================================================
+
+# Calculate adjustment ratio (calibrated / original)
+df_farmers_calibrated <- df_farmers_calibrated |>
+  mutate(
+    weight_ratio = weight_calibrated / factor_scaled
+  )
+
+# --- Diagnostic metrics ---
+cv_initial <- sd(df_farmers_calibrated$factor_scaled) / mean(df_farmers_calibrated$factor_scaled)
+cv_calibrated <- sd(df_farmers_calibrated$weight_calibrated) / mean(df_farmers_calibrated$weight_calibrated)
+deff_calibrated <- 1 + cv_calibrated^2
+
+# Extreme ratio counts
+n_ratio_low <- sum(df_farmers_calibrated$weight_ratio < 0.3)
+n_ratio_high <- sum(df_farmers_calibrated$weight_ratio > 3.0)
+
+# --- Expansion parameters ---
+expansion_threshold <- 500
+target_weight_per_record <- 100
+
+# Calculate expansion needs
+df_farmers_calibrated <- df_farmers_calibrated |>
+  mutate(
+    needs_expansion = weight_calibrated > expansion_threshold,
+    n_copies = if_else(needs_expansion, 
+                       ceiling(weight_calibrated / target_weight_per_record), 
+                       1L),
+    weight_per_copy = weight_calibrated / n_copies
+  )
+
+# Expansion summary
+n_to_expand <- sum(df_farmers_calibrated$needs_expansion)
+n_final_records <- sum(df_farmers_calibrated$n_copies)
+expansion_factor <- n_final_records / nrow(df_farmers_calibrated)
+```
+
+```{r}
+#| label: tbl-c1-calibration-diagnostics
+#| tbl-cap: "Calibration diagnostics and expansion parameters"
+
+# =============================================================================
+# C1. Diagnostic Summary Table
+# =============================================================================
+
+df_diagnostics <- tibble(
+  Metric = c(
+    "Weight CV (initial)",
+    "Weight CV (calibrated)",
+    "Design Effect (DEFF)",
+    "Adjustment ratio range",
+    "Ratios < 0.3 (extreme low)",
+    "Ratios > 3.0 (extreme high)",
+    "Expansion threshold",
+    "Target weight per record",
+    "Farmers to expand",
+    "Final record count"
+  ),
+  Value = c(
+    percent(cv_initial, accuracy = 0.1),
+    percent(cv_calibrated, accuracy = 0.1),
+    round(deff_calibrated, 3),
+    paste0("[", round(min(df_farmers_calibrated$weight_ratio), 2), ", ",
+           round(max(df_farmers_calibrated$weight_ratio), 2), "]"),
+    paste0(n_ratio_low, " (", round(n_ratio_low / nrow(df_farmers_calibrated) * 100, 1), "%)"),
+    paste0(n_ratio_high, " (", round(n_ratio_high / nrow(df_farmers_calibrated) * 100, 1), "%)"),
+    comma(expansion_threshold),
+    comma(target_weight_per_record),
+    paste0(n_to_expand, " (", round(n_to_expand / nrow(df_farmers_calibrated) * 100, 1), "%)"),
+    paste0(comma(n_final_records), " (", round(expansion_factor, 2), "x expansion)")
+  ),
+  Threshold = c(
+    "—",
+    "—",
+    "< 2.0",
+    "[0.3, 3.0]",
+    "< 10%",
+    "< 10%",
+    "—",
+    "—",
+    "—",
+    "—"
+  ),
+  Status = c(
+    "—",
+    "—",
+    if_else(deff_calibrated < 2, "✓ Pass", "Warning"),
+    if_else(min(df_farmers_calibrated$weight_ratio) >= 0.1 &
+            max(df_farmers_calibrated$weight_ratio) <= 10,
+            "✓ Acceptable", "Warning"),
+    if_else(n_ratio_low / nrow(df_farmers_calibrated) < 0.1, "✓ Pass", "Warning"),
+    if_else(n_ratio_high / nrow(df_farmers_calibrated) < 0.1, "✓ Pass", "Warning"),
+    "—",
+    "—",
+    "—",
+    "—"
+  )
+)
+
+export(
+  df_diagnostics,
+  here("01_data", "02_processed",
+       "web_resources", "02_02_tbl_c1_calibration_diagnostics.rds")
+)
+
+df_diagnostics |>
+  gt() |>
+  tab_header(
+    title = "Calibration Diagnostics and Expansion Plan",
+    subtitle = "Weight validation metrics and jitter expansion parameters"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "center", columns = c(Value, Threshold, Status)) |>
+  tab_row_group(label = "Expansion Parameters", rows = 7:10) |>
+  tab_row_group(label = "Calibration Metrics", rows = 1:6) |>
+  row_group_order(groups = c("Calibration Metrics", "Expansion Parameters")) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = str_detect(Status, "Pass"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3E0"),
+    locations = cells_body(rows = str_detect(Status, "Warning"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = Metric %in% c("Expansion threshold", "Target weight per record",
+                                                 "Farmers to expand", "Final record count"))
+  ) |>
+  tab_source_note(
+    source_note = md("**DEFF** = Design Effect (1 + CV²). Values > 2 indicate efficiency loss.<br>
+                      **Blue rows**: Expansion parameters to smooth distribution steps.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.weight = "bold"
+  )
+```
+
+```{r}
+#| label: fig-c1-weight-distribution
+#| fig-cap: "Distribution of calibrated weights with expansion threshold"
+#| fig-width: 10
+#| fig-height: 6
+
+# =============================================================================
+# C1. Weight Distribution Histogram
+# =============================================================================
+
+export(
+  df_farmers_calibrated,
+  here("01_data", "02_processed",
+       "web_resources", "02_02_fig_c1_weight_distribution.rds")
+)
+
+ggplot(df_farmers_calibrated, aes(x = weight_calibrated)) +
+  geom_histogram(
+    bins = 50,
+    fill = "#3E7CB1",
+    alpha = 0.3,
+    color = "white"
+  ) +
+  geom_vline(
+    xintercept = expansion_threshold,
+    linetype = "dashed",
+    color = "#3AAF85",
+    linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = expansion_threshold,
+    y = Inf,
+    label = paste0("Expansion threshold: ", comma(expansion_threshold)),
+    vjust = 2,
+    hjust = -0.05,
+    color = "#3AAF85",
+    size = 3.5
+  ) +
+  annotate(
+    "text",
+    x = max(df_farmers_calibrated$weight_calibrated) * 0.7,
+    y = Inf,
+    label = paste0(n_to_expand, " farmers (", round(n_to_expand/nrow(df_farmers_calibrated)*100, 1), 
+                   "%) will be\nexpanded to ", comma(n_final_records), " records"),
+    vjust = 3,
+    hjust = 0.5,
+    color = "#2C3E50",
+    size = 3.5
+  ) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Calibrated Weights",
+    subtitle = paste0("Farmers with weight > ", comma(expansion_threshold), 
+                      " will be split into multiple records with target weight ≈ ", 
+                      comma(target_weight_per_record)),
+    x = "Calibrated Weight",
+    y = "Number of Farmers"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "#2C3E50"),
+    plot.subtitle = element_text(size = 10, color = "#566573"),
+    axis.title = element_text(size = 10, color = "#2C3E50"),
+    axis.text = element_text(size = 9, color = "#2C3E50")
+  )
+```
+
+```{r}
+#| label: c1-cleanup
+
+# =============================================================================
+# C1. Cleanup Auxiliary Variables
+# =============================================================================
+
+rm(df_diagnostics,
+   cv_initial, cv_calibrated, deff_calibrated,
+   n_ratio_low, n_ratio_high,
+   n_to_expand, n_final_records, expansion_factor)
+```
+
+## C2. Expand High-Weight Farmers into Multiple Records
+
+For each farmer with calibrated weight > 500, create multiple copies based on `n_copies` calculated in C1. Each copy receives an equal share of the original weight (`weight_per_copy`). A unique `farmer_id` is assigned for traceability, preserving the original `no_hogar` to track the source household.
+
+```{r}
+#| label: c2-expand-records
+
+# =============================================================================
+# C2. Expand High-Weight Farmers into Multiple Records
+# =============================================================================
+
+# Store n_copies before uncount (which removes the column)
+df_farmers_expanded <- df_farmers_calibrated |>
+  # Preserve n_copies in a temporary column that survives uncount
+  mutate(n_copies_original = n_copies) |>
+  # Create row indices for expansion
+
+  uncount(weights = n_copies, .id = "copy_id") |>
+  # Assign new identifiers and weights
+  mutate(
+    # Unique identifier for each record (original household + copy number)
+    farmer_id = paste0(no_hogar, "_", copy_id),
+    # Redistribute weight equally across copies
+    weight_expanded = weight_calibrated / n_copies_original,
+    .after = no_hogar
+  ) |>
+  # Rename back for clarity
+  rename(n_copies = n_copies_original)
+```
+
+## C3. Apply Controlled Jitter to Base Variables
+
+Apply controlled jitter only to the base variables most relevant for calibration and segmentation. Records with `copy_id == 1` (first copy or non-expanded farmers) retain original values to preserve at least one exact reference per household.
+
+**Variables to jitter (base only):**
+- `qty_sold_qq`, `qty_household_qq`, `qty_animal_seed_qq`: Destination quantities
+- `total_production`: Recalculated as sum of destination quantities after jitter
+- `land_wtcorn`: Cultivated land 
+- `exp_seeds`: Seed expenditure
+- `revenue`: Sales revenue
+- `farmer_age`: Farmer age
+
+**Jitter parameters:**
+- Intensity: 3% of variable's standard deviation
+- Bounds: Non-negative values enforced; structural zeros preserved
+- Domain floor: `land_wtcorn` is bounded below by the observed minimum in the original data to prevent extreme yield ratios from near-zero denominators
+- Allocation coherence: `total_production` derived from jittered quantities, not jittered independently
+
+```{r}
+#| label: c3-apply-jitter
+
+# =============================================================================
+# C3. Apply Controlled Jitter to Base Variables Only
+# Jitter destination quantities first, then derive total_production
+# =============================================================================
+
+# Define base variables to jitter directly
+vars_base_jitter <- c(
+  "qty_sold_qq",
+  "qty_household_qq", 
+  "qty_animal_seed_qq",
+  "land_wtcorn",
+  "exp_seeds",
+  "revenue",
+  "farmer_age",
+  "price_per_qq"
+)
+
+# Domain floor for land_wtcorn: no jittered value below observed minimum.
+min_land_original <- min(
+  df_farmers_expanded$land_wtcorn[df_farmers_expanded$copy_id == 1],
+  na.rm = TRUE
+)
+
+# Seed for traceability
+set.seed(789)
+
+# Apply jitter only to copy_id > 1 (preserve original values for first copy).
+df_farmers_jittered <- df_farmers_expanded |>
+  mutate(
+    across(
+      all_of(vars_base_jitter),
+      ~ if_else(
+        copy_id > 1,
+        . + rnorm(n(), mean = 0, sd = sd(., na.rm = TRUE) * 0.03),
+        .
+      )
+    )
+  ) |>
+  # Enforce non-negativity
+  mutate(
+    across(
+      all_of(vars_base_jitter),
+      ~ pmax(., 0)
+    )
+  ) |>
+  # Enforce domain floor for land_wtcorn
+  mutate(
+    land_wtcorn = pmax(land_wtcorn, min_land_original)
+  ) |>
+  # Recalculate total_production as sum of destination quantities
+  mutate(
+    total_production = qty_sold_qq + qty_household_qq + qty_animal_seed_qq
+  )
+
+# Clean up
+rm(min_land_original)
+```
+
+## C4. Recalculate Derived Variables
+
+After applying jitter to base variables, recalculate all derived variables to maintain internal consistency. This follows the same logic as Script 02_01, so that ratios, percentages, and aggregates reflect the jittered base values.
+
+**Key considerations:**
+- `is_seller` is preserved (not recalculated)
+- Price and gain variables remain NA for non-sellers (undefined without transaction)
+- Allocation percentages are normalized to sum to 1
+- `land_wtcorn` is adjusted upward where the jittered yield would exceed the agronomic plausibility cap (160 qq/mz). The adjustment adds a small random increment (5% intensity) above the minimum required land to avoid a hard distributional step at the cap boundary.
+
+```{r}
+#| label: c4-recalculate-derived
+
+# =============================================================================
+# C4. Recalculate Derived Variables from Jittered Base Variables
+# =============================================================================
+
+set.seed(789)
+df_farmers_recalculated <- df_farmers_jittered |>
+
+  # -------------------------------------------------------------------------
+  # Step 1: Normalize allocation quantities so they sum to total_production
+  # -------------------------------------------------------------------------
+  mutate(
+    sum_destinations = qty_sold_qq + qty_household_qq + qty_animal_seed_qq,
+    
+    prop_sold = if_else(sum_destinations > 0, 
+                        qty_sold_qq / sum_destinations, 0),
+    prop_household = if_else(sum_destinations > 0, 
+                             qty_household_qq / sum_destinations, 0),
+    prop_animal_seed = if_else(sum_destinations > 0, 
+                               qty_animal_seed_qq / sum_destinations, 0),
+    
+    qty_sold_qq = prop_sold * total_production,
+    qty_household_qq = prop_household * total_production,
+    qty_animal_seed_qq = total_production - qty_sold_qq - qty_household_qq,
+    qty_animal_seed_qq = pmax(qty_animal_seed_qq, 0)
+  ) |>
+  select(-sum_destinations, -prop_sold, -prop_household, -prop_animal_seed) |>
+
+  # -------------------------------------------------------------------------
+  # Step 2: Yield domain cap — adjust land_wtcorn where jitter produced
+  # biologically implausible yields (> 160 qq/mz).
+  # -------------------------------------------------------------------------
+  mutate(
+    land_floor_at_cap = total_production / 160,
+    land_wtcorn = if_else(
+      land_wtcorn > 0 & total_production / land_wtcorn > 160,
+      land_floor_at_cap + land_floor_at_cap * runif(n(), min = 0, max = 0.05),
+      land_wtcorn
+    
+  )) |>
+  select(-land_floor_at_cap) |>
+
+  # -------------------------------------------------------------------------
+  # Step 3: Production metrics
+  # -------------------------------------------------------------------------
+  mutate(
+    yield_wtcorn_qq = if_else(
+      land_wtcorn > 0,
+      total_production / land_wtcorn,
+      NA_real_
+    ),
+    land_wtcorn_annual = land_wtcorn * n_harvests_total,
+    yield_wtcorn_annual = if_else(
+      land_wtcorn_annual > 0,
+      total_production / land_wtcorn_annual,
+      0
+    )
+  ) |>
+
+  # -------------------------------------------------------------------------
+  # Step 4: Expenditure aggregates and rates
+  # -------------------------------------------------------------------------
+  mutate(
+    exp_fertilizers = exp_fert_chemical + exp_fert_organic,
+    exp_non_seed = exp_fert_chemical + exp_fert_organic + exp_pesticides +
+                   exp_packaging + exp_transport + exp_labor +
+                   exp_machinery_maint + exp_machinery_rental +
+                   exp_animal_rental + exp_fuel + exp_land_rental + exp_other,
+    exp_total = exp_seeds + exp_non_seed,
+    
+    # Per physical manzana rates
+    exp_seeds_per_mz = if_else(land_wtcorn > 0, 
+                               exp_seeds / land_wtcorn, NA_real_),
+    exp_non_seed_per_mz = if_else(land_wtcorn > 0, 
+                                  exp_non_seed / land_wtcorn, NA_real_),
+    exp_total_per_mz = if_else(land_wtcorn > 0, 
+                               exp_total / land_wtcorn, NA_real_),
+    
+    # Per annual cultivated manzana rates
+    exp_seeds_per_mz_annual = if_else(land_wtcorn_annual > 0, 
+                                      exp_seeds / land_wtcorn_annual, 0),
+    exp_non_seed_per_mz_annual = if_else(land_wtcorn_annual > 0, 
+                                         exp_non_seed / land_wtcorn_annual, 0),
+    exp_total_per_mz_annual = if_else(land_wtcorn_annual > 0, 
+                                      exp_total / land_wtcorn_annual, 0),
+    
+    # Binary indicators
+    use_seeds = as.integer(exp_seeds > 0),
+    use_fertilizers = as.integer(exp_fertilizers > 0),
+    use_pesticides = as.integer(exp_pesticides > 0)
+  ) |>
+
+  # -------------------------------------------------------------------------
+  # Step 5: Revenue and consumption metrics
+  # -------------------------------------------------------------------------
+  mutate(
+    qty_retained_qq = qty_household_qq + qty_animal_seed_qq,
+    value_self_consumption_total = value_household + value_animal_seed,
+    value_total_economic = revenue + value_self_consumption_total,
+    
+    # Solo asegurar NA para non-sellers (el jitter puede haber introducido valores)
+    price_per_qq = if_else(is_seller == 0, NA_real_, price_per_qq),
+    
+    # Allocation percentages
+    pct_sold = if_else(total_production > 0, qty_sold_qq / total_production, 0),
+    pct_household = if_else(total_production > 0, qty_household_qq / total_production, 0),
+    pct_animal_seed = if_else(total_production > 0, qty_animal_seed_qq / total_production, 0),
+    pct_retained = pct_household + pct_animal_seed,
+    
+    has_household_consumption = as.integer(value_household > 0),
+    has_animal_seed_use = as.integer(value_animal_seed > 0)
+  ) |>
+
+  # -------------------------------------------------------------------------
+  # Step 6: Household composition
+  # -------------------------------------------------------------------------
+  mutate(
+    pct_male = if_else(hh_size > 0, n_male / hh_size, NA_real_)
+  ) |>
+
+  # -------------------------------------------------------------------------
+  # Step 7: Economic gain metrics
+  # -------------------------------------------------------------------------
+  mutate(
+    exp_total_sold = exp_total * pct_sold,
+    
+    # Gain metrics calculated from price_per_qq
+    gain_per_qq_with_cost = if_else(
+      is_seller == 1 & !is.na(price_per_qq),
+      price_per_qq - (exp_total_sold / qty_sold_qq),
+      NA_real_
+    ),
+    
+    gain_per_qq_no_cost = if_else(
+      is_seller == 1 & !is.na(price_per_qq),
+      price_per_qq,
+      NA_real_
+    )
+  ) |>
+
+  # -------------------------------------------------------------------------
+  # Step 8: Final winsorization - Cap derived ratios at domain limits
+  # -------------------------------------------------------------------------
+  mutate(
+    exp_seeds_per_mz = pmin(exp_seeds_per_mz, 5000),
+    exp_seeds_per_mz_annual = pmin(exp_seeds_per_mz_annual, 5000)
+  )
+```
+
+## C5. Convert Structural NAs to Zero
+
+Convert NAs that represent "no activity" to explicit zeros. These occur when denominators are zero (e.g., yield when land = 0).
+
+**Note:** Price and gain variables remain NA for non-sellers—these represent undefined values (no transaction occurred), not missing data.
+
+```{r}
+#| label: c5-structural-nas
+
+# =============================================================================
+# C5. Convert Structural NAs to Explicit Zeros
+# Note: price/gain remain NA for non-sellers (undefined, not zero)
+# =============================================================================
+
+df_farmers_clean <- df_farmers_recalculated |>
+  mutate(
+    # Yield when no land
+    yield_wtcorn_qq = if_else(is.na(yield_wtcorn_qq) & land_wtcorn == 0, 
+                              0, yield_wtcorn_qq),
+    
+    # Expenditure rates when no land
+    exp_seeds_per_mz = if_else(is.na(exp_seeds_per_mz) & land_wtcorn == 0, 
+                               0, exp_seeds_per_mz),
+    exp_non_seed_per_mz = if_else(is.na(exp_non_seed_per_mz) & land_wtcorn == 0, 
+                                  0, exp_non_seed_per_mz),
+    exp_total_per_mz = if_else(is.na(exp_total_per_mz) & land_wtcorn == 0, 
+                               0, exp_total_per_mz),
+    
+    # Household composition when no members
+    pct_male = if_else(is.na(pct_male) & hh_size == 0, 0, pct_male)
+    
+  )
+```
+
+## C6. Re-calibrate Weights to MAGA Targets
+
+Apply a second calibration pass to correct the small bias introduced by jitter truncation.
+
+```{r}
+#| label: c6-recalibrate-post-jitter
+
+# =============================================================================
+# C6. Re-calibrate Weights After Jitter
+# =============================================================================
+
+df_farmers_final <- calibrate_weights_by_group(
+  df = df_farmers_clean,
+  group_var = "departamento",
+  id_var = "farmer_id",
+  weight_var = "weight_expanded",
+  calibration_vars = c("total_production", "land_wtcorn"),
+  df_targets = df_calibration_targets,
+  preserve_total = TRUE
+)
+```
+
+```{r}
+#| label: c-cleanup
+
+# =============================================================================
+# C. Cleanup Auxiliary Variables from Phase C
+# =============================================================================
+
+rm(vars_base_jitter, expansion_threshold, target_weight_per_record)
+```
+
+---
+
+# Phase D: Validation and Export
+
+Final validation of the calibrated and expanded agricultural dataset. This phase confirms that weighted totals match MAGA targets and documents the transformation from the original farmers to the smoothed records ready for segmentation modeling.
+
+## D1. Final Validation: Calibrated Totals vs MAGA
+
+Confirm that the final expanded dataset produces weighted totals matching MAGA departmental statistics.
+
+```{r}
+#| label: tbl-d1-final-validation
+#| tbl-cap: "Final validation: Expanded dataset weighted totals vs MAGA targets"
+
+# =============================================================================
+# D1. Final Validation Table
+# =============================================================================
+
+# Calculate final weighted totals by department
+df_final_validation <- df_farmers_final |>
+  summarise(
+    n_records = n(),
+    n_households = n_distinct(no_hogar),
+    n_farmers_weighted = sum(weight_calibrated),
+    production_final = sum(total_production * weight_calibrated),
+    land_final = sum(land_wtcorn * weight_calibrated),
+    .by = departamento
+  ) |>
+  left_join(
+    df_maga_targets |> 
+      select(departamento, production_maga_qq, land_maga_mz),
+    by = "departamento"
+  ) |>
+  mutate(
+    ratio_production = production_final / production_maga_qq,
+    ratio_land = land_final / land_maga_mz
+  ) |>
+  arrange(departamento)
+
+# Generate validation table
+export(
+  df_final_validation,
+  here("01_data", "02_processed",
+       "web_resources", "02_02_tbl_d1_final_validation.rds")
+)
+
+df_final_validation |>
+  select(
+    departamento, n_records, n_households, n_farmers_weighted,
+    production_final, production_maga_qq, ratio_production,
+    land_final, land_maga_mz, ratio_land
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Final Validation: Expanded Dataset vs MAGA Targets",
+    subtitle = "Weighted totals after expansion and re-calibration"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_records = "Records",
+    n_households = "Households",
+    n_farmers_weighted = "Farmers",
+    production_final = "Final",
+    production_maga_qq = "MAGA",
+    ratio_production = "Ratio",
+    land_final = "Final",
+    land_maga_mz = "MAGA",
+    ratio_land = "Ratio"
+  ) |>
+  tab_spanner(
+    label = "Sample",
+    columns = c(n_records, n_households, n_farmers_weighted)
+  ) |>
+  tab_spanner(
+    label = "Production (qq)",
+    columns = c(production_final, production_maga_qq, ratio_production)
+  ) |>
+  tab_spanner(
+    label = "Land (mz)",
+    columns = c(land_final, land_maga_mz, ratio_land)
+  ) |>
+  fmt_number(
+    columns = c(production_final, production_maga_qq, land_final, land_maga_mz,
+                n_farmers_weighted),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(ratio_production, ratio_land),
+    decimals = 4
+  ) |>
+  fmt_number(
+    columns = c(n_records, n_households),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = c(ratio_production, ratio_land),
+      rows = abs(ratio_production - 1) < 0.0001 & abs(ratio_land - 1) < 0.0001
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_records, n_households, n_farmers_weighted, 
+                production_final, production_maga_qq,
+                land_final, land_maga_mz),
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Ratio** = Final / MAGA. Values of 1.0000 confirm exact calibration.<br>
+                      **Farmers** = Weighted total of white maize farmers represented.<br>
+                      Green highlight: both ratios within ±0.01% of target.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_final_validation)
+```
+
+## D2. Dataset Transformation Summary
+
+Summary of the complete transformation pipeline from raw ENCOVI data to calibrated, expanded dataset ready for segmentation modeling.
+
+```{r}
+#| label: tbl-d2-transformation-summary
+#| tbl-cap: "Dataset transformation summary: From ENCOVI to calibrated expanded dataset"
+
+# =============================================================================
+# D2. Transformation Summary Table
+# =============================================================================
+
+df_transformation <- tibble(
+  Stage = c(
+    "A. Input data (02_01 output)",
+    "B. Weight calibration (MAGA)",
+    "C. Record expansion",
+    "C. Jitter application",
+    "C. Re-calibration",
+    "D. Final output"
+  ),
+  Records = c(
+    comma(nrow(df_farmers_labeled)),
+    comma(nrow(df_farmers_calibrated)),
+    comma(nrow(df_farmers_expanded)),
+    comma(nrow(df_farmers_jittered)),
+    comma(nrow(df_farmers_final)),
+    comma(nrow(df_farmers_final))
+  ),
+  `Weight Range` = c(
+    paste0("[", round(min(df_farmers_labeled$factor_scaled), 0), ", ", 
+           round(max(df_farmers_labeled$factor_scaled), 0), "]"),
+    paste0("[", round(min(df_farmers_calibrated$weight_calibrated), 0), ", ", 
+           round(max(df_farmers_calibrated$weight_calibrated), 0), "]"),
+    paste0("[", round(min(df_farmers_expanded$weight_expanded), 0), ", ", 
+           round(max(df_farmers_expanded$weight_expanded), 0), "]"),
+    "—",
+    paste0("[", round(min(df_farmers_final$weight_calibrated), 0), ", ", 
+           round(max(df_farmers_final$weight_calibrated), 0), "]"),
+    paste0("[", round(min(df_farmers_final$weight_calibrated), 0), ", ", 
+           round(max(df_farmers_final$weight_calibrated), 0), "]")
+  ),
+  Description = c(
+    # Scaling factor read from A2 so the description tracks the computed value
+    paste0("Cleaned farmers from Script 02_01 with scaled ENCOVI weights (×",
+           round(farmer_scaling_factor, 2), ")"),
+    "Weights adjusted to match MAGA production and land totals by department",
+    paste0("High-weight farmers (>500) split into multiple records (target weight ≈100)"),
+    "3% SD jitter applied to base variables; derived variables recalculated",
+    "Second calibration pass to correct jitter-induced bias (~1%)",
+    "Final dataset ready for segmentation modeling"
+  )
+)
+
+export(
+  df_transformation,
+  here("01_data", "02_processed",
+       "web_resources", "02_02_tbl_d2_transformation_summary.rds")
+)
+
+df_transformation |>
+  gt() |>
+  tab_header(
+    title = "Dataset Transformation Pipeline",
+    subtitle = "From ENCOVI sample to MAGA-calibrated expanded dataset"
+  ) |>
+  cols_align(align = "left", columns = c(Stage, Description)) |>
+  cols_align(align = "right", columns = c(Records, `Weight Range`)) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = Stage == "D. Final output")
+  ) |>
+  tab_source_note(
+    source_note = md("**Expansion factor**: 4.44× (1,199 → 5,323 records)<br>
+                      **Max weight reduction**: 7,170 → 499 (93% reduction)")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary
+rm(df_transformation)
+```
+
+## D3. Export Calibrated Dataset
+
+Export the final calibrated and expanded dataset for use in subsequent scripts (02_03 farmer segmentation, adoption modeling).
+
+```{r}
+#| label: d3-export
+
+# =============================================================================
+# D3. Export Final Dataset
+# =============================================================================
+
+write_parquet(
+  df_farmers_final,
+  here("01_data", "02_processed", 
+       "transfer", "02_02_agricultural_data_maga_calibrated.parquet")
+)
+```
+
+# Notes
+
+## Processing Summary
+
+This script calibrates agricultural data from ENCOVI 2023 to match official MAGA departmental statistics, then expands high-weight farmers with controlled jitter to produce smooth distributions suitable for threshold-based segmentation.
+
+**Input:** white maize farmers from Script 02_01
+**Output:** expanded records with MAGA-calibrated weights (counts reported in the D2 summary)
+
+## Methodology
+
+1. **Initial weight scaling**: A scaling factor derived from the INE agricultural-household reference is applied to ENCOVI expansion factors, aligning the total farmer count before departmental calibration.
+
+2. **Dual-variable calibration**: Weights calibrated simultaneously on `total_production` and `land_wtcorn` to match MAGA departmental totals using `calibrate_weights_by_group()` with linear calibration function.
+
+3. **Expansion threshold (500)**: Farmers with calibrated weight > 500 are split into multiple records with target weight ≈ 100. The resulting weight distribution is reported in the C1 diagnostics.
+
+4. **Controlled jitter (3% SD)**: Applied to base variables (`qty_sold_qq`, `qty_household_qq`, `qty_animal_seed_qq`, `land_wtcorn`, `exp_seeds`, `revenue`, `farmer_age`, `price_per_qq`). `total_production` is recalculated as the sum of destination quantities after jitter to maintain allocation coherence. Other derived variables recalculated post-jitter to maintain internal consistency.
+
+5. **Re-calibration post-jitter**: Second calibration pass corrects the small positive bias introduced by non-negativity constraints on jittered values.
+
+## Variables
+
+- **Identifiers**: `no_hogar` (original household), `farmer_id` (expanded record ID), `copy_id` (copy number within household)
+- **Weights**: `weight_calibrated` (final weight for survey estimation)
+- **All other variables**: Preserved from Script 02_01 with jitter applied to base variables and derived variables recalculated
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

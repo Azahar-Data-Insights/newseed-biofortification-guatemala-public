@@ -1,0 +1,473 @@
+---
+title: "Calculating Food Security Scores"
+subtitle: "Module 4: Covariate Prediction"
+---
+
+## Overview
+
+Food security — the consistent access to sufficient, safe, and nutritious food —
+is a key determinant of child nutritional status. The Food Insecurity Experience
+Scale (FIES) captures household food security through eight questions of
+increasing severity, from worry about food availability to going entire days
+without eating.
+
+FIES produces raw scores from 0 (food secure) to 8 (severe food insecurity).
+However, raw scores are ordinal — the difference between scores 1 and 2 is not
+necessarily equal to the difference between 7 and 8. To enable valid statistical
+modeling, we apply the **Rasch model** recommended by FAO, which transforms
+responses into interval-scale measurements where differences are comparable
+across the entire range.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by framework 04_04).
+
+tbl_a2_fies_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_04_tbl_a2_fies_distribution.rds"),
+  trust = TRUE
+)
+
+tbl_b2_item_parameters <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_04_tbl_b2_item_parameters.rds"),
+  trust = TRUE
+)
+
+tbl_b3_raw_score_parameters <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_04_tbl_b3_raw_score_parameters.rds"),
+  trust = TRUE
+) |>
+  # Recode framework's short labels to the descriptive labels reviewed
+  # and approved for the methodological web.
+  mutate(
+    classification = recode(
+      classification,
+      "Mild FI"     = "Mild food insecurity",
+      "Moderate FI" = "Moderate food insecurity",
+      "Severe FI"   = "Severe food insecurity"
+    )
+  )
+
+tbl_c2_score_comparison <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_04_tbl_c2_score_comparison.rds"),
+  trust = TRUE
+) |>
+  mutate(
+    classification = recode(
+      classification,
+      "Mild FI"     = "Mild food insecurity",
+      "Moderate FI" = "Moderate food insecurity",
+      "Severe FI"   = "Severe food insecurity"
+    )
+  )
+
+tbl_c3_model_fit <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_04_tbl_c3_model_fit.rds"),
+  trust = TRUE
+)
+
+fig_c4_rasch_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_04_fig_c4_rasch_distribution.rds"),
+  trust = TRUE
+) |>
+  mutate(
+    classification = fct_recode(
+      classification,
+      "Mild food insecurity"     = "Mild FI",
+      "Moderate food insecurity" = "Moderate FI",
+      "Severe food insecurity"   = "Severe FI"
+    )
+  )
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Weighted prevalence by classification (from tbl-c2-score-comparison)
+prevalence_by_class <- tbl_c2_score_comparison |>
+  summarise(prevalence = sum(pct), .by = classification)
+
+pct_food_secure <- prevalence_by_class |>
+  filter(classification == "Food Secure") |>
+  pull(prevalence)
+
+pct_mild <- prevalence_by_class |>
+  filter(classification == "Mild food insecurity") |>
+  pull(prevalence)
+
+pct_moderate <- prevalence_by_class |>
+  filter(classification == "Moderate food insecurity") |>
+  pull(prevalence)
+
+pct_severe <- prevalence_by_class |>
+  filter(classification == "Severe food insecurity") |>
+  pull(prevalence)
+
+# Headline cifras for the opening narrative
+pct_yes_item1 <- tbl_a2_fies_distribution |>
+  filter(code == "C001") |>
+  pull(pct_yes)
+
+pct_yes_item8 <- tbl_a2_fies_distribution |>
+  filter(code == "C008") |>
+  pull(pct_yes)
+```
+
+
+## FIES Item Response Distribution
+
+The eight FIES items follow FAO's standard ordering by severity. The expected
+pattern — decreasing affirmative responses as severity increases — is confirmed
+in SIVESNU data: `r sprintf("%.0f%%", pct_yes_item1)` report worrying about food
+(mild), while only `r sprintf("%.0f%%", pct_yes_item8)` report going a full day
+without eating (severe).
+
+```{r}
+#| label: tbl-a2-fies-distribution
+#| tbl-cap: "FIES Item Response Distribution"
+
+tbl_a2_fies_distribution |>
+  gt() |>
+  tab_header(
+    title = "FIES Item Response Distribution",
+    subtitle = "Food Insecurity Experience Scale (8 items)"
+  ) |>
+  cols_label(
+    code = "Code",
+    description = "Question",
+    severity = "Severity",
+    n_yes = "Yes",
+    n_no = "No",
+    n_na = "NA",
+    pct_yes = "% Yes"
+  ) |>
+  fmt_number(columns = c(n_yes, n_no, n_na), decimals = 0) |>
+  fmt_number(columns = pct_yes, decimals = 1) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = severity == "Mild", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = severity == "Moderate", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = severity == "Severe", columns = severity)
+  ) |>
+  tab_source_note(
+    source_note = "Source: SIVESNU 2018. Items ordered by increasing severity per FAO FIES methodology."
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+
+## Rasch Model Estimation
+
+The Rasch model is fit on the eight binary FIES responses using survey weights,
+following the FAO methodology for the Voices of the Hungry project. Two sets of
+parameters emerge from the estimation: **item difficulty** parameters (one per
+question, characterizing how severe the experience reported by each item is)
+and **person severity** parameters (one per raw score, mapping each total to an
+interval-scale food insecurity level).
+
+### Item Difficulty Parameters
+
+Item difficulty (β) represents the severity threshold at which each experience is
+typically reported. Negative values indicate experiences reported by most
+respondents; positive values indicate experiences reported only by severely
+food insecure households.
+
+```{r}
+#| label: tbl-b2-item-parameters
+#| tbl-cap: "FIES Item Difficulty Parameters (Rasch Model)"
+
+tbl_b2_item_parameters |>
+  gt() |>
+  tab_header(
+    title = "FIES Item Difficulty Parameters",
+    subtitle = "Rasch model estimates (ordered by difficulty)"
+  ) |>
+  cols_label(
+    rank = "Rank",
+    code = "Code",
+    description = "Question",
+    severity = "Severity",
+    difficulty = "Difficulty (β)"
+  ) |>
+  fmt_number(columns = difficulty, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = severity == "Mild", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = severity == "Moderate", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = severity == "Severe", columns = severity)
+  ) |>
+  tab_source_note(
+    source_note = "Higher difficulty = more severe food insecurity. Negative values = more common experiences."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+### Raw Score to Rasch Transformation
+
+The model transforms each raw score (0-8) into an interval-scale severity
+parameter (θ). These parameters are used to assign individual food insecurity
+scores.
+
+```{r}
+#| label: tbl-b3-raw-score-parameters
+#| tbl-cap: "Severity Parameters by Raw Score"
+
+tbl_b3_raw_score_parameters |>
+  gt() |>
+  tab_header(
+    title = "FIES Severity Parameters by Raw Score",
+    subtitle = "Rasch model transformation"
+  ) |>
+  cols_label(
+    raw_score = "Raw Score",
+    severity = "Severity (θ)",
+    se = "Std. Error",
+    classification = "Classification"
+  ) |>
+  fmt_number(columns = c(severity, se), decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = classification == "Food Secure", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = classification == "Mild food insecurity", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = classification == "Moderate food insecurity", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = classification == "Severe food insecurity", columns = classification)
+  ) |>
+  tab_source_note(
+    source_note = "Classification follows FAO thresholds."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+
+## Validation
+
+### Score Distribution Comparison
+
+The following table shows the population distribution across raw scores and their
+corresponding Rasch transformation. Most children live in households experiencing
+some degree of food insecurity.
+
+```{r}
+#| label: tbl-c2-score-comparison
+#| tbl-cap: "Distribution of FIES Scores: Raw vs Rasch"
+
+tbl_c2_score_comparison |>
+  gt() |>
+  tab_header(
+    title = "FIES Score Distribution",
+    subtitle = "Raw scores mapped to Rasch severity parameters"
+  ) |>
+  cols_label(
+    fies_raw_score = "Raw Score",
+    n = "N",
+    pct = "% (weighted)",
+    mean_rasch = "Rasch Score (θ)",
+    classification = "Classification"
+  ) |>
+  fmt_number(columns = pct, decimals = 1) |>
+  fmt_number(columns = mean_rasch, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = classification == "Food Secure", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = classification == "Mild food insecurity", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = classification == "Moderate food insecurity", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = classification == "Severe food insecurity", columns = classification)
+  ) |>
+  tab_source_note(
+    source_note = "Rasch scores provide interval-scale measurement; raw scores are ordinal."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+### Model Fit Statistics
+
+```{r}
+#| label: tbl-c3-model-fit
+#| tbl-cap: "Rasch Model Fit Statistics"
+
+tbl_c3_model_fit |>
+  gt() |>
+  tab_header(
+    title = "Rasch Model Fit Statistics"
+  ) |>
+  cols_label(
+    statistic = "Statistic",
+    value = "Value"
+  ) |>
+  tab_source_note(
+    source_note = "Reliability > 0.7 indicates acceptable measurement precision."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+### Distribution Visualization
+
+The histogram shows the distribution of Rasch-transformed food insecurity scores.
+The bimodal pattern reflects distinct food secure and food insecure subpopulations.
+
+```{r}
+#| label: fig-c4-rasch-distribution
+#| fig-cap: "Distribution of FIES Rasch Scores"
+#| fig-alt: >
+#|   Histogram of Rasch-transformed food insecurity scores (theta) on the
+#|   x-axis and frequency on the y-axis, with bars shaded by food security
+#|   classification from food secure through severe food insecurity. A dashed
+#|   vertical line marks zero, separating less severe scores on the left from
+#|   more severe scores on the right. The distribution is bimodal, with one
+#|   peak of food secure children and a second peak spanning the food insecure
+#|   classifications, consistent with two distinct subpopulations.
+#| fig-height: 7
+#| fig-width: 10
+
+# Define color palette matching table colors
+fi_colors <- c(
+  "Food Secure" = "#D4EDDA",
+  "Mild food insecurity" = "#FFF3CD",
+  "Moderate food insecurity" = "#FFE0B2",
+  "Severe food insecurity" = "#FFCDD2"
+)
+
+# Histogram of Rasch scores
+ggplot(fig_c4_rasch_distribution, aes(x = fies_rasch_score, fill = classification)) +
+  geom_histogram(bins = 9, color = "white", linewidth = 0.5) +
+  scale_fill_manual(values = fi_colors, name = "Classification") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  annotate("text", x = -0.3, y = Inf, label = "← Less severe",
+           hjust = 1, vjust = 2, size = 3, color = "gray40") +
+  annotate("text", x = 0.3, y = Inf, label = "More severe →",
+           hjust = 0, vjust = 2, size = 3, color = "gray40") +
+  labs(
+    title = "Distribution of Food Insecurity (Rasch Scale)",
+    subtitle = "Children 6-59 months, SIVESNU 2018",
+    x = "FIES Rasch Score (θ)",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, color = "gray30", face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray50"),
+    axis.title = element_text(size = 10, color = "gray40"),
+    legend.position = "bottom"
+  )
+```
+
+
+## Summary
+
+### Food Security Classification
+
+| Classification | Raw Score | Prevalence |
+|----------------|-----------|------------|
+| Food Secure | 0 | `r sprintf("%.1f%%", pct_food_secure)` |
+| Mild food insecurity | 1-3 | `r sprintf("%.1f%%", pct_mild)` |
+| Moderate food insecurity | 4-6 | `r sprintf("%.1f%%", pct_moderate)` |
+| Severe food insecurity | 7-8 | `r sprintf("%.1f%%", pct_severe)` |
+
+### Methodological Notes
+
+1. **Rasch model advantages** — Transforms ordinal raw scores into interval-scale
+   measurements with equal spacing. This enables valid arithmetic operations
+   (means, regression coefficients) in subsequent modeling.
+
+2. **Survey-weighted estimation** — Item parameters were estimated using survey
+   weights to ensure population representativeness, following FAO methodology.
+
+3. **Item ordering validated** — The estimated difficulty parameters follow the
+   expected severity gradient: mild items (worry, diet quality) have negative β,
+   while severe items (hunger, day without food) have positive β.
+
+### Limitations
+
+1. **Extreme scores** — Raw scores 0 and 8 require assumptions for parameter
+   estimation (handled by RM.weights default settings).
+
+2. **Local independence** — The Rasch model assumes conditional independence
+   between items given the latent trait; residual correlations may indicate
+   violation.
+
+### Application
+
+The Rasch-transformed FIES score enters the stunting models as a continuous
+predictor, carrying the full gradient of food security into the model rather
+than a small number of categorical strata.

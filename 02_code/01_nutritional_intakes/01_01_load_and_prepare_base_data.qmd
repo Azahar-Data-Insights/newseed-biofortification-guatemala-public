@@ -1,0 +1,624 @@
+---
+title: "Load and Prepare Base Data"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script performs initial data loading, cleaning, and preparation of all base datasets required for the nutrient intake analysis:
+
+1. Loads raw parquet files (ENCOVI 2023, INCAP 2014, external expert data)
+2. Loads the integrated food composition table (energy, protein, iron, zinc, amino acids, PDCAAS, NPU)
+3. Processes household socioeconomic variables
+4. Cleans individual demographic data and calculates Adult Male Equivalent (AME) factors
+5. Prepares food equivalence tables and reference lists
+6. Saves all cleaned and integrated datasets for subsequent analyses
+
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  janitor,        # Data cleaning utilities
+  gt,             # Table formatting and presentation
+  tidyverse       # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading
+
+## A1. Load ENCOVI 2023 Survey Data
+
+```{r}
+#| label: a1-load-encovi
+
+# Load food consumption data
+encovi_alimentos <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023", "encovi_2023_c13sa_alimentos_3.parquet")
+) |>
+  clean_names() |>
+  remove_empty(c("cols", "rows")) |>
+  rename(codine = p13a04a)  # Match INCAP food code
+
+# Load household data
+encovi_hogar <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023", "encovi_2023_hogares.parquet")
+) |>
+  clean_names() |>
+  remove_empty(c("cols", "rows"))
+
+# Load individual/person data
+encovi_individuo <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023", "encovi_2023_personas.parquet")
+) |>
+  clean_names() |>
+  remove_empty(c("cols", "rows"))
+```
+
+## A2. Load Food Composition Data
+
+```{r}
+#| label: a2-load-composition
+
+# Composition table built by Script 00_03, one row per food,
+# values per 100 g edible portion
+incap_composition <- read_parquet(
+  here("01_data", "03_external", "incap_food_composition.parquet")
+)
+```
+
+## A3. Load Food Equivalences
+
+```{r}
+#| label: a3-load-equivalences
+
+# Equivalence table built by Script 00_03, one row per food and
+# presentation unit, with unit-to-grams conversions
+equivalencias <- read_parquet(
+  here("01_data", "03_external", "incap_food_equivalences.parquet")
+)
+```
+
+---
+
+# Phase B: Data Integration and Processing
+
+## B1. Prepare INCAP Food Composition Database
+
+Normalize nutrient values to a per-gram basis and apply the conservative protein-quality assumption for foods without a PDCAAS score.
+
+```{r}
+#| label: b1-prepare-incap
+
+df_incap <- incap_composition |>
+  # Convert nutrient values to a per-gram basis
+  mutate(across(
+    c(energ_kcal, proteina_g, hierro_mg, zinc_mg,
+      lys_g, met_g, cys_g, thr_g, trp_g),
+    ~ .x / 100
+  )) |>
+  # Replace missing PDCAAS values with 0.1 (conservative estimate for low-quality protein)
+  mutate(pdcaas = if_else(is.na(pdcaas), 0.1, pdcaas))
+```
+
+
+## B2. Process Household Socioeconomic Variables
+
+Clean and recode household socioeconomic variables.
+
+```{r}
+#| label: b2-process-household
+
+df_hogar <- encovi_hogar |>
+  transmute(
+    no_hogar, upm, factor,
+    departamento = factor(
+      depto, 
+      levels = 1:22, 
+      labels = c("Guatemala", "El Progreso", "Sacatepéquez", "Chimaltenango", 
+                 "Escuintla", "Santa Rosa", "Sololá", "Totonicapán", "Quetzaltenango", 
+                 "Suchitepéquez", "Retalhuleu", "San Marcos", "Huehuetenango", "Quiché", 
+                 "Baja Verapaz", "Alta Verapaz", "Petén", "Izabal", "Zacapa", "Chiquimula", 
+                 "Jalapa", "Jutiapa"), 
+      ordered = TRUE
+    ),
+    area = factor(area, levels = 1:2, labels = c("Urbana", "Rural")),
+    miembros_hogar = total_pers,
+    propiedad = factor(
+      p01b01, 
+      levels = c(1:4, 98), 
+      labels = c("Propia y totalmente pagada", "Propia y pagandola a plazos", 
+                 "Alquilada", "Cedida o prestada", "Otro")
+    ),
+    material_paredes = factor(
+      p01a02,
+      levels = c(1:8, 98), 
+      labels = c("Ladrillo", "Block", "Concreto", "Adobe", "Madera", 
+                 "Lamina metalica", "Bajareque", "Lepa, palo o caña", "Otro")
+    ),
+    material_techo = factor(
+      p01a03,
+      levels = c(1:5, 98), 
+      labels = c("Concreto", "Lamina metalica", "Asbesto cemento", 
+                 "Teja", "Paja, palma o similar", "Otro")
+    ),
+    material_piso = factor(
+      p01a04,
+      levels = c(1:7, 98), 
+      labels = c("Ladrillo ceramico", "Ladrillo de cemento", "Ladrillo de barro", 
+                 "Torta de cemento", "Parqué", "Madera", "Tierra", "Tierra")
+    ),
+    tipo_vivienda = factor(
+      p01a01,
+      levels = c(1:5, 98), 
+      labels = c("Casa formal", "Apartamento", "Cuarto en casa de vecindad", 
+                 "Rancho", "Casa improvisada", "Otro")
+    ),
+    n_cuartos = p01d01,
+    n_dormitorios = p01d02,
+    cocina = factor(
+      p01d05,
+      levels = 1:2, 
+      labels = c("De uso exclusivo", "De uso compartido")
+    ),
+    fuente_agua = factor(
+      p01d06,
+      levels = c(1:7, 98), 
+      labels = c("Tubería dentro de la vivienda", "Tubería fuera de la vivienda", 
+                 "Chorro publico", "Pozo perforado", "Río, lago, manantial", 
+                 "Camion cisterna", "Agua de lluvia", "Otro")
+    ),
+    tipo_sanitario = factor(
+      p01d18,
+      levels = 1:2, 
+      labels = c("Uso exclusivo", "Uso compartido")
+    ),
+    recoleccion_basura = factor(case_when(
+      p01d22 == 1 ~ "Servicio municipal",
+      p01d22 == 2 ~ "Servicio privado",
+      p01d22 == 3 ~ "La queman o la entierran",
+      p01d22 == 4 ~ "La queman o la entierran",
+      p01d22 == 5 ~ "La tiran en cualquier lugar"
+    )),
+    electricidad = factor(p01a05c, levels = 1:2, labels = c("Si", "No")),
+    televisor = factor(p01d20e, levels = 1:2, labels = c("Si", "No")),
+    telefonia_fija = factor(p01d20b, levels = 1:2, labels = c("Si", "No")),
+    telefonia_celular = factor(p01d20c, levels = 1:2, labels = c("Si", "No")),
+    computadora = factor(p01d20d, levels = 1:2, labels = c("Si", "No"))
+  )
+```
+
+## B3. Process Individual Demographics
+
+Clean individual demographics.
+
+```{r}
+#| label: b3-process-individuals
+
+df_individuos <- encovi_individuo |>
+  mutate(
+    # Recode relationship to household head
+    parentesco = factor(case_when(
+      ppa05 == 1 ~ "Jefe del hogar",
+      ppa05 == 2 ~ "Esposo(a) o compañero(a)",
+      ppa05 == 3 ~ "Hijo(a)",
+      ppa05 == 4 ~ "Yerno o nuera",
+      ppa05 == 5 ~ "Nieto(a)",
+      ppa05 == 6 ~ "Padre o madre",
+      ppa05 == 7 ~ "Suegro(a)",
+      ppa05 == 8 ~ "Hermano(a)",
+      ppa05 %in% c(9, 10) ~ "Otro pariente",
+      ppa05 == 11 ~ "Empleado de casa particular",
+      ppa05 %in% c(12, 13) ~ "Otro no pariente"
+    )),
+    # Recode sex
+    sexo = factor(ppa02, levels = 1:2, labels = c("Hombre", "Mujer")),
+    # Age variable
+    edad = ppa03,
+    # Recode education level
+    grado_estudios = factor(
+      if_else(!is.na(p04a02), p04a02, p04a05),
+      levels = 1:12, 
+      labels = c("Ninguno", "Solo sabe leer", "Preprimaria", 
+                 "Primaria incompleta", "Primaria completa", 
+                 "Educacion media incompleta", "Educacion media completa", 
+                 "Carrera universitaria incompleta", "Carrera universitaria completa", 
+                 "Maestria o doctorado", "No lo conoce o conocio", "No sabe")
+    )
+  ) |>
+  # Simplify education categories
+  mutate(
+    grado_estudios = fct_relevel(
+      factor(case_when(
+        grado_estudios == "Ninguno" ~ "Ninguno",
+        grado_estudios %in% c("Solo sabe leer", "Preprimaria", "Primaria incompleta") ~ "Solo sabe leer",
+        grado_estudios %in% c("Primaria completa", "Educacion media incompleta") ~ "Primaria",
+        grado_estudios %in% c("Educacion media completa", "Carrera universitaria incompleta") ~ "Secundaria",
+        grado_estudios %in% c("Carrera universitaria completa", "Maestria o doctorado") ~ "Superior/universitaria",
+        grado_estudios %in% c("No lo conoce o conocio", "No sabe") ~ "Desconocido"
+      ), ordered = TRUE), 
+      c("Desconocido", "Ninguno", "Solo sabe leer", "Primaria", "Secundaria", "Superior/universitaria")
+    ),
+    # Convert to numeric for household heads and partners
+    grado_estudios_num = case_when(
+      grado_estudios == "Desconocido" ~ 1,
+      grado_estudios == "Ninguno" ~ 1,
+      grado_estudios == "Solo sabe leer" ~ 2,
+      grado_estudios == "Primaria" ~ 4,
+      grado_estudios == "Secundaria" ~ 7,
+      grado_estudios == "Superior/universitaria" ~ 10
+    ),
+    grado_estudios_num = if_else(
+      parentesco %in% c("Jefe del hogar", "Esposo(a) o compañero(a)"), 
+      grado_estudios_num, 
+      NA_real_
+    )
+  ) |>
+  # Calculate mean education level per household
+  mutate(
+    grado_estudios_hogar = mean(grado_estudios_num, na.rm = TRUE),
+    .by = no_hogar
+  ) |>
+  # Create age groups
+  mutate(
+    edad_grupos = factor(cut(
+      edad, 
+      breaks = c(-Inf, 0.5, 1, 2, 4, 7, 10, 14, 18, 30, 60, Inf), 
+      labels = c("de 0 a 6 meses", "de 6 meses a 1 año", "de 1 a 2 años",
+                 "de 2 a 4 años", "de 4 a 7 años", "de 7 a 10 años",
+                 "de 10 a 14 años", "de 14 a 18 años", "de 18 a 30 años",
+                 "de 30 a 60 años", "más de 60 años")
+    ))
+  ) |>
+  # Select key variables
+  select(no_hogar, upm, factor, parentesco, grado_estudios, grado_estudios_num, 
+         grado_estudios_hogar, sexo, edad, edad_grupos)
+```
+
+## B4. Create Reference Lists
+
+Create reference vectors for subsequent data processing.
+
+```{r}
+#| label: b4-reference-lists
+
+# Extract unique food names in order from equivalence table
+nombres_alimentos <- unique(equivalencias$alimento)
+
+# Define measurement units vector (matches ENCOVI survey codes)
+unidades_medida <- c(
+  "1 ACRE", "2 ALMUD", "3 ARROBA", "4 BARRIL", "5 BOLSA", "6 BOTELLA", 
+  "7 BULTO", "8 CABALLER", "9 CAJA", "10 CANASTO", "11 CARGA", "12 CARRETAD", 
+  "13 CIENTO", "14 COPA", "15 CUADRA", "16 CUARTERO", "17 CUERDA", "18 DOCENA", 
+  "19 FANEGA", "20 GALON", "21 GARRAFON", "22 GRAMOS", "23 HECTAREA", 
+  "24 KILOGRAM", "25 KILOMETR", "26 KILOVATI", "27 LATA", "28 LEGUA", 
+  "29 LEÑO O R", "30 LIBRA", "31 LITRO", "32 MANO", "33 MANOJO", "34 MANZANA", 
+  "35 MEDIA BO", "36 MEDIDA", "37 MEDIO (S", "38 MEDIO CI", "39 MEDIO GA", 
+  "40 METRO CU", "41 METRO", "42 MILLA", "43 MILLAR", "44 OCTAVO", "45 ONZA", 
+  "46 PAJA", "47 PAR", "48 PIE LINE", "49 PIE TABL", "50 PULGADA", "51 QUINTAL", 
+  "52 RACIMO", "53 RED", "54 SACO", "55 TAREA", "56 TERCIO", "57 TIJANA", 
+  "58 TONEL", "59 TONELADA", "60 TRENZA", "61 TROZA", "62 UN CUART", "63 UNIDAD", 
+  "64 VARA", "65 VASO", "66 YARDA", "67 PILA", "98 OTRO", "101 CABEZA", 
+  "102 SOBRE", "103 BARRA", "104 BOTE", "105 BANDEJA", "106 PAQUETE", 
+  "107 CAJETILL", "108 CARTON", "109 BOLA", "110 ENVASE", "111 FRASCO", 
+  "112 MARQUETA", "113 PEDAZO", "114 PORCIîN", "115 RODAJA", "116 TAPA/CUA", 
+  "117 TALLO", "118 RAJA", "119 RAMA", "120 TAZA", "121 TAMBO", "122 ROLLO", 
+  "123 MAZO", "124 FARDO", "125 QUETZAL", "128 HUACAL", "129 PACHA"
+)
+```
+
+---
+
+# Phase C: Quality Checks and Export
+
+## C1. Data Summary Tables
+
+```{r}
+#| label: tbl-c1-data-summary
+
+# === ENCOVI 2023 Summary ===
+tbl_encovi_summary <- tibble(
+  Dataset = c("Food consumption", "Households", "Individuals"),
+  Observations = c(
+    nrow(encovi_alimentos),
+    nrow(encovi_hogar),
+    nrow(encovi_individuo)
+  ),
+  Variables = c(
+    ncol(encovi_alimentos),
+    ncol(encovi_hogar),
+    ncol(encovi_individuo)
+  )
+)
+
+tbl_encovi_summary |>
+  gt() |>
+  tab_header(
+    title = "ENCOVI 2023 Survey Data",
+    subtitle = "Loaded datasets overview"
+  ) |>
+  fmt_number(
+    columns = c(Observations, Variables),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_label(
+    Dataset = "Dataset",
+    Observations = "N",
+    Variables = "Variables"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+
+# === INCAP 2014 Summary ===
+tbl_incap_summary <- tibble(
+  Component = c(
+    "Integrated nutrient database",
+    "Energy (kcal)",
+    "Protein (g)",
+    "Iron (mg)",
+    "Zinc (mg)",
+    "Lysine (g)",
+    "Methionine (g)",
+    "Cysteine (g)",
+    "Threonine (g)",
+    "Tryptophan (g)",
+    "PDCAAS scores"
+  ),
+  Status = c(
+    paste(nrow(df_incap), "foods"),
+    ifelse("energ_kcal" %in% names(df_incap), "✓", "✗"),
+    ifelse("proteina_g" %in% names(df_incap), "✓", "✗"),
+    ifelse("hierro_mg" %in% names(df_incap), "✓", "✗"),
+    ifelse("zinc_mg" %in% names(df_incap), "✓", "✗"),
+    ifelse("lys_g" %in% names(df_incap), "✓", "✗"),
+    ifelse("met_g" %in% names(df_incap), "✓", "✗"),
+    ifelse("cys_g" %in% names(df_incap), "✓", "✗"),
+    ifelse("thr_g" %in% names(df_incap), "✓", "✗"),
+    ifelse("trp_g" %in% names(df_incap), "✓", "✗"),
+    ifelse("pdcaas" %in% names(df_incap), "✓", "✗")
+  )
+)
+
+tbl_incap_summary |>
+  gt() |>
+  tab_header(
+    title = "INCAP 2014 Food Composition Database",
+    subtitle = "Integrated composition tables with amino acids and PDCAAS"
+  ) |>
+  cols_label(
+    Component = "Component",
+    Status = "Available"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+
+# === External Data Summary ===
+tbl_external_summary <- tibble(
+  Dataset = c(
+    "Food equivalences",
+    "Unique foods",
+    "Measurement units",
+    "PDCAAS values"
+  ),
+  Count = c(
+    nrow(equivalencias),
+    length(nombres_alimentos),
+    length(unidades_medida),
+    sum(!is.na(incap_composition$pdcaas))
+  ),
+  Description = c(
+    "Expert-provided unit conversions",
+    "Foods tracked in survey",
+    "Survey measurement codes",
+    "Protein quality scores"
+  )
+)
+
+tbl_external_summary |>
+  gt() |>
+  tab_header(
+    title = "External Expert Data",
+    subtitle = "María José Soto (FINUT) contributions"
+  ) |>
+  fmt_number(
+    columns = Count,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_label(
+    Dataset = "Dataset",
+    Count = "N",
+    Description = "Description"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+
+# === Processed Data Summary ===
+tbl_processed_summary <- tibble(
+  Dataset = c(
+    "Household socioeconomic",
+    "Individuals (demographic)"
+  ),
+  Count = c(
+    nrow(df_hogar),
+    nrow(df_individuos)
+  ),
+  Percentage = c(
+    NA_real_,
+    NA_real_
+  )
+)
+
+tbl_processed_summary |>
+  gt() |>
+  tab_header(
+    title = "Processed Base Data",
+    subtitle = "Cleaned and prepared datasets for nutrient intake calculations"
+  ) |>
+  fmt_number(
+    columns = Count,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  sub_missing(
+    columns = Percentage,
+    missing_text = "—"
+  ) |>
+  cols_label(
+    Dataset = "Dataset",
+    Count = "N",
+    Percentage = "%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+
+# Save data for web resources
+export(
+  list(
+    encovi_summary = tbl_encovi_summary,
+    incap_summary = tbl_incap_summary,
+    external_summary = tbl_external_summary,
+    processed_summary = tbl_processed_summary
+  ),
+  here("01_data", "02_processed",
+       "web_resources", "01_01_tbl_c1_data_summary.rds")
+)
+
+# Cleanup auxiliary objects
+rm(tbl_encovi_summary, tbl_incap_summary, tbl_external_summary, tbl_processed_summary)
+```
+
+## C2. Save Processed Datasets
+
+```{r}
+#| label: c2-save-outputs
+
+# Save integrated INCAP food composition data
+write_parquet(
+  df_incap,
+  here("01_data", "02_processed",  
+       "transfer", "01_01_incap_integrated.parquet")
+)
+
+# Save cleaned household socioeconomic data
+write_parquet(
+  df_hogar,
+  here("01_data", "02_processed",  
+       "transfer", "01_01_household_socioeconomic.parquet")
+)
+
+# Save cleaned individual demographic data
+write_parquet(
+  df_individuos,
+  here("01_data", "02_processed",  
+       "transfer", "01_01_individuals_demographic.parquet")
+)
+
+# Save ENCOVI food consumption data (unprocessed, for next script)
+write_parquet(
+  encovi_alimentos,
+  here("01_data", "02_processed",  
+       "transfer", "01_01_encovi_alimentos.parquet")
+)
+
+# Save food equivalence table
+write_parquet(
+  equivalencias,
+  here("01_data", "02_processed",  
+       "transfer", "01_01_food_equivalences.parquet")
+)
+
+# Save reference lists as RDS
+export(
+  list(
+    nombres_alimentos = nombres_alimentos,
+    unidades_medida = unidades_medida
+  ),
+  here("01_data", "02_processed", 
+       "transfer", "01_01_reference_lists.rds")
+)
+```
+
+# Notes
+
+## Methodology
+
+### Data Integration
+
+- **Food composition source**: The integrated composition table is built from `incap_finut_master.xlsx` (Script 00_03). It combines INCAP food composition values (energy, protein, iron, zinc, edible-portion factor) with the FINUT protein-quality layer (amino acids, PDCAAS, NPU) and Azahar Data Insights derived values for foods without literature scores. Per-value provenance is documented in the workbook's `source_notes` sheet and in `01_data/03_external/README.md`.
+- **Nutrient values normalized to per-gram basis**: Supports calculations with varying portion sizes.
+- **PDCAAS missing values**: Replaced with 0.1 (conservative estimate for incomplete protein sources).
+
+### Household Variables
+
+Socioeconomic variables are recoded to descriptive factor labels; the original survey codes remain as the underlying factor levels.
+
+### Food Equivalence Table
+
+The `equivalencias` table provides unit-to-grams conversions and plant-based classifications compiled by María José Soto (FINUT) through on-site market research in Guatemala:
+- Local Guatemalan unit conversions (bags, packages, trays)
+- Plant-based food classifications for phytate calculations
+- Market-based measurements reflecting actual retail packaging
+
+See `01_data/03_external/README.md` for provenance and lineage details.
+
+
+

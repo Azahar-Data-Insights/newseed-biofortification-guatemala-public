@@ -1,0 +1,1584 @@
+---
+title: "Calculate Market Baseline (`r params$seed_label`, `r params$subsidy_label`)"
+subtitle: "Module 6: Scenario Precomputation — Production, consumption, and gravity-based redistribution"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+params:
+  # Seed identification
+  seed_year: "2022"
+  seed_label: "2022 Seed"
+  seed_suffix: "s22"
+  # Subsidy identification
+  subsidy_label: "Current subsidy"
+  subsidy_suffix: "sub00"
+---
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Setup: Load packages, configure environment, resolve parameters
+# =============================================================================
+
+# Clean environment (preserve params injected by Quarto)
+rm(list = setdiff(ls(), "params"))
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  gt,                 # Professional table formatting
+  tidyverse           # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# --- Resolve parameters into local variables -------------------------------
+
+# Seed
+seed_year   <- params$seed_year
+seed_label  <- params$seed_label
+seed_suffix <- params$seed_suffix
+
+# Subsidy
+subsidy_label  <- params$subsidy_label
+subsidy_suffix <- params$subsidy_suffix
+
+# Seed code for plot/table titles (e.g., "S22"). Derived from seed_suffix
+# to keep seed_variants.yml unchanged: no additional field required.
+seed_code <- toupper(seed_suffix)
+
+# Composite file prefix for all output artefacts (parquet + web_resources rds)
+file_prefix <- paste0("06_01_", seed_suffix, "_", subsidy_suffix)
+
+# scenarios/
+ensure_output_dir(here("01_data", "02_processed", "scenarios"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Overview
+
+**Seed Variant: `r paste0(seed_year, " (", seed_code, ")")` — Subsidy Regime: `r subsidy_label`** — This script uses farmer adoption scores from the `r seed_code` × `r toupper(subsidy_suffix)` economic impact pathway. For alternative combinations, see the companion variants rendered from this parametrized template.
+
+This script establishes the market baseline metrics and redistribution infrastructure required for scenario modeling in Module 6. It calculates departmental production capacity, consumption requirements, and applies a gravity-based redistribution model to simulate inter-departmental surplus flows across all penetration levels.
+
+Penetration is implemented through the continuous adoption model: each farmer has a per-farmer entry point (`p_entry`) and a behavioural profile (`S`, `M`, `L`), which together determine the conversion ratio `r_i(p) = sigmoid_curve(p, p_entry_i, floor_profile, k_profile)` at each national penetration level `p`. At the farmer's entry point, the conversion ratio equals the profile-specific floor; it then rises along a sigmoid curve towards 1 as `p` increases. At full penetration (`p = 1`), all farmers have `r_i(1) = 1` by construction. The effective biofortified production of farmer `i` at penetration `p` is `production_biofortified_i × weight_calibrated_i × r_i(p)`.
+
+The two outputs of this script behave differently with respect to the subsidy regime:
+
+- **`06_01_{seed}_{sub}_market_baseline.parquet`** captures structural departmental quantities — farmer counts, land allocation, FSI consumption demand, current production, and maximum biofortified production capacity at full adoption. These are physical and demographic in nature and are therefore **invariant to the subsidy regime** for a given seed: the subsidy affects seed prices, producer absorption, and farmer extra costs, but does not alter yields, segment composition, consumption demand, or the road network.
+
+- **`06_01_{seed}_{sub}_saturation_scenarios.parquet`** captures departmental coverage along the penetration curve (0–100%) after gravity-based redistribution. Penetration is implemented as a continuous adoption process driven by the Likely Adopters score (Script 02_06), which incorporates the economic-benefit component for the active subsidy regime. As the subsidy regime shifts the relative attractiveness of biofortified seed across farmers, the **order in which farmers enter the adoption pool changes**, and therefore the spatial distribution of biofortified production at intermediate penetration levels also changes. The endpoints (penetration = 0% and penetration = 100%) converge across subsidy regimes by construction, since they correspond respectively to no adopters and the full farmer set with `r_i(1) = 1`.
+
+## Main Operations
+
+1. Load farmer data with adoption ranking and continuous adoption parameters (Module 2 output)
+2. Load ENCOVI 2023 consumption data for departmental maize demand (Module 1 output)
+3. Load OSRM-derived travel time matrix and gravity weights (06_00 output)
+4. Load calibrated model configuration for continuous adoption curves (02_05 output)
+5. Calculate baseline farmer counts by segment (total, hybrid, OPV) per department
+6. Calculate baseline land allocation for maize production per department
+7. Calculate annual maize consumption by department using survey weights
+8. Calculate maximum current and biofortified production capacity per department
+9. Generate saturation diagnostic curves before redistribution
+10. Apply gravity-based redistribution across all penetration levels
+11. Validate production conservation through redistribution
+12. Export market baseline and saturation scenarios
+
+## Methodological Notes
+
+**Gravity-Based Redistribution**: Surplus production flows from departments with excess to all departments with deficit, weighted proportionally to the deficit at the destination and inversely proportional to the real travel time between departments. The formulation follows Anderson & van Wincoop (2003), analogous to IMPLAN inter-regional commodity flow estimation.
+
+**Travel Time Matrix**: A 22×22 asymmetric matrix of driving times between departmental capitals, computed via OSRM over OpenStreetMap road network data. Asymmetry reflects real directional differences in Guatemala's road infrastructure (terrain gradients, one-way routing, etc.).
+
+**Continuous Adoption Model**: The conversion ratio `r_i(p)` determines the fraction of each farmer's potential biofortified production that is realised at penetration `p`. The model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05.
+
+# Phase A: Data Loading
+
+This phase loads the four data sources required for market baseline calculations:
+
+1. **Farmer adoption data** (02_06): Contains farmer rankings, economic metrics, production capacity, continuous adoption parameters (`p_entry`, `profile`), and survey weights for the active seed × subsidy combination
+2. **Individual nutrient intake** (01_04): Contains maize consumption data at individual level with survey design variables
+3. **Travel time matrix** (06_00): Contains OSRM-derived gravity weights for inter-departmental redistribution
+4. **Model configuration** (02_05): Contains calibrated continuous adoption curve parameters (per-profile floors and steepness coefficients)
+
+## A1. Load Farmer Adoption Data
+
+Load the complete farmer dataset with adoption scores, economic impact calculations, and segment assignments. This parquet is produced by `02_06x_apply_likely_adopters_model.qmd` for the `r seed_suffix` × `r subsidy_suffix` combination and integrates upstream data from segmentation (02_03) and economic impact (02_04).
+
+```{r}
+#| label: a1-load-farmer-data
+
+# =============================================================================
+# A1. Load Farmer Adoption Data
+# =============================================================================
+
+df_farmers_raw <- read_parquet(
+  here("01_data", "02_processed",
+       "scenarios", paste0("02_06_", seed_suffix, "_", subsidy_suffix,
+                           "_farmers_adoption_scores.parquet"))
+)
+```
+
+## A2. Load Model Configuration for Continuous Adoption Curves
+
+Load the calibrated model configuration from Script 02_05 and extract the six continuous adoption parameters. These parameters govern the sigmoid conversion curves that determine the fraction of biofortified production realised by each farmer at each penetration level.
+
+```{r}
+#| label: a2-load-model-config
+
+# =============================================================================
+# A2. Load Model Configuration and Extract Continuous Adoption Parameters
+# =============================================================================
+
+model_config <- readRDS(
+  here("01_data", "02_processed", "models",
+       "02_05_likely_adopters_model_config.rds")
+)
+
+# Extract continuous adoption curve parameters (per-profile floors and steepness)
+floor_S <- model_config$continuous$floor_S
+floor_M <- model_config$continuous$floor_M
+floor_L <- model_config$continuous$floor_L
+k_S     <- model_config$continuous$k_S
+k_M     <- model_config$continuous$k_M
+k_L     <- model_config$continuous$k_L
+
+# Clean up: only the six scalar parameters are needed downstream
+rm(model_config)
+```
+
+## A3. Load Individual Nutrient Intake Data
+
+Load the individual-level nutrient intake dataset containing daily maize consumption and survey design variables. This data will be aggregated to departmental level using survey weights.
+
+```{r}
+#| label: a3-load-nutritional-data
+
+# =============================================================================
+# A3. Load Individual Nutritional Intake Data
+# =============================================================================
+
+df_individuals_raw <- read_parquet(
+  here("01_data", "02_processed",
+       "transfer", "01_04_individual_nutritional_intake_complete.parquet")
+)
+```
+
+## A4. Load Travel Time Matrix and Gravity Weights
+
+Load the pre-computed OSRM travel time matrix and gravity weights for the 22 departmental capitals. This matrix is computed once by `06_00_compute_travel_time_matrix.qmd` and used across all seed variants.
+
+**Source of coordinates**: Departmental capitals (cabeceras departamentales) are the administrative seats of each of Guatemala's 22 departments. Coordinates were obtained from the GeoNames geographical database (www.geonames.org, Creative Commons Attribution 4.0 License), which aggregates data from official national mapping agencies and the OpenStreetMap community. Each coordinate corresponds to the populated place record classified as `feature class P` (populated place) and `feature code PPLA` (seat of a first-order administrative division) in GeoNames for the respective departmental capital. GeoNames data for Guatemala can be accessed at https://download.geonames.org/export/dump/GT.zip. Coordinates are in WGS84 (EPSG:4326).
+
+```{r}
+#| label: a4-load-travel-time
+
+# =============================================================================
+# A4. Load Travel Time Matrix and Gravity Weights
+# =============================================================================
+
+df_travel_time <- read_parquet(
+  here("01_data", "02_processed",
+       "external", "06_00_osrm_travel_time_matrix.parquet")
+)
+```
+
+## A5. Data Dimensions Summary
+
+Verify the loaded datasets contain expected records and display key dimensions for audit trail.
+
+```{r}
+#| label: tbl-a5-data-dimensions
+#| tbl-cap: "Input datasets for market baseline calculations"
+
+# =============================================================================
+# A5. Summarize Data Dimensions
+# =============================================================================
+
+# Create dimensions summary
+tbl_dimensions <- tibble(
+  dataset = c(paste0("Farmers (02_06_", seed_suffix, "_", subsidy_suffix, ")"),
+              "Model configuration (02_05)",
+              "Individuals (01_04)",
+              "Travel time matrix (06_00)"),
+  n_records = c(nrow(df_farmers_raw), NA_integer_, nrow(df_individuals_raw),
+                nrow(df_travel_time)),
+  n_variables = c(ncol(df_farmers_raw), NA_integer_, ncol(df_individuals_raw),
+                  ncol(df_travel_time)),
+  notes = c("Per-farmer adoption scores, p_entry, profile",
+            paste0("6 continuous params: floor_S=", floor_S,
+                   ", floor_M=", floor_M, ", floor_L=", floor_L,
+                   ", k_S=", k_S, ", k_M=", k_M, ", k_L=", k_L),
+            "Individual nutritional intake with survey weights",
+            "22x22 asymmetric OSRM travel time matrix")
+)
+
+# Export for web resources
+export(tbl_dimensions, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_a5_data_dimensions.rds")))
+
+# Display as GT table
+tbl_dimensions |>
+  gt() |>
+  tab_header(
+    title = "Phase A: Data Loading Summary",
+    subtitle = "Input datasets for market baseline calculations"
+  ) |>
+  cols_label(
+    dataset = "Dataset",
+    n_records = "Records",
+    n_variables = "Variables",
+    notes = "Notes"
+  ) |>
+  cols_align(align = "left", columns = c(dataset, notes)) |>
+  fmt_number(
+    columns = c(n_records, n_variables),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  sub_missing(missing_text = "config") |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023 dataset + OSRM travel time matrix + 02_05 model configuration"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(tbl_dimensions)
+```
+
+## A6. Travel Time Matrix Visualization
+
+Display the OSRM-derived travel time matrix as a heatmap. This visualization confirms that the geographic distance structure is consistent with Guatemala's road network topology.
+
+```{r}
+#| label: fig-a6-travel-time-heatmap
+#| fig-cap: "Driving travel times between departmental capitals (minutes) — OSRM asymmetric matrix"
+#| fig-width: 10
+#| fig-height: 10
+
+# =============================================================================
+# A6. Travel Time Matrix Heatmap
+# =============================================================================
+
+# Department ordering (INE standard)
+dept_order <- c("Guatemala", "El Progreso", "Sacatep\u00e9quez", "Chimaltenango",
+                "Escuintla", "Santa Rosa", "Solol\u00e1", "Totonicap\u00e1n",
+                "Quetzaltenango", "Suchitep\u00e9quez", "Retalhuleu", "San Marcos",
+                "Huehuetenango", "Quich\u00e9", "Baja Verapaz", "Alta Verapaz",
+                "Pet\u00e9n", "Izabal", "Zacapa", "Chiquimula", "Jalapa", "Jutiapa")
+
+# Prepare plot data
+df_travel_plot <- df_travel_time |>
+  select(origin, destination, travel_time_min) |>
+  mutate(
+    origin = factor(origin, levels = dept_order),
+    destination = factor(destination, levels = rev(dept_order))
+  )
+
+# Export for web resources
+export(df_travel_plot, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_a6_travel_time_heatmap.rds")))
+
+# Heatmap
+ggplot(df_travel_plot, aes(x = origin, y = destination, fill = travel_time_min)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = round(travel_time_min, 0)),
+    size = 2.2,
+    color = "gray20"
+  ) +
+  scale_fill_gradient2(
+    low = "#E8F0F7",
+    high = "#1B6CA8",
+    midpoint = median(df_travel_plot$travel_time_min),
+    name = "Travel Time\n(minutes)"
+  ) +
+  labs(
+    title = "Driving Travel Times Between Departmental Capitals",
+    subtitle = "OSRM routing over OpenStreetMap road network \u2014 asymmetric (directional)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40", size = 11),
+    legend.position = "bottom",
+    legend.key.width = unit(2, "cm"),
+    legend.key.height = unit(0.4, "cm"),
+    panel.grid = element_blank()
+  )
+
+# Clean up
+rm(df_travel_plot)
+```
+
+## A7. Gravity Weights Summary
+
+```{r}
+#| label: tbl-a7-gravity-summary
+#| tbl-cap: "Gravity weight matrix summary statistics"
+
+# =============================================================================
+# A7. Gravity Weights Summary
+# =============================================================================
+
+df_gravity_off_diag <- df_travel_time |>
+  filter(origin != destination)
+
+tbl_gravity_summary <- tibble(
+  metric = c(
+    "Beta (decay parameter)",
+    "Number of department pairs",
+    "Min gravity weight",
+    "Max gravity weight",
+    "Mean gravity weight",
+    "Min travel time (min)",
+    "Max travel time (min)",
+    "Mean travel time (min)"
+  ),
+  value = c(
+    as.character(unique(df_travel_time$beta)),
+    nrow(df_gravity_off_diag),
+    format(min(df_gravity_off_diag$gravity_weight), scientific = TRUE, digits = 3),
+    format(max(df_gravity_off_diag$gravity_weight), scientific = TRUE, digits = 3),
+    format(mean(df_gravity_off_diag$gravity_weight), scientific = TRUE, digits = 3),
+    round(min(df_gravity_off_diag$travel_time_min), 1),
+    round(max(df_gravity_off_diag$travel_time_min), 1),
+    round(mean(df_gravity_off_diag$travel_time_min), 1)
+  )
+)
+
+# Export for web resources
+export(tbl_gravity_summary, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_a7_gravity_summary.rds")))
+
+tbl_gravity_summary |>
+  gt() |>
+  tab_header(
+    title = "Gravity Weight Matrix Summary",
+    subtitle = "w(i,j) = 1 / travel_time(i,j)\u00b2 \u2014 Anderson & van Wincoop (2003)"
+  ) |>
+  cols_label(metric = "Metric", value = "Value") |>
+  cols_align(align = "left", columns = metric) |>
+  cols_align(align = "right", columns = value) |>
+  tab_source_note(
+    source_note = "Source: 06_00_osrm_travel_time_matrix.parquet"
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(df_gravity_off_diag, tbl_gravity_summary)
+```
+
+---
+
+# Phase B: Baseline Metrics Calculation
+
+This phase calculates departmental baseline metrics required for scenario modeling. All calculations use survey weights to produce population-representative estimates. Biofortified production aggregations apply the continuous adoption model explicitly: at full penetration (`p = 1`), every farmer has `r_i(1) = 1` by construction of the sigmoid curve, so `production_biofortified × weight_calibrated × r_i(1) = production_biofortified × weight_calibrated`. The formulas below include the `r_i(1)` factor for methodological transparency.
+
+## B1. Calculate Farmer Totals by Department
+
+Calculate the total number of maize farmers by department, segmented by technology adoption level (OPV/Criollo, Low, Mid, High). These totals serve as denominators for penetration percentage calculations.
+
+```{r}
+#| label: b1-farmer-totals
+
+# =============================================================================
+# B1. Calculate Farmer Totals by Department
+# =============================================================================
+
+# Create survey design for farmers
+svy_farmers <- df_farmers_raw |>
+  as_survey_design(
+    ids = 1,
+    weights = weight_calibrated,
+    strata = NULL
+  )
+
+# Calculate farmer counts by department and segment
+df_farmers_by_segment <- svy_farmers |>
+  group_by(departamento, segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  as_tibble()
+
+# Pivot to wide format for easier use
+df_baseline_farmers <- df_farmers_by_segment |>
+  pivot_wider(
+    names_from = segment_final,
+    values_from = n_farmers,
+    names_prefix = "n_farmers_",
+    values_fill = 0
+  ) |>
+  mutate(
+    n_farmers_total = n_farmers_High + n_farmers_Mid +
+                      n_farmers_Low + `n_farmers_OPV/Criollo`,
+    n_farmers_hybrid = n_farmers_High + n_farmers_Mid + n_farmers_Low,
+    n_farmers_opv = `n_farmers_OPV/Criollo`
+  ) |>
+  select(
+    departamento,
+    n_farmers_total,
+    n_farmers_hybrid,
+    n_farmers_opv,
+    n_farmers_high = n_farmers_High,
+    n_farmers_mid = n_farmers_Mid,
+    n_farmers_low = n_farmers_Low
+  )
+
+# Clean up
+rm(df_farmers_by_segment)
+```
+
+## B2. Calculate Land Totals by Department
+
+Calculate total maize cultivation area by department and segment. Land is measured in manzanas (mz) and converted to hectares (ha) using the standard conversion factor (1 mz = 0.7 ha).
+
+```{r}
+#| label: b2-land-totals
+
+# =============================================================================
+# B2. Calculate Land Totals by Department
+# =============================================================================
+
+# Calculate land by department and segment
+df_land_by_segment <- svy_farmers |>
+  group_by(departamento, segment_final) |>
+  summarise(
+    land_mz = survey_total(land_wtcorn, vartype = NULL, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  as_tibble()
+
+# Pivot to wide format
+df_baseline_land <- df_land_by_segment |>
+  pivot_wider(
+    names_from = segment_final,
+    values_from = land_mz,
+    names_prefix = "land_mz_",
+    values_fill = 0
+  ) |>
+  mutate(
+    land_mz_total = land_mz_High + land_mz_Mid +
+                    land_mz_Low + `land_mz_OPV/Criollo`,
+    land_mz_hybrid = land_mz_High + land_mz_Mid + land_mz_Low,
+    land_mz_opv = `land_mz_OPV/Criollo`,
+    # Convert to hectares (1 mz = 0.7 ha)
+    land_ha_total = land_mz_total * 0.7,
+    land_ha_hybrid = land_mz_hybrid * 0.7,
+    land_ha_opv = land_mz_opv * 0.7
+  ) |>
+  select(
+    departamento,
+    land_mz_total,
+    land_mz_hybrid,
+    land_mz_opv,
+    land_ha_total,
+    land_ha_hybrid,
+    land_ha_opv
+  )
+
+# Clean up
+rm(df_land_by_segment)
+```
+
+## B3. Calculate Annual Maize Consumption by Department
+
+Calculate total annual maize consumption by department using survey-weighted population estimates and calibrated per capita consumption from official sources.
+
+**Consumption estimates from two sources:**
+
+1. **Direct human consumption**: 110 kg/capita/year based on FAO/MAGA (2008), which states: *"El consumo per capita de ma\u00edz en Guatemala es de 110 kg/a\u00f1o (utilizaci\u00f3n directa)"*. This covers only tortillas and direct food use.
+
+2. **Total FSI consumption** (Food, Seed, Industrial): 174 kg/capita/year based on USDA (2019) Grain and Feed Annual report. This includes all food-related uses: direct human consumption, backyard animal feed, seed retention, and post-harvest losses.
+
+Coverage calculations use the **FSI total** as the denominator, since production must meet all domestic demand, not just direct human consumption.
+
+**Conversion factors:**
+
+- Kilograms to quintales: \u00f7 45.36 (1 qq = 100 lb = 45.36 kg)
+- Quintales to metric tons: \u00d7 0.04536 (1 qq \u2248 0.04536 MT)
+
+```{r}
+#| label: b3-annual-consumption
+
+# =============================================================================
+# B3. Calculate Annual Maize Consumption by Department
+# =============================================================================
+
+# Define consumption parameters from official sources
+CONSUMPTION_HUMAN_KG <- 110
+CONSUMPTION_FSI_KG <- 174
+
+# Conversion factor
+KG_TO_QQ <- 45.36
+
+# Create survey design for individuals
+svy_individuals <- df_individuals_raw |>
+  as_survey_design(
+    ids = upm,
+    weights = factor,
+    strata = NULL
+  )
+
+# Calculate population by department
+df_population_by_dept <- svy_individuals |>
+  group_by(departamento) |>
+  summarise(
+    population = survey_total(vartype = NULL, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  as_tibble()
+
+# Calculate consumption estimates (human and FSI)
+df_baseline_consumption <- df_population_by_dept |>
+  mutate(
+    # Human consumption: 110 kg/capita/year (FAO/MAGA 2008)
+    consumption_human_qq = population * CONSUMPTION_HUMAN_KG / KG_TO_QQ,
+    consumption_human_mt = consumption_human_qq * 0.04536,
+
+    # FSI consumption: 174 kg/capita/year (USDA 2019)
+    consumption_fsi_qq = population * CONSUMPTION_FSI_KG / KG_TO_QQ,
+    consumption_fsi_mt = consumption_fsi_qq * 0.04536
+  )
+
+# Clean up
+rm(df_population_by_dept, CONSUMPTION_HUMAN_KG, CONSUMPTION_FSI_KG, KG_TO_QQ)
+```
+
+## B4. Calculate Maximum Current Production by Department
+
+Calculate the maximum current maize production capacity by department if all farmers continue with their current practices. This represents the baseline production scenario (penetration = 0%).
+
+```{r}
+#| label: b4-current-production
+
+# =============================================================================
+# B4. Calculate Maximum Current Production by Department
+# =============================================================================
+
+# Calculate current production totals by department
+df_baseline_current_prod <- svy_farmers |>
+  group_by(departamento) |>
+  summarise(
+    current_production_qq = survey_total(
+      total_production,
+      vartype = NULL,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  as_tibble() |>
+  mutate(
+    current_production_mt = current_production_qq * 0.04536
+  )
+```
+
+## B5. Calculate Maximum Biofortified Production by Department
+
+Calculate the maximum potential biofortified maize production by department at full adoption. This represents the ceiling scenario (penetration = 100%), where every farmer has `r_i(1) = 1` by the convergence property of the sigmoid curve, so the effective biofortified production equals `production_biofortified × weight_calibrated × 1`.
+
+```{r}
+#| label: b5-biofortified-production
+
+# =============================================================================
+# B5. Calculate Maximum Biofortified Production by Department
+# =============================================================================
+
+# At p = 1, r_i(1) = 1 for all farmers by construction of the sigmoid curve.
+# The survey_total below is therefore equivalent to:
+#   sum(production_biofortified * weight_calibrated * r_i(1))
+# = sum(production_biofortified * weight_calibrated * 1)
+# = sum(production_biofortified * weight_calibrated)
+
+# Calculate biofortified production totals by department
+df_baseline_bio_prod <- svy_farmers |>
+  group_by(departamento) |>
+  summarise(
+    max_bio_production_qq = survey_total(
+      production_biofortified,
+      vartype = NULL,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  as_tibble() |>
+  mutate(
+    max_bio_production_mt = max_bio_production_qq * 0.04536
+  )
+```
+
+## B6. Consolidate Baseline Metrics
+
+Join all calculated metrics into a single departmental baseline dataset and generate the summary table for validation.
+
+```{r}
+#| label: b6-consolidate-baseline
+
+# =============================================================================
+# B6. Consolidate All Baseline Metrics
+# =============================================================================
+
+# Convert departamento to character in all datasets before joining
+df_baseline_farmers_chr <- df_baseline_farmers |>
+  mutate(departamento = as.character(departamento))
+
+df_baseline_land_chr <- df_baseline_land |>
+  mutate(departamento = as.character(departamento))
+
+df_baseline_consumption_chr <- df_baseline_consumption |>
+  mutate(departamento = as.character(departamento))
+
+df_baseline_current_prod_chr <- df_baseline_current_prod |>
+  mutate(departamento = as.character(departamento))
+
+df_baseline_bio_prod_chr <- df_baseline_bio_prod |>
+  mutate(departamento = as.character(departamento))
+
+# Join all baseline metrics by department
+df_market_baseline <- df_baseline_farmers_chr |>
+  left_join(df_baseline_land_chr, by = "departamento") |>
+  left_join(df_baseline_consumption_chr, by = "departamento") |>
+  left_join(df_baseline_current_prod_chr, by = "departamento") |>
+  left_join(df_baseline_bio_prod_chr, by = "departamento") |>
+  # Calculate coverage ratios at 100% penetration (against FSI consumption)
+  mutate(
+    max_coverage_ratio = max_bio_production_qq / consumption_fsi_qq,
+    max_coverage_pct = pmin(max_coverage_ratio * 100, 100),
+    has_excess = max_bio_production_qq > consumption_fsi_qq,
+    excess_production_qq = pmax(max_bio_production_qq - consumption_fsi_qq, 0)
+  ) |>
+  # Restore departamento as ordered factor for consistency
+  mutate(
+    departamento = factor(
+      departamento,
+      levels = dept_order,
+      ordered = TRUE
+    )
+  ) |>
+  arrange(departamento)
+
+# Clean up intermediate objects
+rm(df_baseline_farmers_chr, df_baseline_land_chr, df_baseline_consumption_chr,
+   df_baseline_current_prod_chr, df_baseline_bio_prod_chr)
+```
+
+## B7. Baseline Summary Table
+
+Display consolidated baseline metrics for validation. This table shows key departmental metrics that will be used in scenario calculations.
+
+```{r}
+#| label: tbl-b7-baseline-summary
+#| tbl-cap: "Departmental baseline metrics for scenario modeling"
+
+# =============================================================================
+# B7. Generate Baseline Summary Table
+# =============================================================================
+
+# Prepare table data with formatted columns
+tbl_baseline_summary <- df_market_baseline |>
+  transmute(
+    departamento,
+    n_farmers_total,
+    n_farmers_hybrid,
+    n_farmers_opv,
+    land_ha_total,
+    consumption_human_mt,
+    consumption_fsi_mt,
+    current_production_mt,
+    max_bio_production_mt,
+    max_coverage_pct
+  )
+
+# Export for web resources
+export(tbl_baseline_summary, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_b7_baseline_summary.rds")))
+
+# Generate GT table
+tbl_baseline_summary |>
+  gt() |>
+  tab_header(
+    title = "Departmental Market Baseline Metrics",
+    subtitle = "Farmers, land, consumption, and production capacity by department"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers_total = "Total Farmers",
+    n_farmers_hybrid = "Hybrid Farmers",
+    n_farmers_opv = "OPV Farmers",
+    land_ha_total = "Land (ha)",
+    consumption_human_mt = "Human Cons. (MT/yr)",
+    consumption_fsi_mt = "FSI Cons. (MT/yr)",
+    current_production_mt = "Current Prod. (MT)",
+    max_bio_production_mt = "Max Bio Prod. (MT)",
+    max_coverage_pct = "Max Coverage (%)"
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  fmt_number(
+    columns = c(n_farmers_total, n_farmers_hybrid, n_farmers_opv),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(land_ha_total, consumption_human_mt, consumption_fsi_mt,
+                current_production_mt, max_bio_production_mt),
+    use_seps = TRUE,
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = max_coverage_pct,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      columns = max_coverage_pct,
+      rows = max_coverage_pct >= 100
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(
+      columns = max_coverage_pct,
+      rows = max_coverage_pct < 50
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_farmers_total, n_farmers_hybrid, n_farmers_opv,
+                land_ha_total, consumption_human_mt, consumption_fsi_mt,
+                current_production_mt, max_bio_production_mt),
+    fns = list(
+      Total = ~ sum(., na.rm = TRUE)
+    ),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023 (MAGA-calibrated weights). Human Cons. = direct human consumption at 110 kg/capita/year (FAO/MAGA 2008). FSI Cons. = Food, Seed & Industrial consumption at 174 kg/capita/year (USDA 2019). Coverage calculated against FSI. Green = surplus (\u2265100%). Red = deficit (<50%)."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(10)
+  )
+
+# Clean up
+rm(tbl_baseline_summary)
+```
+
+---
+
+# Phase C: Redistribution Infrastructure & Validation
+
+## C1. Saturation Analysis Before Redistribution
+
+This section generates departmental coverage curves across penetration levels (0-100%) using the continuous adoption model.
+
+At each national penetration level `p`, every farmer with `p_entry <= p` is in the adoption pool. The effective biofortified production of farmer `i` at penetration `p` is `production_biofortified_i × weight_calibrated_i × r_i(p)`, where `r_i(p) = apply_adoption_curve(p, p_entry_i, profile_i, ...)` is the profile-specific sigmoid conversion ratio. Departmental biofortified production is the sum of these effective contributions across all admitted farmers in that department.
+
+This approach reflects realistic adoption patterns where early adopters are not uniformly distributed across departments, and where each farmer's conversion intensity varies by their behavioural profile and position along the penetration curve.
+
+```{r}
+#| label: c1-saturation-data
+
+# =============================================================================
+# C1. Generate Saturation Data - Before Redistribution (Continuous Adoption)
+# =============================================================================
+
+# Prepare farmer data with pre-computed base biofortified production
+# (the constant factor that is then scaled by r_i(p) at each penetration level)
+df_farmers_prep <- df_farmers_raw |>
+  mutate(
+    bio_base = production_biofortified * weight_calibrated
+  )
+
+# Penetration levels sequence
+penetration_levels <- seq(0, 1, by = 0.10)
+
+# Calculate departmental coverage at each penetration level
+df_saturation_before <- map_dfr(penetration_levels, function(p) {
+
+  # Farmers in the adoption pool at this penetration level
+  df_admitted <- df_farmers_prep |>
+    filter(p_entry <= p) |>
+    mutate(
+      r_i = apply_adoption_curve(p, p_entry, profile,
+                                 floor_S, floor_M, floor_L,
+                                 k_S, k_M, k_L),
+      bio_weighted_p = bio_base * r_i
+    )
+
+  # Biofortified production by department
+  df_bio_by_dept <- df_admitted |>
+    summarise(
+      bio_production_qq = sum(bio_weighted_p, na.rm = TRUE),
+      n_adopters = n(),
+      .by = departamento
+    )
+
+  # Coverage calculation
+  df_market_baseline |>
+    select(departamento, consumption_fsi_qq) |>
+    mutate(departamento = as.character(departamento)) |>
+    left_join(df_bio_by_dept, by = "departamento") |>
+    replace_na(list(bio_production_qq = 0, n_adopters = 0)) |>
+    mutate(
+      penetration = p,
+      coverage_pct = bio_production_qq / consumption_fsi_qq * 100,
+      is_saturated = coverage_pct >= 100
+    ) |>
+    select(departamento, penetration, bio_production_qq,
+       consumption_fsi_qq, coverage_pct, n_adopters, is_saturated)
+})
+```
+
+```{r}
+#| label: fig-c1-saturation-curves
+#| fig-cap: "Departmental coverage evolution by national penetration level (before redistribution)"
+#| fig-width: 10
+#| fig-height: 8
+#| warning: false
+
+# =============================================================================
+# C1. Visualization - Saturation Curves Before Redistribution
+# =============================================================================
+
+# Saturation points for annotation
+df_saturation_points <- df_saturation_before |>
+  filter(is_saturated) |>
+  slice_min(penetration, by = departamento)
+
+# Color palette: highlight saturating departments
+dept_colors <- df_saturation_before |>
+  filter(penetration == 1) |>
+  mutate(
+    saturates = coverage_pct >= 100,
+    color_group = if_else(saturates, departamento, "Other")
+  ) |>
+  select(departamento, color_group)
+
+df_saturation_plot <- df_saturation_before |>
+  left_join(dept_colors, by = "departamento") |>
+  mutate(
+    alpha_value = if_else(color_group == "Other", 0.4, 1),
+    size_value = if_else(color_group == "Other", 0.5, 1)
+  )
+
+# Export for web resources
+export(df_saturation_plot, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_c1_saturation_curves.rds")))
+
+# Main visualization
+ggplot() +
+  # Non-saturating departments (background)
+  geom_line(
+    data = filter(df_saturation_plot, color_group == "Other"),
+    aes(x = penetration * 100, y = coverage_pct, group = departamento),
+    color = "gray60",
+    linewidth = 0.4,
+    alpha = 0.5
+  ) +
+  # Saturating departments (highlighted)
+  geom_line(
+    data = filter(df_saturation_plot, color_group != "Other"),
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    linewidth = 1
+  ) +
+  # Saturation threshold
+  geom_hline(
+    yintercept = 100,
+    linetype = "dashed",
+    color = "darkred",
+    linewidth = 0.6
+  ) +
+  # Saturation points
+  geom_point(
+    data = df_saturation_points,
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    size = 3,
+    shape = 16
+  ) +
+  # Labels for saturation points (custom positioning)
+  geom_text(
+    data = filter(df_saturation_points, departamento == "Pet\u00e9n"),
+    aes(x = penetration * 100, y = coverage_pct, label = departamento),
+    hjust = 1.1,
+    vjust = -0.5,
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  # Annotation for threshold (moved to the left)
+  annotate(
+    "text",
+    x = 1, y = 105,
+    label = "Saturation threshold (100%)",
+    hjust = 0,
+    size = 3,
+    color = "darkred",
+    fontface = "italic"
+  ) +
+  # Scales
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 300, 50),
+    labels = function(x) paste0(x, "%"),
+    limits = c(0, 320)
+  ) +
+  scale_color_manual(
+    values = c("Pet\u00e9n" = "#2E86AB")
+  ) +
+  # Labels
+  labs(
+    title = "Departmental Coverage by National Penetration Level",
+    subtitle = "Before excess redistribution \u2014 Gray lines show non-saturating departments",
+    x = "National Penetration Level",
+    y = "Departmental Coverage",
+    color = "Saturating\nDepartments"
+  ) +
+  # Theme
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = c(0.12, 0.85),
+    legend.background = element_rect(fill = "white", color = "gray80"),
+    legend.title = element_text(size = 10, face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 12),
+    axis.title = element_text(color = "gray40")
+  )
+
+# Clean up
+rm(df_saturation_points, dept_colors, df_saturation_plot)
+```
+
+## C2. Apply Gravity-Based Redistribution
+
+This section applies the gravity-based redistribution model to calculate departmental coverage at each penetration level. For each level, the biofortified production is calculated using the continuous adoption model (`r_i(p)` per farmer), then surplus is redistributed through the gravity-weighted network to all deficit departments.
+
+The gravity model distributes surplus from each donor department to all receivers, weighted by `w(i,j) × deficit_j`, where `w(i,j) = 1 / travel_time(i→j)²`.
+
+```{r}
+#| label: c2-gravity-redistribution
+
+# =============================================================================
+# C2. Apply Gravity-Based Redistribution Across Penetration Levels
+#     (Continuous Adoption Model)
+# =============================================================================
+
+# Calculate departmental coverage WITH gravity redistribution at each level
+df_saturation_after <- map_dfr(penetration_levels, function(p) {
+
+  # Farmers in the adoption pool at this penetration level
+  df_admitted <- df_farmers_prep |>
+    filter(p_entry <= p) |>
+    mutate(
+      r_i = apply_adoption_curve(p, p_entry, profile,
+                                 floor_S, floor_M, floor_L,
+                                 k_S, k_M, k_L),
+      bio_weighted_p = bio_base * r_i
+    )
+
+  # Biofortified production by department
+  df_bio_by_dept <- df_admitted |>
+    summarise(
+      bio_production = sum(bio_weighted_p, na.rm = TRUE),
+      .by = departamento
+    )
+
+  # Build coverage data frame
+  df_coverage <- df_market_baseline |>
+    select(departamento, annual_consumption = consumption_fsi_qq) |>
+    mutate(departamento = as.character(departamento)) |>
+    left_join(df_bio_by_dept, by = "departamento") |>
+    replace_na(list(bio_production = 0))
+
+  # Apply gravity-based redistribution
+  df_redistributed <- redistribute_gravity(
+    df = df_coverage,
+    travel_time_df = df_travel_time
+  )
+
+  # Add penetration level and format output
+  df_redistributed |>
+    mutate(
+      penetration = p,
+      coverage_pct = coverage * 100,
+      is_saturated = coverage >= 1
+    ) |>
+    select(departamento, penetration, bio_production,
+           annual_consumption, coverage_pct, excess, is_saturated)
+})
+
+# Cap coverage at 100% (excess beyond local demand = implicit export)
+df_saturation_after <- df_saturation_after |>
+  mutate(
+    bio_production = pmin(bio_production, annual_consumption),
+    coverage_pct = pmin(coverage_pct, 100),
+    is_saturated = coverage_pct >= 100
+  )
+```
+
+## C3. Production Conservation Validation
+
+Total biofortified production must be conserved through the redistribution process. The check compares total production before and after redistribution at 100% national penetration.
+
+```{r}
+#| label: tbl-c3-conservation-check
+#| tbl-cap: "Production conservation validation at 100% penetration"
+
+# =============================================================================
+# C3. Validate Production Conservation
+# =============================================================================
+
+# Total production before redistribution (at 100% penetration)
+total_before <- df_saturation_before |>
+  filter(penetration == 1) |>
+  summarise(total_qq = sum(bio_production_qq, na.rm = TRUE)) |>
+  pull(total_qq)
+
+# Total production after redistribution (at 100% penetration)
+# Note: after capping, bio_production is capped at annual_consumption
+# So we need uncapped data for this check. Recalculate at p=1 without cap.
+df_check_uncapped <- df_saturation_after |>
+  filter(penetration == 1)
+
+# After redistribution + capping: production received by departments
+total_after_capped <- sum(df_check_uncapped$bio_production, na.rm = TRUE)
+
+# Remaining excess (production that exceeded local demand)
+total_excess_remaining <- df_saturation_after |>
+  filter(penetration == 1) |>
+  summarise(total_excess = sum(excess, na.rm = TRUE)) |>
+  pull(total_excess)
+
+# Total accounted for = capped production + remaining excess
+total_accounted <- total_after_capped + total_excess_remaining
+
+# Difference
+production_diff <- total_before - total_accounted
+production_diff_pct <- production_diff / total_before * 100
+
+# Summary table
+tbl_conservation_check <- tibble(
+  metric = c(
+    "Total bio production before redistribution (qq)",
+    "Total bio production after redistribution \u2014 capped (qq)",
+    "Remaining excess after redistribution (qq)",
+    "Total accounted (capped + excess) (qq)",
+    "Difference (loss/gain) (qq)",
+    "Difference as % of total production"
+  ),
+  value = c(
+    format(round(total_before, 0), big.mark = ","),
+    format(round(total_after_capped, 0), big.mark = ","),
+    format(round(total_excess_remaining, 0), big.mark = ","),
+    format(round(total_accounted, 0), big.mark = ","),
+    format(round(production_diff, 2), big.mark = ","),
+    paste0(round(production_diff_pct, 4), "%")
+  )
+)
+
+# Export for web resources
+export(tbl_conservation_check, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c3_conservation_check.rds")))
+
+tbl_conservation_check |>
+  gt() |>
+  tab_header(
+    title = "Production Conservation Check",
+    subtitle = "Validation at 100% national penetration \u2014 gravity redistribution"
+  ) |>
+  cols_label(metric = "Metric", value = "Value") |>
+  cols_align(align = "left", columns = metric) |>
+  cols_align(align = "right", columns = value) |>
+  tab_source_note(
+    source_note = "A non-zero difference indicates production loss or creation through redistribution. Values near zero (< 1 qq) are acceptable due to floating-point arithmetic."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(df_check_uncapped, total_before, total_after_capped,
+   total_excess_remaining, total_accounted, production_diff, production_diff_pct,
+   tbl_conservation_check)
+```
+
+## C4. Saturation Order Summary
+
+This table summarizes the penetration level at which each department first reaches 100% coverage after applying the gravity-based redistribution. Departments are ordered by saturation timing.
+
+Departments that do not reach saturation even at 100% national penetration are marked with "\u2014", indicating insufficient production flow through the redistribution network.
+
+```{r}
+#| label: tbl-c4-saturation-order
+#| tbl-cap: "Departmental saturation order by penetration level (after gravity redistribution)"
+
+# =============================================================================
+# C4. Saturation Order Table (After Redistribution)
+# =============================================================================
+
+# Identify first saturation point per department
+df_saturation_order <- df_saturation_after |>
+  filter(is_saturated) |>
+  slice_min(penetration, by = departamento) |>
+  select(departamento, saturation_penetration = penetration)
+
+# Join with all departments to include non-saturating ones
+tbl_saturation_order <- df_market_baseline |>
+  select(departamento) |>
+  mutate(departamento = as.character(departamento)) |>
+  left_join(df_saturation_order, by = "departamento") |>
+  arrange(saturation_penetration, departamento) |>
+  mutate(
+    rank = ifelse(!is.na(saturation_penetration), row_number(), NA_integer_),
+    saturation_display = ifelse(
+      !is.na(saturation_penetration),
+      paste0(saturation_penetration * 100, "%"),
+      "\u2014"
+    )
+  ) |>
+  select(rank, departamento, saturation_display)
+
+# Export for web resources
+export(tbl_saturation_order, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c4_saturation_order.rds")))
+
+# Generate GT table
+tbl_saturation_order |>
+  gt() |>
+  tab_header(
+    title = "Departmental Saturation Order",
+    subtitle = "Penetration level at which each department reaches 100% coverage (after gravity redistribution)"
+  ) |>
+  cols_label(
+    rank = "Order",
+    departamento = "Department",
+    saturation_display = "Saturation Point"
+  ) |>
+  cols_align(align = "center", columns = c(rank, saturation_display)) |>
+  cols_align(align = "left", columns = departamento) |>
+  sub_missing(columns = rank, missing_text = "\u2014") |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      rows = saturation_display != "\u2014"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(
+      rows = saturation_display == "\u2014"
+    )
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = departamento)
+  ) |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023 farmer adoption model with gravity-based redistribution. w(i,j) = 1/travel_time(i\u2192j)\u00b2, \u03b2 = 2."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(11)
+  )
+
+# Clean up
+rm(df_saturation_order, tbl_saturation_order)
+```
+
+
+## C5. Saturation Curves After Redistribution
+
+This section visualizes departmental coverage evolution after applying the gravity-based redistribution. Compared to the pre-redistribution curves (C1), departments that previously never reached 100% coverage should now show improved trajectories as they receive surplus from producing departments, weighted by geographic proximity.
+
+```{r}
+#| label: fig-c5-saturation-after
+#| fig-cap: "Departmental coverage evolution by national penetration level (after gravity redistribution)"
+#| fig-width: 10
+#| fig-height: 8
+
+# =============================================================================
+# C5. Visualization - Saturation Curves After Redistribution
+# =============================================================================
+
+# Identify saturation points (first penetration where coverage >= 100%)
+df_saturation_points_after <- df_saturation_after |>
+  filter(is_saturated) |>
+  slice_min(penetration, by = departamento)
+
+# Count saturating departments for subtitle
+n_saturating <- n_distinct(df_saturation_points_after$departamento)
+
+# Order saturating departments by saturation point
+saturating_depts_ordered <- df_saturation_points_after |>
+  arrange(penetration) |>
+  pull(departamento)
+
+# Order non-saturating departments by max coverage (highest first = closer to 100%)
+non_saturating_depts_ordered <- df_saturation_after |>
+  filter(penetration == 1, !departamento %in% saturating_depts_ordered) |>
+  arrange(desc(coverage_pct)) |>
+  pull(departamento)
+
+# Create blue gradient palette for saturating (dark = earlier saturation)
+blue_palette <- colorRampPalette(c("#08306B", "#2171B5", "#6BAED6", "#C6DBEF"))(n_saturating)
+names(blue_palette) <- saturating_depts_ordered
+
+# Create gray gradient palette for non-saturating (dark = closer to 100%)
+n_non_saturating <- length(non_saturating_depts_ordered)
+gray_palette <- colorRampPalette(c("gray40", "gray75"))(max(n_non_saturating, 1))
+names(gray_palette) <- non_saturating_depts_ordered
+
+# Combined palette
+full_palette <- c(blue_palette, gray_palette)
+
+# Create plot data
+df_plot_after <- df_saturation_after |>
+  mutate(
+    is_saturating = departamento %in% saturating_depts_ordered
+  )
+
+# Export for web resources
+export(df_plot_after, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_c5_saturation_after.rds")))
+
+# Main visualization
+ggplot() +
+  # Non-saturating departments (gray gradient)
+  geom_line(
+    data = filter(df_plot_after, !is_saturating),
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    linewidth = 0.5,
+    alpha = 0.6
+  ) +
+  # Saturating departments (blue gradient)
+  geom_line(
+    data = filter(df_plot_after, is_saturating),
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    linewidth = 0.9
+  ) +
+  # Saturation threshold
+  geom_hline(
+    yintercept = 100,
+    linetype = "dashed",
+    color = "darkred",
+    linewidth = 0.6
+  ) +
+  # Saturation points
+  geom_point(
+    data = df_saturation_points_after,
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    size = 2.5,
+    shape = 16
+  ) +
+  # Annotation for threshold
+  annotate(
+    "text",
+    x = 5, y = 105,
+    label = "Saturation threshold (100%)",
+    hjust = 0,
+    size = 3.3,
+    color = "darkred",
+    fontface = "italic"
+  ) +
+  # Scales
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 200, 25),
+    labels = function(x) paste0(x, "%")
+  ) +
+  scale_color_manual(
+    values = full_palette,
+    breaks = saturating_depts_ordered  # Only show saturating in legend
+  ) +
+  # Labels
+  labs(
+    title = "Departmental Coverage by National Penetration Level",
+    subtitle = paste0("After gravity-based redistribution \u2014 ", n_saturating,
+                      " departments reach 100% coverage"),
+    x = "National Penetration Level",
+    y = "Departmental Coverage",
+    color = "Saturating Departments\n(dark = earlier saturation)"
+  ) +
+  # Legend in multiple rows at bottom
+  guides(
+    color = guide_legend(nrow = ceiling(n_saturating / 4), byrow = TRUE)
+  ) +
+  # Theme
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 10, color = "gray40"),
+    legend.text = element_text(size = 9),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 12),
+    axis.title = element_text(color = "gray40")
+  )
+
+# Clean up
+rm(df_saturation_points_after, saturating_depts_ordered, non_saturating_depts_ordered,
+   blue_palette, gray_palette, full_palette, df_plot_after, n_saturating, n_non_saturating)
+```
+
+## C6. Market Metrics After Redistribution
+
+This table presents the final departmental metrics at 100% national penetration after applying the gravity-based redistribution. It validates that total production is conserved through the redistribution process and shows the final coverage achieved by each department.
+
+```{r}
+#| label: tbl-c6-market-metrics-after
+#| tbl-cap: "Departmental market metrics at 100% penetration (after gravity redistribution)"
+
+# =============================================================================
+# C6. Market Metrics After Redistribution
+# =============================================================================
+
+# Extract data at 100% penetration
+df_metrics_after <- df_saturation_after |>
+  filter(penetration == 1) |>
+  select(departamento, bio_production, annual_consumption, coverage_pct) |>
+  mutate(
+    bio_production_mt = bio_production * 0.04536,
+    annual_consumption_mt = annual_consumption * 0.04536
+  ) |>
+  arrange(factor(departamento, levels = levels(df_market_baseline$departamento)))
+
+# Join with baseline for comparison
+tbl_metrics_comparison <- df_market_baseline |>
+  select(
+    departamento,
+    n_farmers_total,
+    land_ha_total,
+    max_bio_production_mt,
+    max_coverage_before = max_coverage_pct
+  ) |>
+  mutate(departamento = as.character(departamento)) |>
+  left_join(
+    df_metrics_after |>
+      select(departamento,
+             bio_production_after_mt = bio_production_mt,
+             coverage_after = coverage_pct),
+    by = "departamento"
+  ) |>
+  mutate(
+    coverage_change = coverage_after - max_coverage_before
+  )
+
+# Export for web resources
+export(tbl_metrics_comparison, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c6_market_metrics_after.rds")))
+
+# Generate GT table
+tbl_metrics_comparison |>
+  gt() |>
+  tab_header(
+    title = "Departmental Market Metrics Comparison",
+    subtitle = "Before vs. after gravity redistribution at 100% national penetration"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers_total = "Total Farmers",
+    land_ha_total = "Land (ha)",
+    max_bio_production_mt = "Local Prod. (MT)",
+    max_coverage_before = "Coverage Before",
+    bio_production_after_mt = "Final Prod. (MT)",
+    coverage_after = "Coverage After",
+    coverage_change = "Change (pp)"
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  fmt_number(
+    columns = c(n_farmers_total),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(land_ha_total, max_bio_production_mt, bio_production_after_mt),
+    use_seps = TRUE,
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(max_coverage_before, coverage_after),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = coverage_change,
+    decimals = 1,
+    pattern = "{x}pp",
+    force_sign = TRUE
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      columns = coverage_after,
+      rows = coverage_after >= 100
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(
+      columns = coverage_after,
+      rows = coverage_after < 50
+    )
+  ) |>
+  tab_style(
+    style = cell_text(color = "#2E7D32", weight = "bold"),
+    locations = cells_body(
+      columns = coverage_change,
+      rows = coverage_change > 0
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_farmers_total, land_ha_total, max_bio_production_mt,
+                bio_production_after_mt),
+    fns = list(Total = ~ sum(., na.rm = TRUE)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+  source_note = "Source: ENCOVI 2023 with gravity-based redistribution. Coverage calculated against FSI consumption (174 kg/capita/year, USDA 2019). Green = saturated (\u2265100%). Red = severe deficit (<50%)."
+) |>
+  tab_footnote(
+    footnote = paste0("Local Prod. = production from local farmers only. Final Prod. = after gravity redistribution. ", seed_label, "."),
+    locations = cells_column_labels(columns = c(max_bio_production_mt, bio_production_after_mt))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(13),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(9)
+  )
+
+# Clean up
+rm(df_metrics_after, tbl_metrics_comparison)
+```
+
+---
+
+# Phase D: Export
+
+## D1. Export Market Baseline
+
+This section exports the departmental market baseline metrics for use in downstream scenario analysis. The baseline contains static departmental characteristics: farmer counts, land area, consumption demand, and maximum biofortified production capacity.
+
+```{r}
+#| label: d1-export-baseline
+
+# =============================================================================
+# D1. Export Market Baseline
+# =============================================================================
+
+write_parquet(
+  df_market_baseline |> mutate(departamento = as.character(departamento)),
+  here("01_data", "02_processed",
+       "scenarios", paste0(file_prefix, "_market_baseline.parquet"))
+)
+```
+
+## D2. Export Saturation Scenarios
+
+This section exports the pre-calculated departmental coverage across all penetration levels (0-100%) with gravity-based redistribution already applied, so the redistribution is not recalculated during scenario simulation.
+
+Each row represents a department × penetration level combination with the final biofortified production available after network redistribution.
+
+```{r}
+#| label: d2-export-scenarios
+
+# =============================================================================
+# D2. Export Saturation Scenarios
+# =============================================================================
+
+write_parquet(
+  df_saturation_after |>
+    mutate(departamento = as.character(departamento)) |>
+    select(departamento, penetration, bio_production_qq = bio_production,
+           annual_consumption_qq = annual_consumption, coverage_pct, is_saturated),
+  here("01_data", "02_processed",
+       "scenarios", paste0(file_prefix, "_saturation_scenarios.parquet"))
+)
+```
+
+# Notes
+
+This script corresponds to the **`r paste0("Seed ", seed_year, " (", seed_code, ")")`** seed variant under the **`r subsidy_label`** subsidy regime. The yield change factors applied to farmers in the upstream economic impact calculation (Script `r paste0("02_04_", seed_suffix, "_", subsidy_suffix)`) determine the `production_biofortified` values used here, and the Likely Adopters score (Script `r paste0("02_06_", seed_suffix, "_", subsidy_suffix)`) determines the order in which farmers enter the adoption pool along the penetration curve.
+
+The continuous adoption model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05. These parameters are invariant across the nine seed-by-subsidy combinations: the calibration is performed once on the s22 + sub00 baseline configuration and applied identically to all combinations.
+
+The two outputs differ in their sensitivity to the subsidy regime: the structural baseline (`market_baseline.parquet`) is invariant across regimes for a given seed — consumption demand, farmer counts, land area, and maximum biofortified production capacity depend only on physical and demographic quantities. The saturation scenarios (`saturation_scenarios.parquet`) are subsidy-sensitive at intermediate penetration levels because the adoption-order ranking is driven by an economic score that responds to the subsidy regime; both endpoints (0% and 100% penetration) converge across regimes by construction, since at 0% no farmer is admitted and at 100% every farmer has `r_i(1) = 1`.
+
+## Methodological Assumptions
+
+The gravity-based redistribution model incorporates the following assumptions:
+
+1. **Calibrated consumption**: Departmental maize consumption includes two estimates calculated from survey-weighted population:
+   - **Direct human consumption**: 110 kg/capita/year (FAO/MAGA 2008)
+   - **FSI consumption** (Food, Seed, Industrial): 174 kg/capita/year (USDA 2019)
+
+   All coverage calculations use the **FSI estimate** as the denominator, since biofortified production must satisfy total domestic demand, not just direct human consumption.
+
+2. **Continuous adoption model**: Each farmer's effective biofortified production at national penetration `p` is `production_biofortified × r_i(p)`, where `r_i(p)` is a profile-specific sigmoid conversion ratio. The conversion ratio equals the profile floor at entry (`p = p_entry`) and converges to 1 at full penetration (`p = 1`) by construction. The three behavioural profiles (S, M, L) capture distinct adoption intensities: near-binary for small farmers, gradual for large farmers.
+
+3. **Gravity-weighted redistribution**: Surplus flows from each donor to all deficit departments, weighted by `w(i,j) × deficit_j / Σ_k(w(i,k) × deficit_k)`, where `w(i,j) = 1 / travel_time(i→j)²`. The travel time matrix is asymmetric by design, reflecting real directional differences in Guatemala's road infrastructure.
+
+4. **Iterative convergence**: Redistribution proceeds in passes until total redistributable excess falls below 1 quintal. Departments that receive more than their deficit in one pass become donors in the next.
+
+5. **No transport costs**: The gravity model determines flow patterns but does not deduct transport costs from production volumes.
+
+6. **No intermediaries**: Direct department-to-department flow without wholesale market hubs.
+
+7. **Capped coverage**: Departmental coverage is capped at 100%; excess beyond local demand represents implicit export outside the modeled system.
+
+## References
+
+Anderson, J. E., & van Wincoop, E. (2003). Gravity with Gravitas: A Solution to the Border Puzzle. *American Economic Review*, 93(1), 170–192. https://doi.org/10.1257/000282803321455214

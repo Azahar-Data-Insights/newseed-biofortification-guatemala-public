@@ -1,0 +1,858 @@
+---
+title: "Convert Raw Data to Parquet Format"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script converts original data files from Excel and Stata formats
+to Parquet format for efficient processing by the analytical pipeline.
+The workflow:
+
+1. Reads `raw_sources.yml` to identify active source files (only
+   files marked `active: true` are converted)
+2. Converts each survey source file to Parquet (no data transformations)
+3. Unifies multi-file reference sources into single Parquet tables:
+   - INE birth registry (2019-2023) → one parquet with `anio` column
+   - WHO Child Growth Standards (monthly, 0-5) → one parquet with `sexo`
+   - WHO Child Growth Standards (daily expanded, 0-5) → one parquet with `sexo`
+   - WHO Growth Reference 2007 (monthly, 5-19) → one parquet with `sexo`
+4. Verifies conversion fidelity (row count, column count, column names)
+5. Cross-references with the hash log from `00_01_download_raw_sources.qmd`
+6. Packages active originals into `_originals/active_raw_sources.zip`
+7. Removes the original files after successful conversion, verification,
+   and archival packaging (controlled by `remove_originals_after_conversion`)
+
+**Survey sources converted (one-to-one, manifest-driven):**
+
+- ENCOVI 2023: 5 active Excel files (out of 35+ available)
+- SIVESNU 2018: 4 Stata files
+
+**Reference sources unified (many-to-one):**
+
+- INE Nacimientos 2019-2023: 5 Excel files → 1 Parquet
+- WHO Standards monthly: 4 Excel files → 1 Parquet
+- WHO Standards daily (expanded): 2 Excel files → 1 Parquet
+- WHO Reference 5-19: 2 Excel files → 1 Parquet
+
+::: {.callout-note}
+## Prerequisite
+This script expects the original files to be present in
+`01_data/01_raw/{SOURCE}/`. Run `00_01_download_raw_sources.qmd` first
+if starting from a clean environment. If the Parquet files already
+exist and `force_convert` is `FALSE` (default), the script skips
+conversion and produces only the verification summary.
+:::
+
+# Setup
+
+```{r}
+#| label: setup
+
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+pacman::p_load(
+  arrow,          # Parquet file handling
+  here,           # Robust file path management
+  gt,             # Publication tables
+  janitor,        # clean_names()
+  yaml,           # Manifest parsing
+  fs,             # Filesystem operations in IO helpers
+  tidyverse       # General purpose data manipulation (includes purrr, stringr)
+)
+
+# Packages used via :: in provisioning functions (not loaded to avoid masking)
+# haven    — read_dta() for Stata file import
+# readxl   — read_excel() for Excel file import
+# curl     — download functions (only needed by 00_01)
+# digest   — SHA256 hashing (only needed by 00_01)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+options(scipen = 999, digits = 4)
+
+# Load provisioning utility functions
+source(here("02_code", "00_functions", "00_functions_provisioning.R"))
+```
+
+# Configuration
+
+```{r}
+#| label: configuration
+
+# Force re-conversion even if Parquet files already exist
+force_convert <- FALSE
+
+# Remove original files after successful conversion, verification, and
+# archival packaging. Originals are preserved in the ZIP archive and can
+# be re-downloaded at any time by re-running 00_01.
+remove_originals_after_conversion <- TRUE
+
+# Directories
+raw_root      <- here("01_data", "01_raw")
+originals_dir <- here("01_data", "01_raw", "_originals")
+
+# Hash log from 00_01 (used for cross-referencing, not recalculated)
+hash_log_path <- here("01_data", "01_raw", "_hashes_active.csv")
+```
+
+# Phase A: Convert Survey Data (One-to-One)
+
+Each active original file is converted to a Parquet file with the same
+name in the same directory. No data transformations are applied. The
+list of files to convert is driven by `raw_sources.yml` — only files
+marked `active: true` are processed.
+
+## A1. Build Conversion Manifest
+
+```{r}
+#| label: a1-build-conversion-manifest
+
+manifest <- yaml::read_yaml(
+  here("02_code", "_config", "raw_sources.yml")
+)
+
+manifest_flat <- flatten_manifest(manifest) |>
+  filter(active)
+
+# Build file-level conversion manifest from active entries only
+conversion_manifest <- manifest_flat |>
+  filter(source_label %in% c("ENCOVI_2023", "SIVESNU")) |>
+  mutate(
+    source_dir = case_when(
+      source_label == "ENCOVI_2023" ~ here("01_data", "01_raw", "ENCOVI_2023"),
+      source_label == "SIVESNU"     ~ here("01_data", "01_raw", "SIVESNU_2018")
+    ),
+    original_path = file.path(source_dir, filename),
+    original_filename = filename,
+    parquet_path = str_replace(original_path, "\\.(xlsx|dta)$", ".parquet"),
+    parquet_exists = file.exists(parquet_path),
+    needs_conversion = force_convert | !parquet_exists
+  )
+```
+
+```{r}
+#| label: tbl-a1-conversion-manifest
+#| tbl-cap: "Active files identified for one-to-one conversion"
+
+conversion_manifest |>
+  select(source_label, original_filename, parquet_exists, needs_conversion) |>
+  gt() |>
+  tab_header(
+    title = "Conversion manifest",
+    subtitle = "Active files from raw_sources.yml and their Parquet status"
+  ) |>
+  cols_label(
+    source_label = "Source",
+    original_filename = "Original file",
+    parquet_exists = "Parquet exists",
+    needs_conversion = "Needs conversion"
+  )
+```
+
+## A2. Execute Conversions
+
+```{r}
+#| label: a2-convert-files
+
+files_to_convert <- conversion_manifest |> filter(needs_conversion)
+
+if (nrow(files_to_convert) > 0) {
+  conversion_results <- files_to_convert |>
+    pmap_dfr(function(original_path, parquet_path, source_label, ...) {
+      convert_one_file(original_path, parquet_path, source_label)
+    })
+} else {
+  conversion_results <- tibble(
+    source_label = character(), original_filename = character(),
+    parquet_filename = character(), original_nrow = integer(),
+    original_ncol = integer(), conversion_success = logical()
+  )
+}
+```
+
+```{r}
+#| label: tbl-a2-conversion-results
+#| tbl-cap: "One-to-one conversion results"
+
+if (nrow(conversion_results) > 0) {
+  conversion_results |>
+    select(source_label, original_filename, original_nrow,
+           original_ncol, conversion_success) |>
+    gt() |>
+    tab_header(
+      title = "Phase A - Parquet conversion",
+      subtitle = "Files converted in this execution"
+    ) |>
+    cols_label(
+      source_label = "Source",
+      original_filename = "Original file",
+      original_nrow = "Rows",
+      original_ncol = "Columns",
+      conversion_success = "Success"
+    ) |>
+    fmt_number(columns = original_nrow, decimals = 0, use_seps = TRUE)
+} else {
+  tibble(status = "All Parquet files already exist. No conversions performed.") |>
+    gt() |>
+    tab_header(title = "Phase A - Parquet conversion")
+}
+```
+
+# Phase B: Unify INE Birth Registry (2019-2023)
+
+The INE birth registry is published as one Excel file per year, each
+with different sheet names and header structures. This phase reads all
+five files, harmonizes the format, and produces a single Parquet file
+with an `anio` column identifying the source year.
+
+```{r}
+#| label: b1-unify-ine-nacimientos
+
+ine_source_dir <- here("01_data", "01_raw", "INE_NACIMIENTOS")
+ine_output_path <- here("01_data", "01_raw", "INE_NACIMIENTOS",
+                         "ine_nacimientos_2019_2023.parquet")
+
+ine_needs_conversion <- force_convert | !file.exists(ine_output_path)
+
+if (ine_needs_conversion) {
+
+  ine_files <- tibble(
+    anio = 2019:2023,
+    filename = paste0("INE_Guatemala_Nacimientos_", 2019:2023, ".xlsx"),
+    sheet_name = case_when(
+      anio %in% c(2019, 2020) ~ "Depto. residencia y mes ocu",
+      anio %in% c(2021, 2022, 2023) ~ "2 Depto. residencia y mes ocu."
+    ),
+    skip_rows = case_when(
+      anio == 2023 ~ 7L,
+      TRUE         ~ 5L
+    )
+  )
+
+  departamentos_gt <- c(
+    "Guatemala", "El Progreso", "Sacatepequez", "Chimaltenango",
+    "Escuintla", "Santa Rosa", "Solola", "Totonicapan",
+    "Quetzaltenango", "Suchitepequez", "Retalhuleu", "San Marcos",
+    "Huehuetenango", "Quiche", "Baja Verapaz", "Alta Verapaz",
+    "Peten", "Izabal", "Zacapa", "Chiquimula",
+    "Jalapa", "Jutiapa"
+  )
+
+  df_nacimientos <- ine_files |>
+    pmap_dfr(function(anio, filename, sheet_name, skip_rows) {
+      load_ine_birth_year(
+        anio = anio,
+        filename = filename,
+        sheet_name = sheet_name,
+        skip_rows = skip_rows,
+        source_dir = ine_source_dir,
+        departamentos_gt = departamentos_gt
+      )
+    }) |>
+    arrange(anio, departamento, mes)
+
+  write_parquet(df_nacimientos, ine_output_path)
+
+  ine_summary <- tibble(
+    output_file = basename(ine_output_path),
+    description = "Birth registry 2019-2023",
+    n_rows = nrow(df_nacimientos),
+    detail = paste0(n_distinct(df_nacimientos$departamento),
+                    " departments, ", n_distinct(df_nacimientos$anio),
+                    " years"),
+    success = file.exists(ine_output_path)
+  )
+
+  rm(df_nacimientos)
+
+} else {
+  ine_summary <- tibble(
+    output_file = basename(ine_output_path),
+    description = "Birth registry 2019-2023",
+    n_rows = NA_integer_, detail = NA_character_, success = TRUE
+  )
+}
+```
+
+```{r}
+#| label: tbl-b1-ine-summary
+#| tbl-cap: "INE birth registry unification summary"
+
+ine_summary |>
+  gt() |>
+  tab_header(
+    title = "Phase B - INE birth registry",
+    subtitle = "Five annual files unified into a single Parquet"
+  ) |>
+  cols_label(
+    output_file = "Output file",
+    description = "Description",
+    n_rows = "Rows",
+    detail = "Detail",
+    success = "Success"
+  ) |>
+  fmt_number(columns = n_rows, decimals = 0, use_seps = TRUE) |>
+  sub_missing(missing_text = "cached")
+```
+
+# Phase C: Unify WHO Growth Standards and Reference
+
+The WHO publishes length/height-for-age data across multiple files
+covering different age ranges, sexes, and resolutions. This phase
+produces three unified Parquet files, each serving a distinct
+analytical purpose in the framework.
+
+## C1. WHO Standards — Monthly (0-60 months)
+
+Four files (boys/girls x 0-2/2-5 years) are combined into a single
+table with a `sexo` column. Month 24 appears in both the 0-2 and 2-5
+files; the 0-2 version is retained and the 2-5 duplicate is removed.
+This is consistent with the WHO measurement protocol: at 24 months the
+standard transitions from recumbent length to standing height, and the
+0-2 table uses the recumbent measurement convention.
+
+```{r}
+#| label: c1-who-standards-monthly
+
+who_src <- here("01_data", "01_raw", "WHO_GROWTH")
+
+who_monthly_path <- here(who_src, "who_standards_lhfa_monthly.parquet")
+who_monthly_needs <- force_convert | !file.exists(who_monthly_path)
+
+if (who_monthly_needs) {
+
+  df_girls <- bind_rows(
+    readxl::read_excel(
+      here(who_src, "lhfa_girls_0_to_2_years_zscores.xlsx")
+    ) |> clean_names(),
+    readxl::read_excel(
+      here(who_src, "lhfa_girls_2_to_5_years_zscores.xlsx")
+    ) |> clean_names() |>
+      filter(month > 24)
+  ) |>
+    mutate(sexo = "Mujer")
+
+  df_boys <- bind_rows(
+    readxl::read_excel(
+      here(who_src, "lhfa_boys_0_to_2_years_zscores.xlsx")
+    ) |> clean_names(),
+    readxl::read_excel(
+      here(who_src, "lhfa_boys_2_to_5_years_zscores.xlsx")
+    ) |> clean_names() |>
+      filter(month > 24)
+  ) |>
+    mutate(sexo = "Hombre")
+
+  df_who_monthly <- bind_rows(df_girls, df_boys) |>
+    arrange(sexo, month)
+
+  write_parquet(df_who_monthly, who_monthly_path)
+
+  who_monthly_summary <- tibble(
+    output_file = basename(who_monthly_path),
+    description = "Standards 0-60 months (monthly)",
+    n_rows = nrow(df_who_monthly),
+    age_range = paste0(min(df_who_monthly$month), "-",
+                       max(df_who_monthly$month), " months"),
+    success = TRUE
+  )
+
+  rm(df_girls, df_boys, df_who_monthly)
+
+} else {
+  who_monthly_summary <- tibble(
+    output_file = basename(who_monthly_path),
+    description = "Standards 0-60 months (monthly)",
+    n_rows = NA_integer_, age_range = NA_character_, success = TRUE
+  )
+}
+```
+
+## C2. WHO Standards — Daily Expanded (0-1856 days)
+
+Two expanded tables (boys/girls) with daily resolution. No
+deduplication needed — the files cover 0-1856 days without overlap.
+
+```{r}
+#| label: c2-who-standards-daily
+
+who_daily_path <- here(who_src, "who_standards_lhfa_daily.parquet")
+who_daily_needs <- force_convert | !file.exists(who_daily_path)
+
+if (who_daily_needs) {
+
+  df_who_daily <- bind_rows(
+    readxl::read_excel(
+      here(who_src, "lhfa-boys-zscore-expanded-tables.xlsx")
+    ) |> clean_names() |>
+      mutate(sexo = "Hombre"),
+    readxl::read_excel(
+      here(who_src, "lhfa-girls-zscore-expanded-tables.xlsx")
+    ) |> clean_names() |>
+      mutate(sexo = "Mujer")
+  ) |>
+    arrange(sexo, day)
+
+  write_parquet(df_who_daily, who_daily_path)
+
+  who_daily_summary <- tibble(
+    output_file = basename(who_daily_path),
+    description = "Standards 0-1856 days (daily expanded)",
+    n_rows = nrow(df_who_daily),
+    age_range = paste0("0-", round(max(df_who_daily$day) / 30.4375),
+                       " months (daily)"),
+    success = TRUE
+  )
+
+  rm(df_who_daily)
+
+} else {
+  who_daily_summary <- tibble(
+    output_file = basename(who_daily_path),
+    description = "Standards 0-1856 days (daily expanded)",
+    n_rows = NA_integer_, age_range = NA_character_, success = TRUE
+  )
+}
+```
+
+## C3. WHO Growth Reference 2007 — Monthly (5-19 years)
+
+Two files (boys/girls) from the WHO 2007 Growth Reference for
+school-age children and adolescents. Monthly resolution, months
+61-228.
+
+```{r}
+#| label: c3-who-reference-monthly
+
+who_ref_path <- here(who_src, "who_reference_hfa_monthly.parquet")
+who_ref_needs <- force_convert | !file.exists(who_ref_path)
+
+if (who_ref_needs) {
+
+  df_who_ref <- bind_rows(
+    readxl::read_excel(
+      here(who_src, "hfa-boys-z-who-2007-exp.xlsx")
+    ) |> clean_names() |>
+      mutate(sexo = "Hombre"),
+    readxl::read_excel(
+      here(who_src, "hfa-girls-z-who-2007-exp.xlsx")
+    ) |> clean_names() |>
+      mutate(sexo = "Mujer")
+  ) |>
+    arrange(sexo, month)
+
+  write_parquet(df_who_ref, who_ref_path)
+
+  who_ref_summary <- tibble(
+    output_file = basename(who_ref_path),
+    description = "Reference 2007, 5-19 years (monthly)",
+    n_rows = nrow(df_who_ref),
+    age_range = paste0(min(df_who_ref$month), "-",
+                       max(df_who_ref$month), " months"),
+    success = TRUE
+  )
+
+  rm(df_who_ref)
+
+} else {
+  who_ref_summary <- tibble(
+    output_file = basename(who_ref_path),
+    description = "Reference 2007, 5-19 years (monthly)",
+    n_rows = NA_integer_, age_range = NA_character_, success = TRUE
+  )
+}
+```
+
+```{r}
+#| label: tbl-c3-who-summary
+#| tbl-cap: "WHO growth data unification summary"
+
+bind_rows(who_monthly_summary, who_daily_summary, who_ref_summary) |>
+  gt() |>
+  tab_header(
+    title = "Phase C - WHO growth data",
+    subtitle = "Multiple Excel files unified into Parquet tables"
+  ) |>
+  cols_label(
+    output_file = "Output file",
+    description = "Description",
+    n_rows = "Rows",
+    age_range = "Age range",
+    success = "Success"
+  ) |>
+  fmt_number(columns = n_rows, decimals = 0, use_seps = TRUE) |>
+  sub_missing(missing_text = "cached")
+```
+
+# Phase D: Verify Conversion Fidelity
+
+Re-read each one-to-one Parquet file and compare its structure against
+the original to confirm that the conversion preserved all data.
+
+```{r}
+#| label: d1-verify-fidelity
+
+verifiable <- conversion_manifest |>
+  filter(file.exists(original_path), file.exists(parquet_path))
+
+if (nrow(verifiable) > 0) {
+  verification <- verifiable |>
+    pmap_dfr(function(original_path, parquet_path, source_label, ...) {
+      verify_one_pair(original_path, parquet_path, source_label)
+    })
+} else {
+  verification <- tibble(
+    source_label = character(), filename = character(),
+    nrow_original = integer(), nrow_parquet = integer(),
+    ncol_original = integer(), ncol_parquet = integer(),
+    cols_match = logical(), rows_match = logical(),
+    fidelity_ok = logical()
+  )
+}
+```
+
+```{r}
+#| label: tbl-d1-fidelity-verification
+#| tbl-cap: "Conversion fidelity verification"
+
+if (nrow(verification) > 0) {
+  verification |>
+    select(source_label, filename, nrow_original, nrow_parquet,
+           ncol_original, ncol_parquet, fidelity_ok) |>
+    gt() |>
+    tab_header(
+      title = "Phase D - Conversion fidelity",
+      subtitle = "Structure comparison between original and Parquet files"
+    ) |>
+    cols_label(
+      source_label = "Source",
+      filename = "Parquet file",
+      nrow_original = "Rows (original)",
+      nrow_parquet = "Rows (parquet)",
+      ncol_original = "Cols (original)",
+      ncol_parquet = "Cols (parquet)",
+      fidelity_ok = "Fidelity OK"
+    ) |>
+    fmt_number(
+      columns = c(nrow_original, nrow_parquet),
+      decimals = 0, use_seps = TRUE
+    ) |>
+    tab_style(
+      style = cell_fill(color = "#D4EDDA"),
+      locations = cells_body(columns = fidelity_ok,
+                             rows = fidelity_ok == TRUE)
+    ) |>
+    tab_style(
+      style = cell_fill(color = "#F8D7DA"),
+      locations = cells_body(columns = fidelity_ok,
+                             rows = fidelity_ok == FALSE)
+    )
+} else {
+  tibble(
+    status = "No original-parquet pairs available for verification."
+  ) |>
+    gt() |>
+    tab_header(title = "Phase D - Conversion fidelity")
+}
+```
+
+```{r}
+#| label: d2-fidelity-guard
+
+if (nrow(verification) > 0) {
+  n_failed <- sum(!verification$fidelity_ok)
+  if (n_failed > 0) {
+    stop(sprintf(
+      "Phase D halted: %d file(s) failed fidelity verification.",
+      n_failed
+    ))
+  }
+}
+```
+
+# Phase E: Cross-Reference with Download Hashes
+
+If the hash log from `00_01_download_raw_sources.qmd` is available,
+display it alongside the converted files for a complete provenance
+chain.
+
+```{r}
+#| label: tbl-e1-hash-cross-reference
+#| tbl-cap: "Provenance chain: download hashes linked to converted files"
+
+if (file.exists(hash_log_path)) {
+  hash_log <- read_csv(hash_log_path, show_col_types = FALSE)
+
+  provenance <- conversion_manifest |>
+    select(source_label, original_filename, parquet_exists) |>
+    left_join(
+      hash_log |> select(filename, sha256_observed, status),
+      by = c("original_filename" = "filename")
+    ) |>
+    mutate(
+      sha256_short = if_else(
+        is.na(sha256_observed),
+        NA_character_,
+        paste0(substr(sha256_observed, 1, 16), "...")
+      )
+    )
+
+  provenance |>
+    select(source_label, original_filename, sha256_short,
+           status, parquet_exists) |>
+    gt() |>
+    tab_header(
+      title = "Provenance chain",
+      subtitle = "Download hash verification linked to Parquet conversion"
+    ) |>
+    cols_label(
+      source_label = "Source",
+      original_filename = "Original file",
+      sha256_short = "SHA256 (truncated)",
+      status = "Hash status",
+      parquet_exists = "Parquet available"
+    ) |>
+    sub_missing(missing_text = "not in hash log") |>
+    tab_footnote(
+      footnote = "Full hashes in 01_data/01_raw/_hashes_active.csv",
+      locations = cells_column_labels(columns = sha256_short)
+    )
+} else {
+  tibble(
+    note = paste(
+      "Hash log not found. Run 00_01_download_raw_sources.qmd to",
+      "generate it. Conversion is valid regardless; the hash log",
+      "provides additional provenance for audit purposes."
+    )
+  ) |>
+    gt() |>
+    tab_header(
+      title = "Provenance chain",
+      subtitle = "Hash log from 00_01 not available"
+    )
+}
+```
+
+# Phase F: Package Active Sources to ZIP
+
+After conversion and fidelity verification, the original files are
+bundled into a single ZIP archive for audit purposes. This archive is
+the canonical artifact to share with auditors: it contains the exact
+bytes used by the framework, accompanied by the hash log from `00_01`.
+
+```{r}
+#| label: f1-package-active
+
+fs::dir_create(originals_dir)
+
+active_manifest <- flatten_manifest(
+  yaml::read_yaml(here("02_code", "_config", "raw_sources.yml"))
+) |>
+  filter(active) |>
+  mutate(
+    target_dir = case_when(
+      source_label == "ENCOVI_2023"     ~ here(raw_root, "ENCOVI_2023"),
+      source_label == "SIVESNU"         ~ here(raw_root, "SIVESNU_2018"),
+      source_label == "INE_NACIMIENTOS" ~ here(raw_root, "INE_NACIMIENTOS"),
+      source_label == "WHO_GROWTH"      ~ here(raw_root, "WHO_GROWTH"),
+      TRUE                              ~ NA_character_
+    ),
+    target_path = file.path(target_dir, filename)
+  )
+
+active_files_on_disk <- active_manifest |>
+  pull(target_path) |>
+  keep(file.exists)
+
+active_archive_path <- file.path(originals_dir, "active_raw_sources.zip")
+
+active_pkg <- package_to_zip(
+  files = active_files_on_disk,
+  archive_path = active_archive_path,
+  working_dir = raw_root
+)
+```
+
+```{r}
+#| label: tbl-f-packaging-summary
+#| tbl-cap: "ZIP packaging summary"
+
+active_pkg |>
+  select(archive_path, n_files, archive_size_mb, success) |>
+  gt() |>
+  tab_header(
+    title = "Phase F - ZIP packaging",
+    subtitle = "Active originals bundled for audit retention"
+  ) |>
+  cols_label(
+    archive_path = "Path",
+    n_files = "Files",
+    archive_size_mb = "Size (MB)",
+    success = "Success"
+  ) |>
+  fmt_number(columns = archive_size_mb, decimals = 1) |>
+  sub_missing(missing_text = "-")
+```
+
+# Phase G: Remove Original Files
+
+After successful conversion, verification, and archival packaging, the
+original Excel and Stata files are removed from the working directories.
+The originals are preserved in `active_raw_sources.zip` and can be
+re-downloaded at any time by re-running `00_01_download_raw_sources.qmd`.
+
+```{r}
+#| label: g1-remove-originals
+
+# Removal runs if: (a) enabled, (b) ZIP archive created successfully, and
+# (c) either verification passed or was skipped because parquets already
+# existed (nrow == 0 means nothing needed converting this run).
+fidelity_ok <- nrow(verification) == 0 || all(verification$fidelity_ok)
+
+if (remove_originals_after_conversion && fidelity_ok && active_pkg$success) {
+
+  # Survey originals (ENCOVI xlsx, SIVESNU dta) from conversion manifest
+  survey_files <- conversion_manifest |> pull(original_path)
+
+  # Reference source xlsx (INE births, WHO growth) from unification phases
+  ine_xlsx <- list.files(ine_source_dir, pattern = "\\.xlsx$",
+                         full.names = TRUE)
+  who_xlsx <- list.files(who_src, pattern = "\\.xlsx$",
+                         full.names = TRUE)
+
+  files_to_remove <- c(survey_files, ine_xlsx, who_xlsx) |>
+    keep(file.exists)
+
+  if (length(files_to_remove) > 0) {
+    files_removed <- file.remove(files_to_remove)
+
+    tibble(
+      filename = basename(files_to_remove),
+      removed = files_removed
+    ) |>
+      gt() |>
+      tab_header(
+        title = "Phase G - Original file removal",
+        subtitle = "Files removed after successful conversion and archival"
+      ) |>
+      cols_label(filename = "File", removed = "Removed")
+  } else {
+    tibble(status = "No original files found to remove (already cleaned up).") |>
+      gt() |>
+      tab_header(title = "Phase G - Original file removal")
+  }
+
+} else if (!remove_originals_after_conversion) {
+
+  tibble(
+    status = paste(
+      "Original file removal is disabled.",
+      "Set remove_originals_after_conversion <- TRUE to enable."
+    )
+  ) |>
+    gt() |>
+    tab_header(title = "Phase G - Original file removal")
+}
+```
+
+
+# Summary
+
+```{r}
+#| label: tbl-summary
+#| tbl-cap: "Script execution summary"
+
+unified_files <- c(
+  ine_output_path,
+  who_monthly_path,
+  who_daily_path,
+  who_ref_path
+)
+
+summary_data <- tribble(
+  ~metric,                              ~value,
+  "Survey sources converted (1:1)",     as.character(n_distinct(conversion_manifest$source_label)),
+  "Active files in manifest",           as.character(nrow(conversion_manifest)),
+  "Files converted (this run)",         as.character(nrow(files_to_convert)),
+  "Files already cached",              as.character(sum(!conversion_manifest$needs_conversion)),
+  "Unified reference parquets",         as.character(sum(file.exists(unified_files))),
+  "Fidelity verifications passed",      as.character(if (nrow(verification) > 0) sum(verification$fidelity_ok) else 0L),
+  "Hash log available",                 as.character(file.exists(hash_log_path)),
+  "Active sources archive",             as.character(active_pkg$success),
+  "Originals removed",                  as.character(remove_originals_after_conversion)
+)
+
+summary_data |>
+  gt() |>
+  tab_header(
+    title = "Execution summary",
+    subtitle = "00_02_convert_to_parquet.qmd"
+  ) |>
+  cols_label(metric = "Metric", value = "Value")
+```
+
+# Notes
+
+## Methodology
+
+This script performs three types of operations:
+
+**One-to-one conversions** (Phase A): Format conversion only — no data
+transformations, filtering, recoding, or derived variables. The list
+of files to convert is read from `raw_sources.yml` (only entries with
+`active: true`), ensuring that only the files required by the pipeline
+are converted. The Parquet files are byte-level representations of the
+original tabular content read by `readxl::read_excel()` or
+`haven::read_dta()`.
+
+**Many-to-one unifications** (Phases B-C): Multiple source files are
+combined into a single Parquet table with an identifying column (`anio`
+for INE, `sexo` for WHO). Minimal harmonization is applied:
+
+- INE: sheet names and header rows are normalized across years;
+  department names are standardized to match the pipeline convention
+- WHO monthly: month 24 is deduplicated (retained from the 0-2 file,
+  removed from the 2-5 file)
+- WHO daily and reference: combined without modification
+
+**Archival packaging** (Phase F): After conversion and fidelity
+verification, the original files are bundled into a ZIP archive for
+audit purposes. The active sources archive contains the exact bytes
+used by the framework. Packaging is performed here (rather than in
+`00_01`) so that the audit bundle accompanies verified conversion
+results. After packaging, the original files are removed from the
+working directories (Phase G).
+
+## Limitations
+
+If the original files have been removed (Phase G or manual deletion),
+the fidelity verification in Phase D cannot run. The hash log from
+`00_01` remains the primary provenance artifact.
+
+Stata `.dta` files may contain labeled values (factor levels with
+numeric codes). `haven::read_dta()` preserves these as `haven_labelled`
+vectors, which Arrow writes as their underlying numeric type with
+labels stored in Parquet metadata. Downstream scripts handle this
+correctly via `haven::as_factor()` or explicit recoding.

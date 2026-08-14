@@ -1,0 +1,1021 @@
+---
+title: "Generating Synthetic Population"
+subtitle: "Module 4: Covariate Prediction"
+---
+
+## Overview
+
+Scenario simulation needs a population that carries three things at once: the
+demographic and geographic structure of Guatemala, the dietary record of each
+child, and an anthropometric outcome to move. No single survey carries all
+three.
+
+ENCOVI 2023 carries the first two. It is nationally representative, it holds the
+household and geographic attributes that scenario assignment works on, and it
+records food consumption in enough detail to derive each child's nutrient
+intake. What it does not record is child height.
+
+SIVESNU 2018 records height. It provides height-for-age z-scores for children in
+the same 6–59 month range, but its sample is small and its departmental coverage
+uneven, so it cannot itself serve as the population of a departmental
+simulation.
+
+This module builds the simulation population from the ENCOVI side and supplies
+the missing outcome by **statistical matching** against SIVESNU:
+
+1. **Receptor cohort** — Every record is an ENCOVI child aged 6–59 months with a
+   complete dietary record, keeping its household, department and design weight.
+2. **Bridge model** — A model of the height-for-age z-score estimated on the
+   variables both surveys collect, which places donors and receptors on a single
+   comparable metric.
+3. **Donation** — Each receptor is matched to its nearest donors on that metric,
+   within its region and age band, and receives the anthropometric block of one
+   selected donor.
+4. **Departmental anchoring** — Donor selection is tilted, department by
+   department, so that weighted stunting prevalence approaches the Encuesta
+   Nacional de Salud Materno Infantil (ENSMI) 2014–2015 reference
+   [@MSPAS2017_ENSMI].
+5. **Nutrient profile** — Supplementation is added and the derived nutrient
+   variables are recomputed from the child's own ENCOVI intake.
+6. **Weight calibration** — Design weights are calibrated to that same
+   departmental reference, holding each department's weighted population fixed.
+
+The resulting dataset is the input to the biofortification scenarios.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting
+  glue,               # String interpolation for table subtitles
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by
+# framework 04_07)
+
+# --- Phase B: Cohort construction and harmonization ---
+tbl_b3_receptor_cohort <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_b3_receptor_cohort.rds"),
+  trust = TRUE
+)
+
+tbl_b4_donor_pool <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_b4_donor_pool.rds"),
+  trust = TRUE
+)
+
+tbl_b4_donated_coverage <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_b4_donated_coverage.rds"),
+  trust = TRUE
+)
+
+tbl_b5_harmonization <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_b5_harmonization.rds"),
+  trust = TRUE
+)
+
+# --- Phase C: Bridge model and donation ---
+tbl_c1_bridge_model <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_c1_bridge_model.rds"),
+  trust = TRUE
+)
+
+fig_c1_smooth_terms <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_fig_c1_smooth_terms.rds"),
+  trust = TRUE
+)
+
+# --- Phase D: Donation diagnostics ---
+tbl_d1_donor_usage <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_d1_donor_usage.rds"),
+  trust = TRUE
+)
+
+tbl_d2_departmental_tilt <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_d2_departmental_tilt.rds"),
+  trust = TRUE
+)
+
+tbl_d3_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_d3_distribution.rds"),
+  trust = TRUE
+)
+
+fig_d3_zscore_density <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_fig_d3_zscore_density.rds"),
+  trust = TRUE
+)
+
+# --- Phase E: Nutrient profile ---
+tbl_e1_chispitas <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_e1_chispitas.rds"),
+  trust = TRUE
+)
+
+tbl_e2_nutritional_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_e2_nutritional_summary.rds"),
+  trust = TRUE
+)
+
+# --- Phase F: Block PCA transformations ---
+tbl_f_pca_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_f_pca_summary.rds"),
+  trust = TRUE
+)
+
+# --- Phase G: Weight calibration ---
+tbl_h_calibration_diagnostics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_h_calibration_diagnostics.rds"),
+  trust = TRUE
+)
+
+tbl_h_calibration_results <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_h_calibration_results.rds"),
+  trust = TRUE
+)
+
+tbl_h_distribution_calibrated <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_h_distribution_calibrated.rds"),
+  trust = TRUE
+)
+
+fig_h_density_calibrated <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_fig_h_density_calibrated.rds"),
+  trust = TRUE
+)
+
+# --- Phase H: Export ---
+tbl_i_output_inventory <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_07_tbl_i_output_inventory.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Figures used in the narrative text
+
+n_receptors <- sum(tbl_b3_receptor_cohort$n_children)
+n_households <- sum(tbl_b3_receptor_cohort$n_households)
+n_weighted <- sum(tbl_b3_receptor_cohort$n_weighted)
+
+n_donors <- tbl_c1_bridge_model |>
+  filter(Metric == "Donors") |>
+  pull(Value) |>
+  parse_number()
+
+# Supplementation adherence, as used by the framework. The factor is a scalar
+# carried on every row of the contribution table.
+adherence_national <- tbl_e1_chispitas |>
+  pull(adherence_national) |>
+  first()
+
+bridge_deviance <- tbl_c1_bridge_model |>
+  filter(Metric == "Deviance explained") |>
+  pull(Value)
+
+bridge_correlation <- tbl_c1_bridge_model |>
+  filter(Metric == "Fitted-observed correlation") |>
+  pull(Value)
+
+# Departmental tilt: residual departure from the reference before calibration
+mean_gap_pp <- round(mean(abs(tbl_d2_departmental_tilt$gap_pp)), 2)
+max_gap_pp <- round(max(abs(tbl_d2_departmental_tilt$gap_pp)), 2)
+n_within_1se <- sum(abs(tbl_d2_departmental_tilt$gap_se) <= 1)
+n_departments <- nrow(tbl_d2_departmental_tilt)
+n_dept_boundary <- sum(tbl_d2_departmental_tilt$boundary)
+
+# Calibration: residual departure after calibration
+max_gap_calibrated <- round(max(abs(tbl_h_calibration_results$gap_pp)), 2)
+
+calib_ratio_range <- tbl_h_calibration_diagnostics |>
+  filter(Metric == "Adjustment ratio range") |>
+  pull(Value)
+
+calib_covariate_shift <- tbl_h_calibration_diagnostics |>
+  filter(Metric == "Maximum covariate shift") |>
+  pull(Value)
+
+n_output_variables <- sum(tbl_i_output_inventory$N_variables)
+```
+
+
+## Building the Two Cohorts
+
+### Receptor Cohort
+
+The receptors are the children the simulation acts on: ENCOVI 2023 children aged
+6–59 months with a complete dietary record. Age in months is the value estimated
+in
+[Estimate Age in Months](../01_nutritional_intakes/01_02_estimate_age_in_months.qmd)
+from the National Statistics Institute (INE) birth registry distributions.
+
+Each receptor keeps its household identifier, its department and its design
+weight, so the departmental composition of the synthetic population and the
+joint structure of household, geographic and dietary attributes are those of the
+survey.
+
+One attribute is completed at this point. Household education is missing for a
+small number of records and is required later, both as a bridge variable and as
+a predictor of the nutrient imputation in
+[Baseline and QPM Profiles](04_08_precompute_baseline_and_qpm_profiles.qmd).
+Missing values are filled with the weighted median of the child's own
+department and area, which keeps the completion inside the cell the variable is
+used to distinguish.
+
+```{r}
+#| label: tbl-b3-receptor-cohort
+#| tbl-cap: "Receptor cohort by department"
+
+tbl_b3_receptor_cohort |>
+  gt() |>
+  tab_header(
+    title = "Receptor Cohort",
+    subtitle = "ENCOVI 2023 children 6-59 months with a complete dietary record"
+  ) |>
+  cols_label(
+    region = "Region",
+    departamento = "Department",
+    n_children = "Children",
+    n_households = "Households",
+    n_weighted = "Weighted population"
+  ) |>
+  fmt_number(
+    columns = c(n_children, n_households, n_weighted),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_align(align = "left", columns = c(region, departamento)) |>
+  cols_align(align = "right", columns = c(n_children, n_households, n_weighted)) |>
+  grand_summary_rows(
+    fns = list(Total = ~ sum(.)),
+    columns = c(n_children, n_households, n_weighted),
+    fmt = ~ fmt_number(., decimals = 0, use_seps = TRUE)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Donor Pool
+
+The donors are the SIVESNU 2018 children carrying a valid height-for-age
+z-score, together with the variables the matching needs and the anthropometric
+block that is transferred. Donors are organised by region and age band, which
+are the cells the matching operates within.
+
+```{r}
+#| label: tbl-b4-donor-pool
+#| tbl-cap: "Donor pool by region and age band"
+
+tbl_b4_donor_pool |>
+  gt() |>
+  tab_header(
+    title = "Donor Pool",
+    subtitle = "SIVESNU 2018 children with a valid height-for-age z-score, by donation cell"
+  ) |>
+  cols_label(region = "Region") |>
+  tab_spanner(label = "Age band (months)", columns = -region) |>
+  cols_align(align = "left", columns = region) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Asymmetry Between the Two Cohorts
+There are `r format(n_receptors, big.mark = ",")` receptors and
+`r format(n_donors, big.mark = ",")` donors, so donors are used by more than one
+receptor. Donor usage and the reach of the candidate sets are reported in the
+diagnostics below.
+:::
+
+```{r}
+#| label: tbl-b4-donated-coverage
+#| tbl-cap: "Availability of the donated variable block"
+
+tbl_b4_donated_coverage |>
+  gt() |>
+  tab_header(
+    title = "Donated Block Coverage",
+    subtitle = "Variables transferred from the donor record"
+  ) |>
+  cols_label(
+    Category = "Category",
+    n_variables = "Variables",
+    n_available = "Available in donor pool"
+  ) |>
+  fmt_number(columns = c(n_variables, n_available), decimals = 0) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = c(n_variables, n_available)) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Harmonizing the Bridge Variables
+
+The matching only works if a variable means the same thing on both sides. The
+bridge variables are therefore brought to a common encoding: factor levels are
+aligned to a single ordered set, levels observed in fewer than 15 donors are
+collapsed into a residual category, and the resulting encoding is applied
+identically to donors and receptors.
+
+```{r}
+#| label: tbl-b5-harmonization
+#| tbl-cap: "Bridge variable harmonization"
+
+tbl_b5_harmonization |>
+  gt() |>
+  tab_header(
+    title = "Bridge Variable Harmonization",
+    subtitle = "Level alignment applied identically to donors and receptors"
+  ) |>
+  cols_label(
+    Variable = "Variable",
+    Levels_retained = "Levels retained",
+    Levels_collapsed = "Levels collapsed",
+    Pct_rare_receptors = "% rare (receptors)",
+    Pct_missing_receptors = "% missing (receptors)",
+    Assigned_level = "Assigned level",
+    In_bridge_model = "In bridge model"
+  ) |>
+  fmt_number(
+    columns = c(Pct_rare_receptors, Pct_missing_receptors),
+    decimals = 1
+  ) |>
+  cols_align(align = "left", columns = c(Variable, Assigned_level)) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Dietary Position
+The nutritional index enters the bridge model as the child's **survey-weighted
+percentile** within the intake distribution of its own survey. A percentile is
+free of the scale of the underlying measurements, which is what lets the dietary
+dimension inform the matching across two sources whose absolute intake levels
+are not directly comparable.
+:::
+
+
+## The Bridge Model
+
+The bridge model relates the height-for-age z-score to the variables both
+surveys collect. Its purpose is not prediction: it defines a **one-dimensional
+metric** on which donors and receptors are comparable. Two children with the
+same predicted value share the same expected anthropometric position given
+everything both surveys observe.
+
+Age and the two continuous covariates enter through penalized smooth terms; the
+harmonized factors enter parametrically.
+
+```{r}
+#| label: tbl-c1-bridge-model
+#| tbl-cap: "Bridge model fit"
+
+tbl_c1_bridge_model |>
+  gt() |>
+  tab_header(
+    title = "Bridge Model",
+    subtitle = "Height-for-age z-score on the variables shared by both surveys"
+  ) |>
+  cols_label(Metric = "Metric", Value = "Value") |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-c1-smooth-terms
+#| fig-cap: "Estimated smooth terms of the bridge model"
+#| fig-alt: >
+#|   Faceted line chart with three panels, one per smooth term of the bridge
+#|   model, in this order: age in months, household education level, and
+#|   nutritional index percentile. Each panel plots the value of the covariate
+#|   on the x-axis against its estimated contribution to the height-for-age
+#|   z-score on the y-axis, with a dashed horizontal line at zero. Only the age
+#|   curve departs clearly from a straight line, with a minimum around 27
+#|   months; the education and index curves are close to linear. All three
+#|   contributions sit below the zero line across the whole range.
+#| fig-width: 10
+#| fig-height: 4
+
+fig_c1_smooth_terms |>
+  ggplot(aes(x = x_value, y = fit)) +
+  geom_hline(yintercept = 0, color = "grey70", linetype = "dashed",
+             linewidth = 0.4) +
+  geom_line(color = "#1B6CA8", linewidth = 1) +
+  facet_wrap(~ term, scales = "free_x") +
+  labs(
+    title = "Bridge Model Smooth Terms",
+    subtitle = "Estimated contribution to the height-for-age z-score",
+    x = NULL,
+    y = "Contribution to z-score"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4", size = 9),
+    panel.grid.minor = element_blank()
+  )
+```
+
+::: {.callout-important}
+## What the Bridge Model Carries
+The model accounts for `r bridge_deviance` of the deviance in the donor pool,
+with a fitted-observed correlation of `r bridge_correlation`. That is the share
+of anthropometric position the shared variables locate; the remainder travels
+across as the selected donor's residual, described next.
+:::
+
+
+## Donation
+
+### Candidate Sets and Residual Transfer
+
+Each receptor is matched to the five donors closest to it on the bridge metric,
+within its donation cell of region and age band. Cells holding fewer donors than
+the candidate set draw from the full pool, so every receptor is matched.
+
+The transferred z-score is the receptor's **own predicted value plus the
+residual of the selected donor**. The predicted component follows the receptor's
+characteristics; the residual component reproduces the empirical dispersion of
+the outcome. Together they retain the variance and shape observed in the donor
+pool without assuming a parametric error form.
+
+::: {.callout-note}
+## Why Cells Are Regional
+Candidate donors are drawn within region and age band rather than within
+department. Departmental information reaches the population through the
+receptor's own attributes and through the departmental anchoring described
+next, so the donor pool is asked only for the conditional structure its sample
+size supports.
+:::
+
+### Departmental Anchoring
+
+Selection within each candidate set is governed by a departmental parameter that
+shifts the probability of drawing a donor whose transferred z-score falls below
+the stunting threshold. The expected weighted prevalence is monotone in that
+parameter, so the value reproducing the ENSMI reference is unique and is found
+by root finding.
+
+The magnitude of the parameter is itself informative: it measures how far the
+departmental level sits from what the shared variables predict on their own.
+
+```{r}
+#| label: tbl-d2-departmental-tilt
+#| tbl-cap: "Departmental tilt and achieved prevalence"
+
+tbl_d2_departmental_tilt |>
+  gt() |>
+  tab_header(
+    title = "Departmental Anchoring",
+    subtitle = "Tilt parameter and achieved prevalence against the ENSMI 2014-2015 reference"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_children = "Children",
+    prevalence_achieved = "Achieved",
+    se_expected = "SE (pp)",
+    stunting_rate_official = "ENSMI reference",
+    lambda = "Tilt",
+    boundary = "At boundary",
+    gap_pp = "Gap (pp)",
+    gap_se = "Gap (SE)"
+  ) |>
+  fmt_number(columns = n_children, decimals = 0, use_seps = TRUE) |>
+  fmt_percent(
+    columns = c(prevalence_achieved, stunting_rate_official),
+    decimals = 1
+  ) |>
+  fmt_number(columns = c(se_expected, lambda, gap_pp, gap_se), decimals = 2) |>
+  cols_align(align = "left", columns = departamento) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = boundary, rows = boundary == TRUE)
+  ) |>
+  tab_footnote(
+    footnote = "Tilt is the departmental parameter governing donor selection, searched within the range -8 to 8. A value at the boundary would mean the reference could not be reached within that range.",
+    locations = cells_column_labels(columns = lambda)
+  ) |>
+  tab_footnote(
+    footnote = "Gap (SE) expresses the departure from the reference in units of its own standard error.",
+    locations = cells_column_labels(columns = gap_se)
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Anchoring Result
+After the tilt, departmental prevalence departs from the ENSMI reference by
+`r mean_gap_pp` percentage points on average and by `r max_gap_pp` at the widest
+departure, with `r n_within_1se` of the `r n_departments` departments inside one
+standard error. No department reaches the boundary of the admissible tilt range.
+
+The tilt sets prevalence in expectation, over the random draw of donors. The
+weight calibration below fixes it on the realised sample.
+:::
+
+### Donation Diagnostics
+
+Because the donor pool is smaller than the receptor cohort, how often each donor
+is reused and how far the candidate sets reach are properties worth reporting.
+
+```{r}
+#| label: tbl-d1-donor-usage
+#| tbl-cap: "Donor usage and matching distance by region"
+
+tbl_d1_donor_usage |>
+  gt() |>
+  tab_header(
+    title = "Donor Usage",
+    subtitle = "Reuse and matching distance within each region"
+  ) |>
+  cols_label(
+    region = "Region",
+    n_receptors = "Receptors",
+    n_donors_used = "Donors used",
+    max_reuse = "Max reuse",
+    median_reuse = "Median reuse",
+    top1_pct_weighted = "Top donor (% weighted)",
+    mean_distance = "Mean distance",
+    pct_own_cell = "% from own cell"
+  ) |>
+  fmt_number(
+    columns = c(n_receptors, n_donors_used, max_reuse),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(columns = c(median_reuse, mean_distance), decimals = 2) |>
+  fmt_number(columns = c(top1_pct_weighted, pct_own_cell), decimals = 1) |>
+  cols_align(align = "left", columns = region) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-d3-distribution
+#| tbl-cap: "Transferred z-score distribution against the donor pool"
+
+tbl_d3_distribution |>
+  gt() |>
+  tab_header(
+    title = "Transferred Distribution",
+    subtitle = "Survey-weighted on the scale of each source"
+  ) |>
+  cols_label(Statistic = "Statistic") |>
+  fmt_number(columns = -Statistic, decimals = 2) |>
+  cols_align(align = "left", columns = Statistic) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-d3-zscore-density
+#| fig-cap: "Transferred height-for-age z-score distribution"
+#| fig-alt: >
+#|   Density curve of the transferred height-for-age z-score across the synthetic
+#|   population, with the z-score on the x-axis and density on the y-axis,
+#|   weighted by the design weight. A dashed vertical line marks the stunting
+#|   threshold at minus 2. The distribution is smooth, with a main mode near
+#|   minus 1.8 and an additional shoulder around minus 2.7, and a substantial
+#|   share of its mass to the left of the threshold.
+#| fig-width: 9
+#| fig-height: 5
+
+fig_d3_zscore_density |>
+  ggplot(aes(x = zlen_predicted, weight = factor)) +
+  geom_density(fill = "#1B6CA8", alpha = 0.35, color = "#1B6CA8") +
+  geom_vline(xintercept = -2, linetype = "dashed", color = "#E53935",
+             linewidth = 0.8) +
+  labs(
+    title = "Transferred Height-for-Age Z-Score",
+    subtitle = "Synthetic population weighted by design weight. Dashed line = stunting threshold",
+    x = "Height-for-age z-score",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+## Nutrient Profile
+
+### Supplementation Contribution
+
+The micronutrient powder programme delivers iron and zinc through daily sachets.
+Its expected contribution is added to the non-maize component of each child's
+intake, scaled by the departmental coverage published by INE and by a national
+adherence factor of `r round(adherence_national, 3)`. That factor is the
+survey-weighted mean of the adherence estimated in
+[Chispitas Supplementation](04_02_integrate_chispitas_supplementation.qmd),
+taken over the SIVESNU 2018 children recorded as programme recipients, which is
+the full set of recipients in that survey rather than the subset selected as
+donors.
+
+```{r}
+#| label: tbl-e1-chispitas
+#| tbl-cap: "Expected supplementation contribution by department"
+
+tbl_e1_chispitas |>
+  select(-adherence_national) |>
+  gt() |>
+  tab_header(
+    title = "Chispitas Contribution",
+    subtitle = glue(
+      "Expected daily addition to non-maize iron and zinc | ",
+      "Adherence among recipients: {round(adherence_national, 3)}"
+    )
+  ) |>
+  cols_label(
+    departamento = "Department",
+    chispitas_coverage_official = "Coverage",
+    delta_fe_mg = "Iron (mg/day)",
+    delta_zn_mg = "Zinc (mg/day)"
+  ) |>
+  fmt_percent(columns = chispitas_coverage_official, decimals = 1) |>
+  fmt_number(columns = c(delta_fe_mg, delta_zn_mg), decimals = 3) |>
+  cols_align(align = "left", columns = departamento) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Derived Variables
+
+Total intake, absorbed fractions and the composite nutritional index are
+computed from the source-specific components of the child's own ENCOVI record.
+Iron absorption uses the fixed fraction adopted for predominantly plant-based
+diets and zinc absorption follows the Miller saturation model with its age term,
+as documented in
+[Bioavailability Adjustments](04_03_calculate_bioavailability_adjustments.qmd).
+
+The derivation runs twice:
+
+- The **whole-diet pass** uses maize and non-maize together and produces the
+  descriptive nutrient profile of the synthetic population.
+- The **non-maize pass** uses only the non-maize sources and produces the index
+  at which the GAM effect model is evaluated. It applies the Miller model to the
+  non-maize zinc pool alone and uses its own normalization parameters.
+
+The absorption constants are identical in both passes, so the axis the effect
+model was estimated on and the axis it is evaluated on are constructed the same
+way.
+
+```{r}
+#| label: tbl-e2-nutritional-summary
+#| tbl-cap: "Nutrient profile of the synthetic population"
+
+tbl_e2_nutritional_summary |>
+  gt() |>
+  tab_header(
+    title = "Nutrient Profile",
+    subtitle = "Synthetic population after supplementation and derivation"
+  ) |>
+  cols_label(
+    Variable = "Variable",
+    Mean = "Mean",
+    P25 = "P25",
+    Median = "Median",
+    P75 = "P75"
+  ) |>
+  fmt_number(columns = c(Mean, P25, Median, P75), decimals = 2) |>
+  cols_align(align = "left", columns = Variable) |>
+  cols_align(align = "right", columns = c(Mean, P25, Median, P75)) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Block Components
+
+The block components the response model references are recomputed from the
+donated variables using the transformations fitted in
+[Stunting Modeling Data](04_05_prepare_stunting_modeling_data.qmd).
+
+```{r}
+#| label: tbl-f-pca-summary
+#| tbl-cap: "Block PCA components carried into the synthetic population"
+
+tbl_f_pca_summary |>
+  gt() |>
+  tab_header(
+    title = "Block PCA Components",
+    subtitle = "Transformations applied to the donated variables"
+  ) |>
+  cols_label(
+    Block = "Block",
+    Description = "Description",
+    Input_variables = "Input variables",
+    Components = "Components"
+  ) |>
+  fmt_number(columns = c(Input_variables, Components), decimals = 0) |>
+  cols_align(align = "left", columns = c(Block, Description)) |>
+  cols_align(align = "right", columns = c(Input_variables, Components)) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Weight Calibration
+
+Design weights are calibrated so that weighted departmental prevalence
+reproduces the ENSMI reference, holding each department's weighted population
+total fixed.
+
+```{r}
+#| label: tbl-h-calibration-diagnostics
+#| tbl-cap: "Weight calibration diagnostics"
+
+tbl_h_calibration_diagnostics |>
+  gt() |>
+  tab_header(
+    title = "Calibration Diagnostics",
+    subtitle = "Effect of the calibration on the weight distribution"
+  ) |>
+  cols_label(Metric = "Metric", Value = "Value") |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Scale of the Adjustment
+Individual weights move within a ratio range of `r calib_ratio_range`, and the
+largest shift induced in any covariate mean is `r calib_covariate_shift`. The
+calibration reaches the departmental targets without displacing the composition
+of the population it acts on.
+:::
+
+```{r}
+#| label: tbl-h-calibration-results
+#| tbl-cap: "Departmental prevalence after calibration"
+
+tbl_h_calibration_results |>
+  gt() |>
+  tab_header(
+    title = "Calibration Results",
+    subtitle = "Weighted prevalence by department against the ENSMI reference"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_children = "Children",
+    n_weighted = "Weighted population",
+    prevalence = "Prevalence",
+    mean_zscore = "Mean z-score",
+    stunting_rate_official = "ENSMI reference",
+    gap_pp = "Gap (pp)"
+  ) |>
+  fmt_number(columns = c(n_children, n_weighted), decimals = 0, use_seps = TRUE) |>
+  fmt_percent(columns = c(prevalence, stunting_rate_official), decimals = 1) |>
+  fmt_number(columns = c(mean_zscore, gap_pp), decimals = 2) |>
+  cols_align(align = "left", columns = departamento) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-h-distribution-calibrated
+#| tbl-cap: "Z-score distribution under design and calibrated weights"
+
+tbl_h_distribution_calibrated |>
+  gt() |>
+  tab_header(
+    title = "Distributional Effect of the Calibration",
+    subtitle = "Donor pool, design weights and calibrated weights"
+  ) |>
+  cols_label(Statistic = "Statistic") |>
+  fmt_number(columns = -Statistic, decimals = 2) |>
+  cols_align(align = "left", columns = Statistic) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-h-density-calibrated
+#| fig-cap: "Z-score density under design and calibrated weights"
+#| fig-alt: >
+#|   Two overlaid density curves of the height-for-age z-score across the
+#|   synthetic population, one weighted by the design weight and one by the
+#|   calibrated weight, with the z-score on the x-axis and density on the y-axis.
+#|   A dashed vertical line marks the stunting threshold at minus 2. The two
+#|   curves track each other closely across the range.
+#| fig-width: 9
+#| fig-height: 5
+
+fig_h_density_calibrated |>
+  pivot_longer(
+    cols = c(factor, weight_calibrated),
+    names_to = "weight_type",
+    values_to = "weight_value"
+  ) |>
+  mutate(
+    weight_type = recode(
+      weight_type,
+      factor = "Design weights",
+      weight_calibrated = "Calibrated weights"
+    )
+  ) |>
+  ggplot(aes(x = zlen_predicted, weight = weight_value, fill = weight_type,
+             color = weight_type)) +
+  geom_density(alpha = 0.3) +
+  geom_vline(xintercept = -2, linetype = "dashed", color = "#E53935",
+             linewidth = 0.8) +
+  scale_fill_manual(values = c("Design weights" = "#1B6CA8",
+                               "Calibrated weights" = "#3AAF85")) +
+  scale_color_manual(values = c("Design weights" = "#1B6CA8",
+                                "Calibrated weights" = "#3AAF85")) +
+  labs(
+    title = "Effect of Calibration on the Z-Score Distribution",
+    subtitle = "Dashed line = stunting threshold (HAZ = -2)",
+    x = "Height-for-age z-score",
+    y = "Density",
+    fill = NULL,
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+## Output
+
+```{r}
+#| label: tbl-i-output-inventory
+#| tbl-cap: "Variable inventory of the synthetic population"
+
+tbl_i_output_inventory |>
+  gt() |>
+  tab_header(
+    title = "Output Inventory",
+    subtitle = "Variables carried by the synthetic population dataset"
+  ) |>
+  cols_label(
+    Category = "Category",
+    N_variables = "Variables",
+    Source = "Source"
+  ) |>
+  fmt_number(columns = N_variables, decimals = 0) |>
+  cols_align(align = "left", columns = c(Category, Source)) |>
+  cols_align(align = "right", columns = N_variables) |>
+  grand_summary_rows(
+    fns = list(Total = ~ sum(.)),
+    columns = N_variables,
+    fmt = ~ fmt_number(., decimals = 0)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+## Summary
+
+### Key Findings
+
+1. **Bridge model coverage**: The variables shared by both surveys account for
+   `r bridge_deviance` of the deviance in the donor pool, with a fitted-observed
+   correlation of `r bridge_correlation`. The rest of each child's anthropometric
+   position travels across as the selected donor's residual.
+
+2. **Departmental anchoring**: After the tilt, weighted departmental prevalence
+   departs from the ENSMI reference by `r mean_gap_pp` percentage points on
+   average, with `r n_within_1se` of `r n_departments` departments inside one
+   standard error and none at the boundary of the admissible range.
+
+3. **Calibration closes the residual gap**: After weight calibration the
+   departmental gap is `r max_gap_calibrated` percentage points at its widest,
+   with adjustment ratios inside `r calib_ratio_range` and a largest covariate
+   mean shift of `r calib_covariate_shift`.
+
+4. **Output**: `r format(n_receptors, big.mark = ",")` children across
+   `r format(n_households, big.mark = ",")` households, representing
+   `r format(round(n_weighted), big.mark = ",", scientific = FALSE)` children
+   nationally, carrying `r n_output_variables` variables.
+
+::: {.callout-warning}
+## Limitations
+
+1. **Conditional independence** — The donation assumes that, given the shared
+   variables, the anthropometric block is independent of the variables observed
+   only in ENCOVI. This assumption is not verifiable from the data.
+
+2. **Donor reuse** — The donor pool is smaller than the receptor cohort, so
+   donors are used by more than one receptor. Usage and mean matching distance
+   are reported by region.
+
+3. **Reference period** — The departmental reference predates the receptor
+   survey. The departmental anchoring absorbs changes in level occurring between
+   the two collection periods.
+:::
+
+### Application
+
+This population is the input to
+[Baseline and QPM Profiles](04_08_precompute_baseline_and_qpm_profiles.qmd),
+which computes each child's baseline and biofortified nutrient profile, and
+through it to the
+[scenario simulation](../06_scenarios/06_01_calculate_market_baseline.qmd).

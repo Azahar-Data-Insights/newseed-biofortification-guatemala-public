@@ -1,0 +1,2084 @@
+---
+title: "Prepare Agricultural Data from ENCOVI 2023"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script prepares agricultural data from ENCOVI 2023 for the economic impact analysis phase. It extracts, cleans, and integrates information about white maize farmers from multiple ENCOVI survey modules, applying standardized unit conversions and filtering to active producers only.
+
+## Main Operations
+
+1. Load raw ENCOVI 2023 agricultural module data (production units, crop details, households, persons)
+2. Apply unit corrections for land area and production quantities
+3. Calculate derived variables (yield, seed expenditure per manzana, input costs)
+4. Extract farmer sociodemographic characteristics
+5. Filter to active white maize farmers only (wt_corn == 1 AND land_wtcorn > 0)
+6. Select relevant variables for downstream segmentation and adoption models
+
+## Data Sources
+
+| Source | Module | Description |
+|--------|--------|-------------|
+| `encovi_2023_c16sa_unidad.parquet` | Agricultural Unit Header | Farm unit identification, poverty status |
+| `encovi_2023_c16sbc_produccion.parquet` | Crop Production | Cultivation details, harvest, costs, sales |
+| `encovi_2023_hogares.parquet` | Household | Household composition, location |
+| `encovi_2023_personas.parquet` | Persons | Individual demographics |
+
+## Unit Correction Strategy
+
+ENCOVI 2023 contains inconsistent measurement units for land area and production quantities. This script applies systematic corrections based on:
+
+- **Land area**: Values are reported in mixed units (manzanas, caballerías, acres, cuerdas, cuadras, m²). Corrections are applied based on value ranges to standardize to manzanas.
+- **Production**: Quantities are reported in various units (quintales, libras, arrobas, kg, etc.). Corrections standardize all values to quintales.
+- **Yield validation**: After initial conversion, anomalous yields (outside 1-150 qq/mz) trigger secondary unit corrections.
+
+# Setup
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Environment setup
+# =============================================================================
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  janitor,            # Data cleaning utilities
+  haven,              # Manage Stata labels from parquet conversion
+  gt,                 # Professional table formatting
+  tidyverse           # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(
+  scipen = 999,
+  digits = 4,
+  dplyr.summarise.inform = FALSE
+)
+
+# Load utility functions
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Unit Corrections
+
+This phase loads raw ENCOVI 2023 agricultural module data and applies systematic unit corrections to standardize land area and production quantities. ENCOVI respondents report values in heterogeneous units, harmonized here before analysis.
+
+## A1. Load Raw Data
+
+Load the four core ENCOVI 2023 tables required for agricultural analysis. All files have been previously converted from Stata format to Parquet with SHA256 hash verification for data integrity.
+
+```{r}
+#| label: a1-load-raw-data
+
+# =============================================================================
+# Load ENCOVI 2023 agricultural module tables
+# Source: 01_data/01_raw/ENCOVI_2023/
+# =============================================================================
+
+# Agricultural unit header (farm identification, poverty status)
+df_unidad_raw <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023",
+       "encovi_2023_c16sa_unidad.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Crop production details (cultivation, harvest, costs, sales)
+df_produccion_raw <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023",
+       "encovi_2023_c16sbc_produccion.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Household data (composition, location, demographics)
+df_hogares_raw <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023",
+       "encovi_2023_hogares.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Person-level data (individual demographics)
+df_personas_raw <- read_parquet(
+  here("01_data", "01_raw", "ENCOVI_2023",
+       "encovi_2023_personas.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+```
+
+## A2. Filter to White Maize Production
+
+Filter the production dataset to white maize records only (cod_cultivo == 142) and create a reference vector of household IDs for data integrity verification throughout the pipeline.
+
+```{r}
+#| label: a2-filter-white-maize
+
+# =============================================================================
+# Filter to white maize production records only
+# cod_cultivo == 142 corresponds to "Maíz blanco" in ENCOVI classification
+# =============================================================================
+
+# Filter production data to white maize only
+df_produccion_maiz <- df_produccion_raw |>
+  filter(cod_cultivo == 142)
+
+# Create reference vector of white maize farmer households
+# This vector serves as integrity check throughout the pipeline
+vec_hogares_maiz_blanco <- df_produccion_maiz |>
+  distinct(no_hogar) |>
+  pull(no_hogar)
+```
+
+## A3. Unit Corrections
+
+Apply systematic corrections to standardize heterogeneous measurement units for white maize records. Original variables are preserved; corrected values are stored in new columns with unit suffix for traceability.
+
+### Correction Logic
+
+**Land area (p16b03 → p16b03_mz)**:
+
+| Original Value Range | Assumed Unit | Conversion |
+|---------------------|--------------|------------|
+| 0 or NA | Missing/none | 0.05 mz (minimum viable plot) |
+| < 0.05 | Caballerías | × 45 |
+| 40 - 60 | Acres | × 0.7 |
+| 60 - 100 | Cuerdas | × 0.25 |
+| 100 - 350 | Cuadras | × 0.025 |
+| ≥ 350 | Square meters | ÷ 7,000 |
+| Other | Manzanas | No change |
+
+**Production quantity (p16b05a → p16b05a_qq)**: Two-stage process:
+
+1. Primary conversion based on declared unit (p16b05b)
+2. Yield-based validation to detect remaining misclassifications
+
+```{r}
+#| label: a3-unit-corrections
+
+# =============================================================================
+# Apply unit corrections to white maize production data
+# Two-stage process: (1) land area, (2) production quantities with yield validation
+# Original variables preserved; corrected values in new columns with unit suffix
+# =============================================================================
+
+df_produccion_corrected <- df_produccion_maiz |>
+  
+  # -------------------------------------------------------------------------
+  # Stage 1: Land area corrections (p16b03 → p16b03_mz in manzanas)
+  # -------------------------------------------------------------------------
+  mutate(
+    p16b03_mz = case_when(
+      is.na(p16b03) | p16b03 == 0 ~ 0.05,             # Zero/NA → minimum viable plot
+      p16b03 < 0.05 ~ p16b03 * 45,                    # Caballerías → manzanas
+      p16b03 >= 40 & p16b03 < 60 ~ p16b03 * 0.7,      # Acres → manzanas
+      p16b03 >= 60 & p16b03 < 100 ~ p16b03 * 0.25,    # Cuerdas → manzanas
+      p16b03 >= 100 & p16b03 < 350 ~ p16b03 * 0.025,  # Cuadras → manzanas
+      p16b03 >= 350 ~ p16b03 / 7000,                  # Square meters → manzanas
+      TRUE ~ p16b03                                    # Already in manzanas
+    )
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Stage 2a: Primary production conversion (p16b05a → p16b05a_qq in quintales)
+  # -------------------------------------------------------------------------
+  mutate(
+    p16b05a_qq = case_when(
+      # Direct weight measures
+      p16b05b == "QUINTAL" ~ p16b05a,
+      p16b05b == "LIBRA" ~ p16b05a * 0.01,
+      p16b05b == "ARROBA" ~ p16b05a * 0.25,
+      p16b05b == "TONELADA" ~ p16b05a * 100,
+      p16b05b == "KILOGRAMO" ~ p16b05a * 0.1,
+      p16b05b == "GRAMO" ~ p16b05a * 0.001,
+      
+      # Container measures (approximate conversions)
+      p16b05b %in% c("BULTO", "SACO", "BOLSA") ~ p16b05a,
+      p16b05b == "DOCENA" ~ p16b05a * 0.0125,
+      p16b05b == "CARGA" ~ p16b05a * 4,
+      p16b05b == "TONEL" ~ p16b05a * 20,
+      p16b05b == "LATA" ~ p16b05a * 0.25,
+      p16b05b == "ALMUD" ~ p16b05a * 0.1,
+      
+      # Default: assume already in quintales
+      TRUE ~ p16b05a
+    )
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Stage 2b: Yield-based validation and secondary corrections
+  # Anomalous yields flag remaining unit misclassification
+  # -------------------------------------------------------------------------
+  mutate(
+    yield_preliminary = if_else(p16b03_mz > 0, p16b05a_qq / p16b03_mz, NA_real_),
+    
+    p16b05a_qq = case_when(
+      # Extremely low yields suggest larger units were used
+      yield_preliminary > 0 & yield_preliminary < 1.1 ~ p16b05a_qq * 100,
+      yield_preliminary >= 1.1 & yield_preliminary < 3 ~ p16b05a_qq * 20,
+      
+      # Extremely high yields suggest smaller units were used
+      yield_preliminary >= 150 & yield_preliminary < 300 ~ p16b05a_qq * 0.1,
+      yield_preliminary >= 300 & yield_preliminary < 1000 ~ p16b05a_qq * 0.01,
+      yield_preliminary >= 1000 ~ p16b05a_qq * 0.001,
+      
+      # Valid range: keep as is
+      TRUE ~ p16b05a_qq
+    )
+  ) |>
+  
+  # Remove auxiliary column
+  select(-yield_preliminary)
+```
+
+## A4. Unit Corrections Verification
+
+Document the impact of unit corrections. The majority of white maize records (>90%) required no correction, consistent with most respondents reporting values in standard units (manzanas for land, quintales for production).
+
+```{r}
+#| label: tbl-a4-land-corrections
+#| tbl-cap: "Land area unit corrections applied to white maize records"
+
+# =============================================================================
+# Tabulate land area corrections
+# =============================================================================
+
+tbl_land_corrections <- df_produccion_corrected |>
+  mutate(
+    correction_type = case_when(
+      is.na(p16b03) | p16b03 == 0 ~ "Zero/NA → 0.05 mz",
+      p16b03 < 0.05 ~ "Caballerías (×45)",
+      p16b03 >= 40 & p16b03 < 60 ~ "Acres (×0.7)",
+      p16b03 >= 60 & p16b03 < 100 ~ "Cuerdas (×0.25)",
+      p16b03 >= 100 & p16b03 < 350 ~ "Cuadras (×0.025)",
+      p16b03 >= 350 ~ "m² (÷7000)",
+      TRUE ~ "No correction (manzanas)"
+    )
+  ) |>
+  count(correction_type, name = "n_records") |>
+  mutate(
+    pct = n_records / sum(n_records),
+    correction_type = factor(
+      correction_type,
+      levels = c("No correction (manzanas)", "Zero/NA → 0.05 mz", 
+                 "Caballerías (×45)", "Acres (×0.7)", "Cuerdas (×0.25)",
+                 "Cuadras (×0.025)", "m² (÷7000)")
+    )
+  ) |>
+  arrange(correction_type)
+
+export(
+  tbl_land_corrections,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_a4_land_corrections.rds")
+)
+
+tbl_land_corrections |>
+  gt() |>
+  tab_header(
+    title = "Land Area Unit Corrections",
+    subtitle = "White maize records (cod_cultivo = 142)"
+  ) |>
+  cols_label(
+    correction_type = "Correction Applied",
+    n_records = "Records",
+    pct = "Percentage"
+  ) |>
+  cols_align(align = "left", columns = correction_type) |>
+  fmt_number(columns = n_records, use_seps = TRUE, decimals = 0) |>
+  fmt_percent(columns = pct, decimals = 1) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = correction_type == "No correction (manzanas)")
+  ) |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023, agricultural production module"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary object
+rm(tbl_land_corrections)
+```
+
+```{r}
+#| label: tbl-a4-yield-summary
+#| tbl-cap: "White maize yield distribution after unit corrections"
+
+# =============================================================================
+# Yield distribution summary for validation
+# =============================================================================
+
+tbl_yield_summary <- df_produccion_corrected |>
+  filter(p16b03_mz > 0) |>
+  mutate(yield_qq_mz = p16b05a_qq / p16b03_mz) |>
+  summarise(
+    n_records = n(),
+    n_valid_yield = sum(!is.na(yield_qq_mz)),
+    yield_min = min(yield_qq_mz, na.rm = TRUE),
+    yield_p05 = quantile(yield_qq_mz, 0.05, na.rm = TRUE),
+    yield_p25 = quantile(yield_qq_mz, 0.25, na.rm = TRUE),
+    yield_median = median(yield_qq_mz, na.rm = TRUE),
+    yield_p75 = quantile(yield_qq_mz, 0.75, na.rm = TRUE),
+    yield_p95 = quantile(yield_qq_mz, 0.95, na.rm = TRUE),
+    yield_max = max(yield_qq_mz, na.rm = TRUE),
+    n_below_3 = sum(yield_qq_mz < 3, na.rm = TRUE),
+    n_above_150 = sum(yield_qq_mz > 150, na.rm = TRUE)
+  ) |>
+  pivot_longer(everything(), names_to = "metric", values_to = "value") |>
+  mutate(
+    metric = case_match(
+      metric,
+      "n_records" ~ "Total records",
+      "n_valid_yield" ~ "Records with valid yield",
+      "yield_min" ~ "Minimum (qq/mz)",
+      "yield_p05" ~ "Percentile 5 (qq/mz)",
+      "yield_p25" ~ "Percentile 25 (qq/mz)",
+      "yield_median" ~ "Median (qq/mz)",
+      "yield_p75" ~ "Percentile 75 (qq/mz)",
+      "yield_p95" ~ "Percentile 95 (qq/mz)",
+      "yield_max" ~ "Maximum (qq/mz)",
+      "n_below_3" ~ "Records with yield < 3 qq/mz",
+      "n_above_150" ~ "Records with yield > 150 qq/mz"
+    )
+  )
+
+export(
+  tbl_yield_summary,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_a4_yield_summary.rds")
+)
+
+tbl_yield_summary |>
+  gt() |>
+  tab_header(
+    title = "White Maize Yield Distribution",
+    subtitle = "After unit corrections (qq/mz)"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(columns = value, rows = metric %in% c("Total records", "Records with valid yield",
+                                                    "Records with yield < 3 qq/mz", 
+                                                    "Records with yield > 150 qq/mz"),
+             decimals = 0) |>
+  fmt_number(columns = value, rows = !metric %in% c("Total records", "Records with valid yield",
+                                                     "Records with yield < 3 qq/mz", 
+                                                     "Records with yield > 150 qq/mz"),
+             decimals = 1) |>
+  tab_row_group(label = md("*Distribution*"), rows = 3:9) |>
+  tab_row_group(label = md("*Sample Size*"), rows = 1:2) |>
+  tab_row_group(label = md("*Extreme Values*"), rows = 10:11) |>
+  row_group_order(groups = c("*Sample Size*", "*Distribution*", "*Extreme Values*")) |>
+  tab_source_note(
+    source_note = "Expected range for Guatemala: 20-40 qq/mz (criollo/OPV), up to 80-100 qq/mz (hybrid)"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.size = px(13)
+  )
+
+# Cleanup auxiliary object
+rm(tbl_yield_summary)
+```
+
+---
+
+# Phase B: Variable Derivation
+
+This phase calculates derived variables from the raw ENCOVI 2023 data required for farmer segmentation and adoption modeling. Variables are organized into logical blocks: land metrics, harvest characteristics, economic indicators, and farmer demographics.
+
+The primary unit of analysis is the **household** (`no_hogar`), as ENCOVI collects agricultural data at the household level. Each household may have multiple production records (e.g., multiple harvests or plots), which are aggregated appropriately.
+
+## B1. Land and Production Metrics
+
+Calculate land area dedicated to white maize and total production metrics. These are the foundation variables for yield calculation and segmentation.
+
+```{r}
+#| label: b1-land-production-metrics
+
+# =============================================================================
+# Aggregate land and production at household level
+# =============================================================================
+
+df_land_production <- df_produccion_corrected |>
+  summarise(
+    # Land area: sum of all white maize plots per household (physical)
+    land_wtcorn = sum(p16b03_mz, na.rm = TRUE),
+    
+    # Annual cultivated land: sum of (land × harvests) per plot
+    # This is the intensity-adjusted measure for expense normalization
+    land_wtcorn_annual = sum(p16b03_mz * p16b04, na.rm = TRUE),
+    
+    # Total production: sum across all harvests
+    total_production = sum(p16b05a_qq, na.rm = TRUE),
+    
+    # Number of production records (plots)
+    n_wtcorn_records = n(),
+    
+    # Total harvests across all plots (for reference)
+    n_harvests_total = sum(p16b04, na.rm = TRUE),
+    
+    .by = no_hogar
+  ) |>
+  mutate(
+    # Average harvests per plot (derived)
+    avg_harvests_per_plot = if_else(
+      n_wtcorn_records > 0,
+      n_harvests_total / n_wtcorn_records,
+      NA_real_
+    ),
+    
+    # Yield: quintales per physical manzana
+    yield_wtcorn_qq = if_else(
+      land_wtcorn > 0,
+      total_production / land_wtcorn,
+      NA_real_
+    ),
+    
+    # Yield per annual cultivated manzana (intensity-adjusted)
+    yield_wtcorn_annual = if_else(
+      land_wtcorn_annual > 0,
+      total_production / land_wtcorn_annual,
+      NA_real_
+    )
+  )
+```
+
+## B2. Input Expenditures
+
+Calculate all agricultural input expenditures from ENCOVI module C01 (expenses in last 12 months). These variables are at crop level and already filtered to white maize.
+
+Key variables:
+- `p16c01a`: Seeds/plants (central variable for segmentation)
+- `p16c01b`: Chemical fertilizers
+- `p16c01c`: Organic fertilizers
+- `p16c01d`: Pesticides, fungicides, herbicides
+- `p16c01e`: Packaging/storage
+- `p16c01f`: Transport/freight
+- `p16c01g`: Labor
+- `p16c01h`: Machinery maintenance/repair
+- `p16c01i`: Machinery rental
+- `p16c01j`: Work animal rental
+- `p16c01k`: Fuel and lubricants
+- `p16c01l`: Land rental
+- `p16c01m`: Other expenses
+
+```{r}
+#| label: b2-input-expenditures
+
+# =============================================================================
+# Aggregate input expenditures at household level
+# All expenses are annual (last 12 months) per crop
+# =============================================================================
+
+df_input_expenditures <- df_produccion_corrected |>
+  summarise(
+    # Individual input categories
+    exp_seeds = sum(p16c01a, na.rm = TRUE),
+    exp_fert_chemical = sum(p16c01b, na.rm = TRUE),
+    exp_fert_organic = sum(p16c01c, na.rm = TRUE),
+    exp_pesticides = sum(p16c01d, na.rm = TRUE),
+    exp_packaging = sum(p16c01e, na.rm = TRUE),
+    exp_transport = sum(p16c01f, na.rm = TRUE),
+    exp_labor = sum(p16c01g, na.rm = TRUE),
+    exp_machinery_maint = sum(p16c01h, na.rm = TRUE),
+    exp_machinery_rental = sum(p16c01i, na.rm = TRUE),
+    exp_animal_rental = sum(p16c01j, na.rm = TRUE),
+    exp_fuel = sum(p16c01k, na.rm = TRUE),
+    exp_land_rental = sum(p16c01l, na.rm = TRUE),
+    exp_other = sum(p16c01m, na.rm = TRUE),
+    
+    # Land metrics for per-manzana calculations (from same records)
+    land_for_exp = sum(p16b03_mz, na.rm = TRUE),
+    land_annual_for_exp = sum(p16b03_mz * p16b04, na.rm = TRUE),
+    
+    .by = no_hogar
+  ) |>
+  mutate(
+    # Aggregated categories
+    exp_fertilizers = exp_fert_chemical + exp_fert_organic,
+    exp_non_seed = exp_fert_chemical + exp_fert_organic + exp_pesticides + 
+                   exp_packaging + exp_transport + exp_labor + 
+                   exp_machinery_maint + exp_machinery_rental + 
+                   exp_animal_rental + exp_fuel + exp_land_rental + exp_other,
+    exp_total = exp_seeds + exp_non_seed,
+    
+    # Per physical manzana rates
+    exp_seeds_per_mz = if_else(land_for_exp > 0, 
+                               exp_seeds / land_for_exp, 
+                               NA_real_),
+    exp_non_seed_per_mz = if_else(land_for_exp > 0, 
+                                  exp_non_seed / land_for_exp, 
+                                  NA_real_),
+    exp_total_per_mz = if_else(land_for_exp > 0, 
+                               exp_total / land_for_exp, 
+                               NA_real_),
+    
+    # Per annual cultivated manzana rates (intensity-adjusted)
+    exp_seeds_per_mz_annual = if_else(land_annual_for_exp > 0, 
+                                      exp_seeds / land_annual_for_exp, 
+                                      NA_real_),
+    exp_non_seed_per_mz_annual = if_else(land_annual_for_exp > 0, 
+                                         exp_non_seed / land_annual_for_exp, 
+                                         NA_real_),
+    exp_total_per_mz_annual = if_else(land_annual_for_exp > 0, 
+                                      exp_total / land_annual_for_exp, 
+                                      NA_real_),
+    
+    # Binary indicators for input use
+    use_seeds = as.integer(exp_seeds > 0),
+    use_fertilizers = as.integer(exp_fertilizers > 0),
+    use_pesticides = as.integer(exp_pesticides > 0)
+  ) |>
+  # Remove auxiliary land columns (already in df_land_production)
+  select(-land_for_exp, -land_annual_for_exp)
+```
+
+## B3. Revenue, Sales and Self-Consumption
+
+Calculate revenue from maize sales and self-consumption patterns (both human and animal/seed). These variables inform economic impact calculations and allow valuation of non-monetized production.
+
+ENCOVI variables:
+- **Sales**: `p16b06a` (quantity), `p16b06b` (unit), `p16b07` (revenue in Q)
+- **Household consumption**: `p16b08a` (quantity), `p16b08d` (value in Q)
+- **Animal feed/seed**: `p16b09a` (quantity), `p16b09d` (value in Q)
+
+We use the reported values in Quetzales (p16b08d, p16b09d) as economic proxies for self-consumption.
+
+```{r}
+#| label: b3-revenue-sales
+
+# =============================================================================
+# Aggregate revenue and self-consumption at household level
+# Includes: sales, household consumption, and animal/seed allocation
+# =============================================================================
+
+df_revenue_consumption <- df_produccion_corrected |>
+  mutate(
+    # --- Convert sold quantity to quintales (p16b06a → qq) ---
+    qty_sold_qq = case_when(
+      # Direct weight measures
+      p16b06c == 51 ~ p16b06a,
+      p16b06c == 30 ~ p16b06a / 100,
+      p16b06c == 3 ~ p16b06a / 4,
+      p16b06c == 24 ~ p16b06a / 45.36,
+      p16b06c == 59 ~ p16b06a * 20,
+      # Container measures
+      p16b06c == 63 ~ p16b06a,
+      p16b06c == 9 ~ p16b06a / 2,
+      p16b06c == 7 ~ p16b06a * 1.323,
+      # Bound units (mazorcas)
+      p16b06c == 52 ~ p16b06a * 0.165,
+      p16b06c == 33 ~ p16b06a * 0.165,
+      # Default: assume quintales if code missing but value exists
+      is.na(p16b06c) & !is.na(p16b06a) & p16b06a > 0 ~ p16b06a,
+      TRUE ~ NA_real_
+    ),
+    
+    # --- Convert household consumption to quintales (p16b08a → qq) ---
+    qty_household_qq = case_when(
+      p16b08c == 51 ~ p16b08a,
+      p16b08c == 30 ~ p16b08a / 100,
+      p16b08c == 3 ~ p16b08a / 4,
+      p16b08c == 24 ~ p16b08a / 45.36,
+      p16b08c == 59 ~ p16b08a * 20,
+      p16b08c == 63 ~ p16b08a,
+      p16b08c == 9 ~ p16b08a / 2,
+      p16b08c == 7 ~ p16b08a * 1.323,
+      p16b08c == 52 ~ p16b08a * 0.165,
+      p16b08c == 33 ~ p16b08a * 0.165,
+      is.na(p16b08c) & !is.na(p16b08a) & p16b08a > 0 ~ p16b08a,
+      TRUE ~ NA_real_
+    ),
+    
+    # --- Convert animal/seed quantity to quintales (p16b09a → qq) ---
+    qty_animal_seed_qq = case_when(
+      p16b09c == 51 ~ p16b09a,
+      p16b09c == 30 ~ p16b09a / 100,
+      p16b09c == 3 ~ p16b09a / 4,
+      p16b09c == 24 ~ p16b09a / 45.36,
+      p16b09c == 59 ~ p16b09a * 20,
+      p16b09c == 63 ~ p16b09a,
+      p16b09c == 9 ~ p16b09a / 2,
+      p16b09c == 7 ~ p16b09a * 1.323,
+      p16b09c == 52 ~ p16b09a * 0.165,
+      p16b09c == 33 ~ p16b09a * 0.165,
+      is.na(p16b09c) & !is.na(p16b09a) & p16b09a > 0 ~ p16b09a,
+      TRUE ~ NA_real_
+    )
+  ) |>
+  summarise(
+    # --- Sales ---
+    revenue = sum(p16b07, na.rm = TRUE),
+    qty_sold_qq = sum(qty_sold_qq, na.rm = TRUE),
+    
+    # --- Household self-consumption ---
+    qty_household_qq = sum(qty_household_qq, na.rm = TRUE),
+    value_household = sum(p16b08d, na.rm = TRUE),
+    
+    # --- Animal feed / seed saving ---
+    qty_animal_seed_qq = sum(qty_animal_seed_qq, na.rm = TRUE),
+    value_animal_seed = sum(p16b09d, na.rm = TRUE),
+    
+    # --- Production for allocation control ---
+    total_prod_qq = sum(p16b05a_qq, na.rm = TRUE),
+    
+    .by = no_hogar
+  ) |>
+  mutate(
+    # Total quantity retained (not sold)
+    qty_retained_qq = qty_household_qq + qty_animal_seed_qq,
+    
+    # Total self-consumption value
+    value_self_consumption_total = value_household + value_animal_seed,
+    
+    # Total economic value (sales + valued self-consumption)
+    value_total_economic = revenue + value_self_consumption_total,
+    
+    # Price per quintal (from actual sales)
+    price_per_qq = if_else(
+      qty_sold_qq > 0,
+      revenue / qty_sold_qq,
+      NA_real_
+    ),
+    
+    # Binary indicators
+    is_seller = as.integer(revenue > 0),
+    has_household_consumption = as.integer(value_household > 0),
+    has_animal_seed_use = as.integer(value_animal_seed > 0)
+  )
+```
+
+## B4. Land and Farm Characteristics
+
+Extract land tenure and geographic information from production records. These variables describe the farm context rather than the farmer.
+
+Key variables:
+- `p16b10`: Land tenure regime (3 = owned)
+- `depto`: Department code
+- `pobreza`: Poverty status (from household unit file)
+
+```{r}
+#| label: b4-land-characteristics
+
+# =============================================================================
+# Land tenure and geographic characteristics
+# Source: df_produccion_corrected + df_unidad_raw
+# =============================================================================
+
+df_land_characteristics <- df_produccion_corrected |>
+  select(no_hogar, depto, p16b10) |>
+  # Join poverty status from household unit file
+
+  left_join(
+    df_unidad_raw |> select(no_hogar, pobreza),
+    by = join_by(no_hogar)
+  ) |>
+  summarise(
+    # Department (should be constant per household)
+    depto = max(depto, na.rm = TRUE),
+    
+    # Land ownership: 1 if any plot is owned (p16b10 == 3)
+    landowner = as.integer(any(p16b10 == 3, na.rm = TRUE)),
+    
+    # Poverty status (min to get most severe if multiple records)
+    pobreza = min(pobreza, na.rm = TRUE),
+    
+    .by = no_hogar
+  ) |>
+  mutate(
+    # Region classification (8 regions of Guatemala)
+    region = case_when(
+      depto == 1 ~ 1L,
+      depto %in% c(15, 16) ~ 2L,
+      depto %in% c(2, 18, 19, 20) ~ 3L,
+      depto %in% c(6, 21, 22) ~ 4L,
+      depto %in% c(3, 4, 5) ~ 5L,
+      depto %in% c(7, 8, 9, 10, 11, 12) ~ 6L,
+      depto %in% c(13, 14) ~ 7L,
+      depto == 17 ~ 8L,
+      TRUE ~ NA_integer_
+    ),
+    
+    # Poverty indicators
+    poverty = as.integer(pobreza %in% c(1, 2)),
+    extreme_poverty = as.integer(pobreza == 1)
+  )
+```
+
+## B5. Farmer and Household Demographics
+
+Identify the primary farmer in each household using a scoring system based on occupation, age, relationship to head, and sex. Extract demographic characteristics of both the farmer and the household.
+
+Scoring criteria for primary farmer identification:
+- Agricultural occupation (p10c02_1d == 6): +20 points
+- Age 25-65: +10 points, Age 14-24: +7, Age >65: +5, Age <14: +3
+- Household head (ppa05 == 1): +10 points, Spouse: +8, Sibling: +7, Child: +5, Parent: +3
+- Male (ppa02 == 1): +5 points
+
+```{r}
+#| label: b5-farmer-household-demographics
+
+# =============================================================================
+# Primary farmer identification and demographics
+# Source: df_personas_raw filtered to white maize households
+# =============================================================================
+
+# --- Identify primary farmer using scoring system ---
+df_farmer_demographics <- df_personas_raw |>
+  # Filter to white maize households only
+  filter(no_hogar %in% vec_hogares_maiz_blanco) |>
+  # Only adults (>= 14 years) can be primary farmer
+  filter(ppa03 >= 14 | is.na(ppa03)) |>
+  
+  mutate(
+    # Occupation score (agricultural worker)
+    score_occupation = if_else(p10c02_1d == 6, 20L, 0L),
+    
+    # Age score
+    score_age = case_when(
+      ppa03 >= 25 & ppa03 <= 65 ~ 10L,
+      ppa03 >= 14 & ppa03 < 25 ~ 7L,
+      ppa03 > 65 ~ 5L,
+      ppa03 < 14 ~ 3L,
+      TRUE ~ 0L
+    ),
+    
+    # Relationship to head score
+    score_relationship = case_when(
+      ppa05 == 1 ~ 10L,
+      ppa05 == 2 ~ 8L,
+      ppa05 %in% c(9, 10) ~ 7L,
+      ppa05 %in% c(3, 4, 5) ~ 5L,
+      ppa05 %in% c(7, 8) ~ 3L,
+      TRUE ~ 0L
+    ),
+    
+    # Sex score (male)
+    score_sex = if_else(ppa02 == 1, 5L, 0L),
+    
+    # Total score
+    score_total = score_occupation + score_age + score_relationship + score_sex
+  ) |>
+  # Select primary farmer (highest score per household)
+  slice_max(order_by = score_total, n = 1, by = no_hogar, with_ties = FALSE) |>
+  # Extract farmer characteristics
+  transmute(
+    no_hogar,
+    
+    # Demographics
+    farmer_age = ppa03,
+    farmer_male = as.integer(ppa02 == 1),
+    
+    # Education level
+    farmer_ed = p06b26a,
+    
+    # Language
+    farmer_sp = as.integer(p04a10 == 25),
+    
+    # Score for diagnostics
+    farmer_score = score_total
+  )
+
+# --- Household composition ---
+df_household_composition <- df_personas_raw |>
+  filter(no_hogar %in% vec_hogares_maiz_blanco) |>
+  summarise(
+    # Household size
+    hh_size = n(),
+    
+    # Gender composition
+    n_male = sum(ppa02 == 1, na.rm = TRUE),
+    pct_male = n_male / n(),
+    
+    # Children (under 18)
+    n_children = sum(ppa03 < 18, na.rm = TRUE),
+    
+    # Working age adults (18-65)
+    n_working_age = sum(ppa03 >= 18 & ppa03 <= 65, na.rm = TRUE),
+    
+    # Elderly (over 65)
+    n_elderly = sum(ppa03 > 65, na.rm = TRUE),
+    
+    .by = no_hogar
+  )
+
+# --- Combine farmer and household data ---
+df_demographics <- df_farmer_demographics |>
+  left_join(df_household_composition, by = join_by(no_hogar))
+```
+
+## B6. Data Integration
+
+Combine all Phase B dataframes into a single household-level dataset. 
+
+```{r}
+#| label: b6-integration
+
+# =============================================================================
+# Integrate all Phase B dataframes
+# Base: vec_hogares_maiz_blanco (1,199 households)
+# =============================================================================
+
+df_farmers_integrated <- tibble(no_hogar = vec_hogares_maiz_blanco) |>
+  # B1: Land and production metrics
+  left_join(df_land_production, by = join_by(no_hogar)) |>
+  # B2: Input expenditures
+  left_join(df_input_expenditures, by = join_by(no_hogar)) |>
+  # B3: Revenue and self-consumption
+  left_join(df_revenue_consumption, by = join_by(no_hogar)) |>
+  # B4: Land and farm characteristics
+  left_join(df_land_characteristics, by = join_by(no_hogar)) |>
+  # B5: Farmer and household demographics
+  left_join(df_demographics, by = join_by(no_hogar))
+```
+
+```{r}
+#| label: tbl-b6-integration-summary
+#| tbl-cap: "Phase B Integration Summary"
+
+# Create summary of integrated dataset
+tbl_b6_integration_summary <- tibble(
+
+  Source = c("B1: Land & Production",
+             "B2: Input Expenditures",
+             "B3: Revenue & Consumption",
+             "B4: Land Characteristics",
+             "B5: Farmer Demographics",
+             "B6: Derived Metrics",
+             "**Total Integrated**"),
+  Variables = c(
+    ncol(df_land_production) - 1,
+    ncol(df_input_expenditures) - 1,
+    ncol(df_revenue_consumption) - 1,
+    ncol(df_land_characteristics) - 1,
+    ncol(df_demographics) - 1,
+    3,  # exp_total_sold, gain_per_qq_with_cost, gain_per_qq_no_cost
+    ncol(df_farmers_integrated)
+  ),
+  Description = c(
+    "Land area, production, yield, harvest frequency",
+    "All input expenditures (13 categories) and per-mz rates",
+    "Revenue, self-consumption quantities and values, price",
+    "Department, region, land tenure, poverty status",
+    "Farmer demographics and household composition",
+    "Economic gain metrics (with/without costs)",
+    "Complete household-level agricultural dataset"
+  )
+)
+
+export(
+  tbl_b6_integration_summary,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_b6_integration_summary.rds")
+)
+
+tbl_b6_integration_summary |>
+  gt() |>
+  fmt_markdown(columns = Source) |>
+  cols_align(align = "right", columns = Variables) |>
+  cols_align(align = "left", columns = c(Source, Description)) |>
+  tab_header(
+    title = "Phase B: Data Integration Summary",
+    subtitle = md("*White maize farmers from ENCOVI 2023 (sample n = 1,199 households)*")
+  ) |>
+  tab_source_note(
+    source_note = "All dataframes joined by no_hogar (household ID)"
+  ) |>
+  tab_style(
+    style = list(cell_text(weight = "bold")),
+    locations = cells_body(rows = 7)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_b6_integration_summary)
+```
+
+
+---
+
+# Phase C: Data Quality Treatment
+
+This phase addresses data quality issues in the integrated dataset through a systematic process.
+
+## C1. Production Allocation Adjustment
+
+Verify consistency between total production and reported destinations (sales, household consumption, animal feed/seed). Reported destinations do not always sum to total production, which may reflect recall, differing reference periods, or omissions.
+
+**Adjustment logic:**
+
+All destination quantities are scaled proportionally to match `total_production`, preserving the relative distribution reported by farmers:
+
+$$
+\text{qty\_adj}_i = \frac{\text{qty\_raw}_i}{\sum \text{qty\_raw}} \times \text{total\_production}
+$$
+
+The last component (`qty_animal_seed_qq`) absorbs rounding adjustments so the components sum exactly to `total_production`.
+
+```{r}
+#| label: tbl-c1-allocation-diagnostic
+#| tbl-cap: "Production Allocation Consistency Diagnostic"
+
+# =============================================================================
+# C1. Diagnose Production vs Destinations Consistency
+# =============================================================================
+
+df_allocation_diagnostic <- df_farmers_integrated |>
+
+  mutate(
+    # Sum of raw destination quantities
+    sum_destinos_raw = qty_sold_qq + qty_household_qq + qty_animal_seed_qq,
+    
+    # Difference: positive = deficit, negative = excess
+    diff_production = total_prod_qq - sum_destinos_raw,
+    
+    # Classification
+    allocation_status = case_when(
+      total_prod_qq == 0 & sum_destinos_raw == 0 ~ "Zero production",
+      total_prod_qq == 0 & sum_destinos_raw > 0 ~ "Zero prod, positive destinations",
+      sum_destinos_raw == 0 & total_prod_qq > 0 ~ "Positive prod, zero destinations",
+      abs(diff_production) < 0.01 ~ "Balanced",
+      diff_production > 0 ~ "Deficit (destinations < production)",
+      diff_production < 0 ~ "Excess (destinations > production)"
+    ),
+    
+    # Ratio for magnitude assessment
+    ratio_dest_prod = if_else(
+      total_prod_qq > 0,
+      sum_destinos_raw / total_prod_qq,
+      NA_real_
+    )
+  )
+
+# =============================================================================
+# Table: Allocation Status Distribution
+# =============================================================================
+
+tbl_status <- df_allocation_diagnostic |>
+  summarise(
+    n_records = n(),
+    .by = allocation_status
+  ) |>
+  mutate(
+    pct_records = n_records / sum(n_records) * 100
+  ) |>
+  arrange(desc(n_records))
+
+# Generate GT table
+export(
+  tbl_status,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_c1_allocation_diagnostic.rds")
+)
+
+tbl_status |>
+  gt() |>
+  tab_header(
+    title = "Production Allocation Consistency Diagnostic",
+    subtitle = "Distribution of farmers by allocation status"
+  ) |>
+  cols_label(
+    allocation_status = "Status",
+    n_records = "Records",
+    pct_records = "% Records"
+  ) |>
+  fmt_number(columns = n_records, decimals = 0, sep_mark = ",") |>
+  fmt_number(columns = pct_records, decimals = 1, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(rows = str_detect(allocation_status, "Excess"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fff3e0"),
+    locations = cells_body(rows = str_detect(allocation_status, "Deficit"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(rows = str_detect(allocation_status, "Balanced"))
+  ) |>
+  tab_source_note(
+    source_note = md("**Excess:** Reported destinations exceed production. **Deficit:** Destinations below production.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup
+rm(tbl_status)
+```
+
+```{r}
+#| label: c1-allocation-adjustment
+
+# =============================================================================
+# C1. Proportional Adjustment of Destination Quantities
+# All destinations scaled to match total_production, preserving relative shares
+# =============================================================================
+
+df_farmers_allocated <- df_allocation_diagnostic |>
+  mutate(
+    # --- Handle special case: Positive production, zero destinations ---
+    # Handled first so the proportions are set before scaling
+    is_special_case = total_prod_qq > 0 & sum_destinos_raw == 0,
+    
+    # --- Calculate proportions from raw destinations ---
+    # For special cases, assign based on is_seller status
+    prop_sold = case_when(
+      is_special_case & is_seller == 1 ~ 1,
+      is_special_case & is_seller == 0 ~ 0,
+      sum_destinos_raw > 0 ~ qty_sold_qq / sum_destinos_raw,
+      TRUE ~ 0
+    ),
+    prop_household = case_when(
+      is_special_case & is_seller == 1 ~ 0,
+      is_special_case & is_seller == 0 ~ 1,
+      sum_destinos_raw > 0 ~ qty_household_qq / sum_destinos_raw,
+      TRUE ~ 0
+    ),
+    prop_animal_seed = case_when(
+      is_special_case ~ 0,
+      sum_destinos_raw > 0 ~ qty_animal_seed_qq / sum_destinos_raw,
+      TRUE ~ 0
+    ),
+    
+    # --- Apply proportions to total_production ---
+    qty_sold_adj = prop_sold * total_prod_qq,
+    qty_household_adj = prop_household * total_prod_qq,
+    
+    # Last component absorbs rounding so the parts sum to total_production
+    qty_animal_seed_adj = total_prod_qq - qty_sold_adj - qty_household_adj,
+    qty_animal_seed_adj = pmax(qty_animal_seed_adj, 0),  # Ensure non-negative
+    
+    # --- Handle zero production with positive destinations ---
+    qty_sold_adj = if_else(total_prod_qq == 0 & sum_destinos_raw > 0, 0, qty_sold_adj),
+    qty_household_adj = if_else(total_prod_qq == 0 & sum_destinos_raw > 0, 0, qty_household_adj),
+    qty_animal_seed_adj = if_else(total_prod_qq == 0 & sum_destinos_raw > 0, 0, qty_animal_seed_adj),
+    
+    # --- Rename to final variable ---
+    total_production = total_prod_qq,
+    
+    # --- Allocation percentages ---
+    pct_sold = if_else(total_production > 0, qty_sold_adj / total_production, 0),
+    pct_household = if_else(total_production > 0, qty_household_adj / total_production, 0),
+    pct_animal_seed = if_else(total_production > 0, qty_animal_seed_adj / total_production, 0),
+    
+    # --- Derived quantities ---
+    qty_retained_adj = qty_household_adj + qty_animal_seed_adj,
+    pct_retained = pct_household + pct_animal_seed,
+    
+    # --- Economic gain metrics ---
+    exp_total_sold = exp_total * pct_sold,
+    
+    gain_per_qq_with_cost = if_else(
+      qty_sold_adj > 0,
+      (revenue - exp_total_sold) / qty_sold_adj,
+      NA_real_
+    ),
+    
+    gain_per_qq_no_cost = if_else(
+      qty_sold_adj > 0,
+      revenue / qty_sold_adj,
+      NA_real_
+    )
+  ) |>
+  # Remove intermediate variables and rename adjusted to final names
+  select(
+    -qty_sold_qq, -qty_household_qq, -qty_animal_seed_qq, -qty_retained_qq,
+    -total_prod_qq, -sum_destinos_raw, -diff_production, 
+    -allocation_status, -ratio_dest_prod,
+    -prop_sold, -prop_household, -prop_animal_seed, -is_special_case
+  ) |>
+  rename(
+    qty_sold_qq = qty_sold_adj,
+    qty_household_qq = qty_household_adj,
+    qty_animal_seed_qq = qty_animal_seed_adj,
+    qty_retained_qq = qty_retained_adj
+  )
+```
+
+## C2. Convert Structural NAs to Zero
+
+Variables with NA representing "no activity" are converted to explicit zeros. This distinguishes structural zeros (real absence of activity) from missing data (unknown values to impute).
+
+**Conversion rules:**
+
+- **Annual rates** (convert to 0): `yield_wtcorn_annual`, `exp_*_per_mz_annual` — NA when `land_wtcorn_annual = 0` means no cultivated land, not missing data
+
+- **Price/rate variables** (remain NA): `price_per_qq`, `gain_per_qq_with_cost`, `gain_per_qq_no_cost` — price is undefined when no transaction occurs, not zero
+
+```{r}
+#| label: c2-structural-nas-to-zero
+
+# =============================================================================
+# C2. Convert Structural NAs to Zero
+# Annual rate variables: no cultivated land = zero rate (not missing)
+# Price variables remain NA: undefined when no transaction occurs
+# =============================================================================
+
+df_farmers_quality <- df_farmers_allocated |>
+  mutate(
+    # --- Annual rates: NA when land_wtcorn_annual = 0 → 0 ---
+    yield_wtcorn_annual = replace_na(yield_wtcorn_annual, 0),
+    exp_seeds_per_mz_annual = replace_na(exp_seeds_per_mz_annual, 0),
+    exp_non_seed_per_mz_annual = replace_na(exp_non_seed_per_mz_annual, 0),
+    exp_total_per_mz_annual = replace_na(exp_total_per_mz_annual, 0)
+  )
+```
+
+```{r}
+#| label: tbl-c2-structural-nas
+#| tbl-cap: "Structural NAs Converted to Zero"
+
+# =============================================================================
+# Table: Document NA conversions
+# =============================================================================
+
+# Count NAs before conversion
+na_before <- df_farmers_allocated |>
+  summarise(across(everything(), ~sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "na_before") |>
+  filter(na_before > 0)
+
+# Count NAs after conversion
+na_after <- df_farmers_quality |>
+  summarise(across(everything(), ~sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "na_after")
+
+# Create summary table of conversions
+tbl_c2_conversions <- na_before |>
+  left_join(na_after, by = "variable") |>
+  mutate(
+    na_after = replace_na(na_after, 0),
+    converted = na_before - na_after,
+    action = case_when(
+      converted > 0 ~ "Converted to 0",
+      na_after > 0 ~ "Remains NA (price/rate)",
+      TRUE ~ "No change"
+    )
+  ) |>
+  arrange(desc(converted), desc(na_after))
+
+# Generate GT table
+export(
+  tbl_c2_conversions,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_c2_structural_nas.rds")
+)
+
+tbl_c2_conversions |>
+  gt() |>
+  cols_label(
+    variable = "Variable",
+    na_before = "NAs Before",
+    na_after = "NAs After",
+    converted = "Converted",
+    action = "Action"
+  ) |>
+  cols_align(align = "left", columns = variable) |>
+  cols_align(align = "right", columns = c(na_before, na_after, converted)) |>
+  cols_align(align = "center", columns = action) |>
+  tab_header(
+    title = "C2: Structural NAs Converted to Zero",
+    subtitle = md("*NAs representing 'no activity' replaced with explicit zeros*")
+  ) |>
+  tab_spanner(
+    label = "NA Count",
+    columns = c(na_before, na_after)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(rows = action == "Converted to 0", columns = action)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fff3e0"),
+    locations = cells_body(rows = action == "Remains NA (price/rate)", columns = action)
+  ) |>
+  tab_source_note(
+    source_note = "Annual rates convert to 0 when no land; price variables remain NA when undefined"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(na_before, na_after, tbl_c2_conversions)
+```
+
+## C3. Identify and Flag Impossible Values
+
+Detect data entry errors using domain-based criteria. We identify outliers in **derived variables** but apply NAs to their **base variables**, which will be imputed in C4.
+
+**Detection criteria (based on domain knowledge):**
+
+| Derived Variable | Threshold | Base Variable(s) to NA | Justification |
+|------------------|-----------|------------------------|---------------|
+| `avg_harvests_per_plot` | > 3 | `n_harvests_total` | Max 2-3 harvests/year in Guatemala |
+| `price_per_qq` | > 500 | `qty_sold_qq` | Market price 150-250 Q/qq |
+| `price_per_qq` | < 50 (when > 0) | `qty_sold_qq` | Implausibly low market price |
+| `qty_sold_qq` | = 0 when `revenue > 0` | `qty_sold_qq` | Inconsistent: revenue without quantity |
+| `exp_seeds_per_mz` | > 5,000 | `exp_seeds` | Premium hybrid seed ~1,500 Q/mz max |
+| `qty_household_qq / hh_size` | > 15 | `qty_household_qq` | >680 kg/person/year implausible |
+| `qty_animal_seed_qq` | > 500 | `qty_animal_seed_qq` | >22 tons for animals/seed impossible |
+| `yield_wtcorn_qq` | > 160 | `total_production` | >7.3 tons/mz impossible for white maize |
+
+Additionally, `farmer_score` has existing NAs from the scoring process—these will also be imputed.
+
+```{r}
+#| label: tbl-c3-impossible-values
+#| tbl-cap: "Impossible Values Flagged for Imputation"
+
+# =============================================================================
+# C3. Identify impossible values and convert to NA in base variables
+# Detection uses derived variables; NAs applied to base variables
+# =============================================================================
+
+# --- Count cases before flagging (for reporting) ---
+n_harvest_outliers <- sum(df_farmers_quality$avg_harvests_per_plot > 3, na.rm = TRUE)
+n_price_high <- sum(df_farmers_quality$price_per_qq > 500, na.rm = TRUE)
+n_price_low <- sum(df_farmers_quality$price_per_qq > 0 & 
+                   df_farmers_quality$price_per_qq < 50, na.rm = TRUE)
+n_qty_inconsistent <- sum(df_farmers_quality$qty_sold_qq == 0 & 
+                          df_farmers_quality$revenue > 0, na.rm = TRUE)
+n_seeds_outliers <- sum(df_farmers_quality$exp_seeds_per_mz > 5000, na.rm = TRUE)
+n_household_outliers <- sum(
+  df_farmers_quality$qty_household_qq / pmax(df_farmers_quality$hh_size, 1) > 15, 
+  na.rm = TRUE
+)
+n_animal_outliers <- sum(df_farmers_quality$qty_animal_seed_qq > 500, na.rm = TRUE)
+n_yield_outliers <- sum(df_farmers_quality$yield_wtcorn_qq > 160, na.rm = TRUE)
+n_farmer_score_na <- sum(is.na(df_farmers_quality$farmer_score))
+
+# --- Apply NAs to base variables where impossible values detected ---
+df_farmers_flagged <- df_farmers_quality |>
+  mutate(
+    # Harvest frequency: > 3 harvests per plot impossible
+    n_harvests_total = if_else(
+      avg_harvests_per_plot > 3, 
+      NA_real_, 
+      n_harvests_total
+    ),
+    
+    # Price too high: > 500 Q/qq suggests an error in qty_sold
+    qty_sold_qq = if_else(
+      price_per_qq > 500, 
+      NA_real_, 
+      qty_sold_qq
+    ),
+    
+    # Price too low: < 50 Q/qq suggests an error in qty_sold
+    qty_sold_qq = if_else(
+      price_per_qq > 0 & price_per_qq < 50, 
+      NA_real_, 
+      qty_sold_qq
+    ),
+    
+    # Inconsistent: has revenue but no quantity sold
+    qty_sold_qq = if_else(
+      qty_sold_qq == 0 & revenue > 0, 
+      NA_real_, 
+      qty_sold_qq
+    ),
+    
+    # Seed expenditure: > 5000 Q/mz impossible
+    exp_seeds = if_else(
+      exp_seeds_per_mz > 5000, 
+      NA_real_, 
+      exp_seeds
+    ),
+    
+    # Self-consumption: > 15 qq/person/year implausible
+    qty_household_qq = if_else(
+      qty_household_qq / pmax(hh_size, 1) > 15, 
+      NA_real_, 
+      qty_household_qq
+    ),
+    
+    # Animal feed/seed: > 500 qq impossible
+    qty_animal_seed_qq = if_else(
+      qty_animal_seed_qq > 500, 
+      NA_real_, 
+      qty_animal_seed_qq
+    ),
+    
+    # Yield: > 160 qq/mz impossible for white maize
+    total_production = if_else(
+      yield_wtcorn_qq > 160, 
+      NA_real_, 
+      total_production
+    )
+  )
+
+# =============================================================================
+# Table: Summary of flagged impossible values
+# =============================================================================
+
+# Build summary tibble
+tbl_flagged <- tibble(
+  criterion = c(
+    "avg_harvests_per_plot > 3",
+    "price_per_qq > 500",
+    "price_per_qq < 50 (when > 0)",
+    "qty_sold_qq = 0 & revenue > 0",
+    "exp_seeds_per_mz > 5,000",
+    "qty_household_qq / hh_size > 15",
+    "qty_animal_seed_qq > 500",
+    "yield_wtcorn_qq > 160",
+    "farmer_score (existing NA)"
+  ),
+  base_variable = c(
+    "n_harvests_total",
+    "qty_sold_qq",
+    "qty_sold_qq",
+    "qty_sold_qq",
+    "exp_seeds",
+    "qty_household_qq",
+    "qty_animal_seed_qq",
+    "total_production",
+    "farmer_score"
+  ),
+  n_cases = c(
+    n_harvest_outliers,
+    n_price_high,
+    n_price_low,
+    n_qty_inconsistent,
+    n_seeds_outliers,
+    n_household_outliers,
+    n_animal_outliers,
+    n_yield_outliers,
+    n_farmer_score_na
+  )
+) |>
+  filter(n_cases > 0)
+
+# Generate GT table
+export(
+  tbl_flagged,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_c3_impossible_values.rds")
+)
+
+tbl_flagged |>
+  gt() |>
+  cols_label(
+    criterion = "Detection Criterion",
+    base_variable = "Variable Set to NA",
+    n_cases = "Cases"
+  ) |>
+  tab_header(
+    title = "C3: Impossible Values Flagged for Imputation",
+    subtitle = "Domain-based outlier detection"
+  ) |>
+  fmt_number(columns = n_cases, decimals = 0) |>
+  tab_source_note(
+    source_note = "These base variables will be imputed using Random Forest in C4"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup
+rm(n_harvest_outliers, n_price_high, n_price_low,
+   n_qty_inconsistent, n_seeds_outliers, n_household_outliers,
+   n_animal_outliers, n_yield_outliers, n_farmer_score_na,
+   tbl_flagged)
+```
+
+## C4. Impute Missing Values with Random Forest
+
+Impute missing values in base variables using a Random Forest-based multivariate imputation procedure. The method is non-parametric, handles mixed continuous and categorical data, and captures complex non-linear relationships between variables. Implementation uses the `impute_rf_parallel()` utility function, which runs a multi-threaded `ranger` engine and returns imputed values alongside out-of-bag error estimates (OOBE for continuous variables, PFC for categorical).
+
+**Variables to impute:**
+
+- `n_harvests_total`: Harvest frequency outliers
+- `qty_sold_qq`: Price outliers and inconsistent values
+- `exp_seeds`: Seed expenditure outliers
+- `qty_household_qq`: Self-consumption outliers
+- `qty_animal_seed_qq`: Animal feed/seed outliers
+- `total_production`: Yield outliers
+- `farmer_score`: Existing NAs from scoring process
+
+**Post-imputation restoration:**
+
+After imputation, values are restored for non-sellers (`is_seller = 0`) since their NA values are structural (they do not sell), not missing data:
+
+- `qty_sold_qq` → 0 (non-sellers have no sales by definition)
+- `revenue` → preserved (already correct)
+- Price/gain variables → remain NA (undefined without transactions)
+
+```{r}
+#| label: c4-define-variable-classes
+
+# =============================================================================
+# C4. Define Variable Classifications
+# Base variables: direct measurements (imputable)
+# Derived variables: calculated from base (recalculated post-imputation)
+# =============================================================================
+
+vars_base <- c(
+ "no_hogar",
+ # B1: Land & Production (base)
+ "land_wtcorn", "land_wtcorn_annual", "total_production", 
+ "n_wtcorn_records", "n_harvests_total",
+ # B2: Input expenditures (base)
+ "exp_seeds", "exp_fert_chemical", "exp_fert_organic", "exp_pesticides",
+ "exp_packaging", "exp_transport", "exp_labor", "exp_machinery_maint",
+ "exp_machinery_rental", "exp_animal_rental", "exp_fuel", "exp_land_rental", "exp_other",
+ # B3: Revenue & consumption (base)
+ "revenue", "qty_sold_qq", "qty_household_qq", "value_household",
+ "qty_animal_seed_qq", "value_animal_seed",
+ # B4: Land characteristics (base)
+ "depto", "landowner", "pobreza", "region",
+ # B5: Farmer demographics (base)
+ "farmer_age", "farmer_male", "farmer_ed", "farmer_sp", "hh_size",
+ "n_male", "n_children", "n_working_age", "n_elderly",
+ # Seller flag (source of truth, never modified)
+ "is_seller"
+)
+
+vars_derived <- c(
+ # B1 derived
+ "avg_harvests_per_plot", "yield_wtcorn_qq", "yield_wtcorn_annual",
+ # B2 derived
+ "exp_fertilizers", "exp_non_seed", "exp_total",
+ "exp_seeds_per_mz", "exp_non_seed_per_mz", "exp_total_per_mz",
+ "exp_seeds_per_mz_annual", "exp_non_seed_per_mz_annual", "exp_total_per_mz_annual",
+ "use_seeds", "use_fertilizers", "use_pesticides",
+ # B3 derived
+ "qty_retained_qq", "value_self_consumption_total", "value_total_economic",
+ "price_per_qq", "pct_sold", "pct_household", "pct_animal_seed", "pct_retained",
+ "has_household_consumption", "has_animal_seed_use",
+ # B4 derived
+ "poverty", "extreme_poverty",
+ # B5 derived
+ "farmer_score", "pct_male",
+ # B6 derived
+ "exp_total_sold", "gain_per_qq_with_cost", "gain_per_qq_no_cost"
+)
+```
+
+```{r}
+#| label: c4-rf-imputation
+
+# =============================================================================
+# C4b. Run Random Forest Imputation on Base Variables
+# =============================================================================
+
+# --- Prepare data for imputation ---
+# Select only base variables (excluding no_hogar identifier)
+df_for_imputation <- df_farmers_flagged |>
+ select(all_of(vars_base)) |>
+ select(-no_hogar)
+
+# --- Run Random Forest imputation ---
+set.seed(789)
+
+imputation_result <- impute_rf_parallel(
+ data = as.data.frame(df_for_imputation),
+ maxiter = 10,
+ ntree = 100,
+ verbose = FALSE
+)
+
+# --- Store diagnostics for reporting ---
+imputation_error <- imputation_result$OOBerror
+imputation_n_continuous <- imputation_result$n_continuous
+
+# --- Extract imputed data ---
+df_base_imputed <- as_tibble(imputation_result$ximp)
+
+# --- Reconstruct full dataset with imputed base variables ---
+df_farmers_imputed_raw <- df_farmers_flagged |>
+ select(no_hogar) |>
+ bind_cols(df_base_imputed) |>
+ # Add back derived variables (will be recalculated in C5)
+ left_join(
+   df_farmers_flagged |> select(no_hogar, all_of(vars_derived)),
+   by = "no_hogar"
+ )
+
+# Clean up
+rm(df_for_imputation, df_base_imputed)
+```
+
+```{r}
+#| label: c4-restore-non-sellers
+
+# =============================================================================
+# C4c. Restore Structural Values for Non-Sellers
+# Non-sellers (is_seller = 0) have structural zeros/NAs, not missing data
+# =============================================================================
+ 
+df_farmers_imputed <- df_farmers_imputed_raw |>
+ mutate(
+   # Non-sellers: qty_sold must be 0 (structural, not imputed value)
+   qty_sold_qq = if_else(is_seller == 0, 0, qty_sold_qq),
+   
+   # Price variables remain NA for non-sellers (undefined without transaction)
+   price_per_qq = if_else(is_seller == 0, NA_real_, price_per_qq),
+   gain_per_qq_with_cost = if_else(is_seller == 0, NA_real_, gain_per_qq_with_cost),
+   gain_per_qq_no_cost = if_else(is_seller == 0, NA_real_, gain_per_qq_no_cost)
+ )
+
+# Clean up intermediate
+rm(df_farmers_imputed_raw)
+```
+
+```{r}
+#| label: tbl-c4-imputation-summary
+#| tbl-cap: "Random Forest Imputation Results"
+
+# =============================================================================
+# C4d. Summary Table of Imputation Results
+# =============================================================================
+
+# --- Variables that had NAs to impute ---
+vars_with_na <- c("n_harvests_total", "qty_sold_qq", "exp_seeds", 
+                 "qty_household_qq", "qty_animal_seed_qq", 
+                 "total_production", "farmer_score")
+
+# --- Count NAs before and after ---
+na_before <- df_farmers_flagged |>
+ summarise(across(all_of(vars_with_na), ~sum(is.na(.)))) |>
+ pivot_longer(everything(), names_to = "variable", values_to = "na_before")
+
+na_after <- df_farmers_imputed |>
+ summarise(across(all_of(vars_with_na), ~sum(is.na(.)))) |>
+ pivot_longer(everything(), names_to = "variable", values_to = "na_after")
+
+# --- Build summary ---
+imputation_summary <- na_before |>
+ left_join(na_after, by = "variable") |>
+ mutate(
+   imputed = na_before - na_after,
+   status = if_else(na_after == 0, "Complete", "Partial")
+ ) |>
+ filter(na_before > 0)
+
+# --- Generate GT table ---
+export(
+  imputation_summary,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_c4_imputation_summary.rds")
+)
+
+imputation_summary |>
+ gt() |>
+ cols_label(
+   variable = "Variable",
+   na_before = "NAs Before",
+   na_after = "NAs After",
+   imputed = "Values Imputed",
+   status = "Status"
+ ) |>
+ cols_align(align = "left", columns = variable) |>
+ cols_align(align = "right", columns = c(na_before, na_after, imputed)) |>
+ cols_align(align = "center", columns = status) |>
+ tab_header(
+   title = "C4: Random Forest Imputation Results",
+   subtitle = md(
+     if (imputation_n_continuous > 0) {
+       paste0("*OOB imputation error: ",
+              round(imputation_error["OOBE"], 4), " (OOBE)*")
+     } else {
+       "*No continuous variables required imputation*"
+     }
+   )
+ ) |>
+ grand_summary_rows(
+   columns = c(na_before, imputed),
+   fns = list(Total = ~sum(.)),
+   fmt = ~fmt_number(., decimals = 0)
+ ) |>
+ tab_style(
+   style = cell_fill(color = "#e8f5e9"),
+   locations = cells_body(rows = status == "Complete", columns = status)
+ ) |>
+ tab_source_note(
+   source_note = "Imputation parameters: maxiter = 10, ntree = 100, seed = 789"
+ ) |>
+ tab_options(
+   table.font.size = px(12),
+   heading.title.font.size = px(14),
+   heading.subtitle.font.size = px(12)
+ )
+
+# Clean up
+rm(na_before, na_after, imputation_summary,
+   vars_with_na, imputation_result, imputation_error,
+   imputation_n_continuous)
+```
+
+## C5. Recalculate Derived Variables
+
+Regenerate all derived variables using the imputed base variables, so that base measurements and calculated metrics stay consistent.
+
+**Variables to recalculate:**
+
+- **B1 derived**: `avg_harvests_per_plot`, `yield_wtcorn_qq`, `yield_wtcorn_annual`
+- **B2 derived**: `exp_fertilizers`, `exp_non_seed`, `exp_total`, all `*_per_mz` rates, `use_*` indicators
+- **B3 derived**: `qty_retained_qq`, `value_*` totals, `price_per_qq`, `pct_*` percentages, binary indicators
+- **B4 derived**: `poverty`, `extreme_poverty`
+- **B5 derived**: `farmer_score`, `pct_male`
+- **B6 derived**: `exp_total_sold`, `gain_per_qq_with_cost`, `gain_per_qq_no_cost`
+
+**Price correction:** For sellers with prices outside the 50-500 Q/qq range, `price_per_qq` is replaced by hot-deck sampling from the distribution of valid prices, and the dependent gain metrics are recalculated.
+
+**Allocation normalization:** After quantity corrections, allocation percentages are re-normalized to sum to 1, maintaining relative proportions.
+
+**Note:** Price and gain variables remain NA for non-sellers (`is_seller = 0`) since these metrics are undefined without a transaction.
+
+```{r}
+#| label: c5-recalculate-derived
+
+# =============================================================================
+# C5. Recalculate All Derived Variables from Imputed Base Variables
+# =============================================================================
+
+df_farmers_clean <- df_farmers_imputed |>
+
+  # -------------------------------------------------------------------------
+  # Step 1: Correct qty_sold_qq for extreme prices
+  # -------------------------------------------------------------------------
+  mutate(
+    # Calculate preliminary price to detect extremes
+    price_preliminary = if_else(
+      is_seller == 1 & qty_sold_qq > 0,
+      revenue / qty_sold_qq,
+      NA_real_
+    ),
+    
+    # Correct qty_sold_qq when price is out of range (50-500 Q/qq)
+    qty_sold_qq = case_when(
+      is_seller == 0 ~ 0,
+      is_seller == 1 & price_preliminary > 500 ~ revenue / 500,
+      is_seller == 1 & price_preliminary < 50 & price_preliminary > 0 ~ revenue / 50,
+      TRUE ~ qty_sold_qq
+    )
+  ) |>
+  select(-price_preliminary) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 2: Recalculate allocation quantities and normalize to sum = total_production
+  # -------------------------------------------------------------------------
+  mutate(
+    # Sum of destination quantities (may not equal total_production after imputation)
+    sum_destinations = qty_sold_qq + qty_household_qq + qty_animal_seed_qq,
+    
+    # Calculate proportions (handle zero sum)
+    prop_sold = if_else(sum_destinations > 0, 
+                        qty_sold_qq / sum_destinations, 0),
+    prop_household = if_else(sum_destinations > 0, 
+                             qty_household_qq / sum_destinations, 0),
+    prop_animal_seed = if_else(sum_destinations > 0, 
+                               qty_animal_seed_qq / sum_destinations, 0),
+    
+    # Re-normalize quantities to sum to total_production
+    qty_sold_qq = prop_sold * total_production,
+    qty_household_qq = prop_household * total_production,
+    qty_animal_seed_qq = total_production - qty_sold_qq - qty_household_qq,
+    qty_animal_seed_qq = pmax(qty_animal_seed_qq, 0)
+  ) |>
+  select(-sum_destinations, -prop_sold, -prop_household, -prop_animal_seed) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 3: B1 derived - Production metrics
+  # -------------------------------------------------------------------------
+  mutate(
+    avg_harvests_per_plot = if_else(
+      n_wtcorn_records > 0,
+      n_harvests_total / n_wtcorn_records,
+      NA_real_
+    ),
+    yield_wtcorn_qq = if_else(
+      land_wtcorn > 0,
+      total_production / land_wtcorn,
+      NA_real_
+    ),
+    yield_wtcorn_annual = if_else(
+      land_wtcorn_annual > 0,
+      total_production / land_wtcorn_annual,
+      0
+    )
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 4: B2 derived - Expenditure aggregates and rates
+  # -------------------------------------------------------------------------
+  mutate(
+    exp_fertilizers = exp_fert_chemical + exp_fert_organic,
+    exp_non_seed = exp_fert_chemical + exp_fert_organic + exp_pesticides + 
+                   exp_packaging + exp_transport + exp_labor + 
+                   exp_machinery_maint + exp_machinery_rental + 
+                   exp_animal_rental + exp_fuel + exp_land_rental + exp_other,
+    exp_total = exp_seeds + exp_non_seed,
+    
+    # Per physical manzana rates
+    exp_seeds_per_mz = if_else(land_wtcorn > 0, 
+                               exp_seeds / land_wtcorn, NA_real_),
+    exp_non_seed_per_mz = if_else(land_wtcorn > 0, 
+                                  exp_non_seed / land_wtcorn, NA_real_),
+    exp_total_per_mz = if_else(land_wtcorn > 0, 
+                               exp_total / land_wtcorn, NA_real_),
+    
+    # Per annual cultivated manzana rates
+    exp_seeds_per_mz_annual = if_else(land_wtcorn_annual > 0, 
+                                      exp_seeds / land_wtcorn_annual, 0),
+    exp_non_seed_per_mz_annual = if_else(land_wtcorn_annual > 0, 
+                                         exp_non_seed / land_wtcorn_annual, 0),
+    exp_total_per_mz_annual = if_else(land_wtcorn_annual > 0, 
+                                      exp_total / land_wtcorn_annual, 0),
+    
+    # Binary indicators
+    use_seeds = as.integer(exp_seeds > 0),
+    use_fertilizers = as.integer(exp_fertilizers > 0),
+    use_pesticides = as.integer(exp_pesticides > 0)
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 5: B3 derived - Revenue and consumption metrics
+  # -------------------------------------------------------------------------
+  mutate(
+    qty_retained_qq = qty_household_qq + qty_animal_seed_qq,
+    value_self_consumption_total = value_household + value_animal_seed,
+    value_total_economic = revenue + value_self_consumption_total,
+    
+    # Price per quintal: NA for non-sellers (undefined, not zero)
+    price_per_qq = if_else(
+      is_seller == 1 & qty_sold_qq > 0, 
+      revenue / qty_sold_qq, 
+      NA_real_
+    ),
+    
+    # Allocation percentages, summing to 1 when total_production > 0
+    pct_sold = if_else(total_production > 0, 
+                       qty_sold_qq / total_production, 0),
+    pct_household = if_else(total_production > 0, 
+                            qty_household_qq / total_production, 0),
+    pct_animal_seed = if_else(total_production > 0, 
+                              qty_animal_seed_qq / total_production, 0),
+    pct_retained = pct_household + pct_animal_seed,
+    
+    # Binary indicators
+    has_household_consumption = as.integer(value_household > 0),
+    has_animal_seed_use = as.integer(value_animal_seed > 0)
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 6: B4 derived - Poverty indicators
+  # -------------------------------------------------------------------------
+  mutate(
+    poverty = as.integer(pobreza %in% c(1, 2)),
+    extreme_poverty = as.integer(pobreza == 1)
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 7: B5 derived - Household composition
+  # -------------------------------------------------------------------------
+  mutate(
+    pct_male = if_else(hh_size > 0, n_male / hh_size, NA_real_)
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 8: B6 derived - Economic gain metrics
+  # -------------------------------------------------------------------------
+  mutate(
+    exp_total_sold = exp_total * pct_sold,
+    
+    # Gain metrics: NA for non-sellers (undefined, not zero)
+    gain_per_qq_with_cost = if_else(
+      is_seller == 1 & qty_sold_qq > 0,
+      (revenue - exp_total_sold) / qty_sold_qq,
+      NA_real_
+    ),
+    
+    gain_per_qq_no_cost = if_else(
+      is_seller == 1 & qty_sold_qq > 0,
+      revenue / qty_sold_qq,
+      NA_real_
+    )
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 9: Final corrections - Cap ratios and correct extreme prices
+  # -------------------------------------------------------------------------
+  mutate(
+    exp_seeds_per_mz = pmin(exp_seeds_per_mz, 5000),
+    exp_seeds_per_mz_annual = pmin(exp_seeds_per_mz_annual, 5000)
+  ) |>
+  
+  # -------------------------------------------------------------------------
+  # Step 10: Remove diagnostic variables not needed downstream
+  # -------------------------------------------------------------------------
+  select(-farmer_score)
+
+# -----------------------------------------------------------------------------
+# Step 11: Hot-deck imputation for extreme prices
+# Replace prices outside 50-500 Q/qq with sampled values from valid range
+# -----------------------------------------------------------------------------
+
+# Extract valid prices for hot-deck sampling
+valid_prices <- df_farmers_clean |>
+  filter(is_seller == 1, price_per_qq >= 50, price_per_qq <= 500) |>
+  pull(price_per_qq)
+
+# Count extremes for reproducible sampling
+n_low <- sum(df_farmers_clean$is_seller == 1 & 
+             df_farmers_clean$price_per_qq < 50, na.rm = TRUE)
+n_high <- sum(df_farmers_clean$is_seller == 1 & 
+              df_farmers_clean$price_per_qq > 500, na.rm = TRUE)
+
+set.seed(789)
+replacement_low <- sample(valid_prices, n_low, replace = TRUE)
+replacement_high <- sample(valid_prices, n_high, replace = TRUE)
+
+# Apply hot-deck replacement
+df_farmers_clean <- df_farmers_clean |>
+  mutate(
+    row_id = row_number(),
+    is_price_low = is_seller == 1 & price_per_qq < 50,
+    is_price_high = is_seller == 1 & price_per_qq > 500
+  ) |>
+  group_by(is_price_low) |>
+  mutate(
+    low_idx = if_else(is_price_low, row_number(), NA_integer_)
+  ) |>
+  ungroup() |>
+  group_by(is_price_high) |>
+  mutate(
+    high_idx = if_else(is_price_high, row_number(), NA_integer_)
+  ) |>
+  ungroup() |>
+  mutate(
+    price_per_qq = case_when(
+      is_price_low ~ replacement_low[low_idx],
+      is_price_high ~ replacement_high[high_idx],
+      TRUE ~ price_per_qq
+    ),
+    
+    # Recalculate gain metrics with corrected price
+    gain_per_qq_with_cost = if_else(
+      is_seller == 1 & qty_sold_qq > 0,
+      price_per_qq - (exp_total_sold / qty_sold_qq),
+      NA_real_
+    ),
+    
+    gain_per_qq_no_cost = if_else(
+      is_seller == 1 & qty_sold_qq > 0,
+      price_per_qq,
+      NA_real_
+    )
+  ) |>
+  select(-row_id, -is_price_low, -is_price_high, -low_idx, -high_idx)
+
+# Cleanup
+rm(valid_prices, n_low, n_high, replacement_low, replacement_high)
+```
+
+## C6. Quality Assessment Summary
+
+Final summary of data quality transformations applied in Phase C. The cleaned dataset is ready for farmer segmentation and economic impact analysis.
+
+```{r}
+#| label: tbl-c6-quality-summary
+#| tbl-cap: "Phase C: Data Quality Treatment Summary"
+
+# Build summary of all transformations
+quality_summary <- tibble(
+  step = c("C1", "C2", "C2", "C3", "C4", "C4", "C5", "C5", "C5"),
+  action = c(
+    "Normalize allocations",
+    "Structural NAs → 0",
+    "Structural NAs → NA", 
+    "Impossible values → NA",
+    "Random Forest imputation",
+    "Restore non-seller values",
+    "Recalculate derived variables",
+    "Normalize allocation quantities",
+    "Hot-deck price correction"
+  ),
+  description = c(
+    "Redistribute destinations to sum to total_production",
+    "Annual rate variables when land_wtcorn_annual = 0",
+    "Price/gain variables for non-sellers (undefined, not zero)",
+    "Domain-based detection of data entry errors",
+    "Impute base variables using random forest",
+    "qty_sold = 0, price/gain = NA for non-sellers",
+    "Regenerate all derived metrics from clean base",
+    "Ensure qty_sold + qty_household + qty_animal_seed = total_production",
+    "Replace extreme prices (< 50 or > 500 Q/qq) with sampled valid values"
+  ),
+  records_affected = c(
+    "All 1,199 households",
+    "14 households",
+    "844 households",
+    "~90 values flagged",
+    "1,167 values imputed",
+    "844 households",
+    "All 1,199 households",
+    "All 1,199 households",
+    "87 households"
+  )
+)
+
+# Generate GT table
+export(
+  quality_summary,
+  here("01_data", "02_processed",
+       "web_resources", "02_01_tbl_c6_quality_summary.rds")
+)
+
+quality_summary |>
+  gt() |>
+  cols_label(
+    step = "Step",
+    action = "Action",
+    description = "Description",
+    records_affected = "Records Affected"
+  ) |>
+  cols_align(align = "center", columns = step) |>
+  cols_align(align = "left", columns = c(action, description, records_affected)) |>
+  tab_header(
+    title = "Phase C: Data Quality Treatment Summary",
+    subtitle = md("*Systematic cleaning of agricultural dataset*")
+  ) |>
+  tab_row_group(label = "Recalculation & Correction", rows = 7:9) |>
+  tab_row_group(label = "Imputation", rows = 5:6) |>
+  tab_row_group(label = "Error Detection", rows = 4) |>
+  tab_row_group(label = "Structural Values", rows = 2:3) |>
+  tab_row_group(label = "Allocation Normalization", rows = 1) |>
+  row_group_order(groups = c("Allocation Normalization", "Structural Values", 
+                             "Error Detection", "Imputation", "Recalculation & Correction")) |>
+  tab_source_note(
+    source_note = "Final dataset: 1,199 households, 70 variables. Structural NAs: 844 (price/gain for non-sellers)"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.weight = "bold"
+  )
+
+# Clean up
+rm(quality_summary)
+```
+
+---
+
+# Phase D: Save Output
+
+Export the cleaned agricultural dataset for use in subsequent scripts (02_02 MAGA weight calibration, 02_03 farmer segmentation).
+
+```{r}
+#| label: d1-save-output
+
+# =============================================================================
+# Save cleaned dataset to transfer directory
+# =============================================================================
+
+write_parquet(
+  df_farmers_clean,
+  here("01_data", "02_processed", 
+       "transfer", "02_01_agricultural_data_clean.parquet")
+)
+```
+
+# Notes
+
+## Methodology
+
+1. **Population filter**: White maize farmers only (cod_cultivo == 142)
+2. **Unit conversions**: Applied to land (manzanas), production (quintales), and sales quantities
+3. **Allocation normalization**: Destination quantities (sold, household, animal/seed) normalized to sum exactly to total_production, preserving relative proportions
+4. **Structural NAs**: Annual rates convert to 0 when no land; price/gain variables remain NA for non-sellers (undefined without transaction)
+5. **Outlier treatment**: Domain-based detection → NA in base variables → Random Forest imputation → recalculation of derived variables
+6. **Non-seller restoration**: After imputation, non-sellers (is_seller = 0) have qty_sold = 0 and price/gain = NA restored
+7. **Price correction**: Extreme prices (< 50 or > 500 Q/qq) replaced via hot-deck imputation from valid price distribution
+8. **Winsorization**: Applied to exp_seeds_per_mz (capped at 5,000 Q/mz)
+
+## Variables Created
+
+- Variables covering land, production, inputs, revenue, self-consumption, demographics
+- **Base variables**: Direct measurements from survey (imputable)
+- **Derived variables**: Calculated ratios, percentages, indicators (recalculated post-imputation)
+- **Removed**: farmer_score (diagnostic variable, not needed downstream)
+
+## Quality Metrics
+
+- Observations and variable counts: reported in the integration summary (B6)
+- Complete cases: base variables complete after imputation
+- Structural NAs: price and gain variables for non-sellers (undefined without transaction)
+- Impossible values flagged and corrected: reported per variable in the C3 table
+- Imputation OOB error: reported per run in the C4 diagnostic table (OOBE)
+- Allocation integrity: destination quantities sum to total_production within floating-point tolerance
+- Price range: constrained to 50-500 Q/qq after hot-deck correction
+
+
+
+
+
+
+
+
+

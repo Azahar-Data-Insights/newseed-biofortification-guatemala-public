@@ -1,0 +1,834 @@
+---
+title: "Transfer Model: Zinc Intake"
+subtitle: "Module 3: Transfer Models"
+---
+
+## Why Model Zinc?
+
+Zinc is essential for immune function and growth, and zinc deficiency is
+associated with stunting in children. In Guatemala, maize provides a substantial
+share of dietary zinc (see
+[Daily Nutrient Intake by Source](../01_nutritional_intakes/01_03_intake_calculation.qmd) 
+in Module 1) — even higher than for iron. By modeling zinc intake from 
+maize and non-maize sources separately, we can:
+
+1. **Simulate biofortification scenarios** — Predict how higher-content maize varieties 
+   would change total zinc intake
+2. **Preserve baseline non-maize intake** — Keep other dietary sources constant 
+   when modeling interventions
+3. **Locate the modifiable fraction** — Identify where the maize-derived share
+   of zinc intake is largest
+
+## Modeling Approach
+
+We use **survey-weighted gamma regression** because zinc intake data is:
+
+- **Positive and continuous** — People consume some amount of zinc daily
+- **Right-skewed** — Most people have moderate intake, few have very high intake
+- **Population-representative** — Survey weights carry the estimates to the
+  national level
+
+The models predict zinc intake based on demographic and socioeconomic 
+characteristics that are available in both ENCOVI (training data) and 
+SIVESNU (application target).
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  fitdistrplus,       # Distribution fitting for goodness-of-fit assessment
+  ggpubr,             # Arrange diagnostic plots into a 2x2 grid
+  survey,             # Required for svyglm method dispatch (model diagnostics)
+  performance,        # Pseudo-R² (Nagelkerke / Cragg-Uhler) and diagnostics
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file (single source of truth)
+source(here("..", "02_code", "00_functions", "00_functions.R"))
+
+# --- Local helpers: distribution assessment (web formatting) ---------------
+# Recreate the distribution-fit outputs from the raw outcome vector exported
+# by the framework, returning table and diagnostic grid as separate objects
+# so each renders in its own chunk with web-consistent formatting. 
+
+build_distribution_table <- function(outcome) {
+
+  fit_gamma       <- fitdist(data = outcome, "gamma")
+  fit_lognormal   <- fitdist(data = outcome, "lnorm")
+  fit_exponential <- fitdist(data = outcome, "exp")
+
+  data.frame(
+    distribution = c("Gamma", "Lognormal", "Exponential"),
+    loglik = c(fit_gamma$loglik, fit_lognormal$loglik, fit_exponential$loglik),
+    aic    = c(fit_gamma$aic, fit_lognormal$aic, fit_exponential$aic),
+    bic    = c(fit_gamma$bic, fit_lognormal$bic, fit_exponential$bic),
+    ks_stat = c(
+      gofstat(fit_gamma, fitnames = "gamma")$ks,
+      gofstat(fit_lognormal, fitnames = "lnorm")$ks,
+      gofstat(fit_exponential, fitnames = "exp")$ks
+    ),
+    cvm_stat = c(
+      gofstat(fit_gamma, fitnames = "gamma")$cvm,
+      gofstat(fit_lognormal, fitnames = "lnorm")$cvm,
+      gofstat(fit_exponential, fitnames = "exp")$cvm
+    ),
+    ad_stat = c(
+      gofstat(fit_gamma, fitnames = "gamma")$ad,
+      gofstat(fit_lognormal, fitnames = "lnorm")$ad,
+      gofstat(fit_exponential, fitnames = "exp")$ad
+    )
+  ) |>
+    gt() |>
+    tab_header(
+      title = "Distribution Fit Comparison",
+      subtitle = "Goodness-of-fit statistics for Gamma, Lognormal, and Exponential distributions"
+    ) |>
+    cols_label(
+      distribution = "Distribution",
+      loglik   = "Log-Likelihood",
+      aic      = "AIC",
+      bic      = "BIC",
+      ks_stat  = "Kolmogorov-Smirnov",
+      cvm_stat = "Cramer-von Mises",
+      ad_stat  = "Anderson-Darling"
+    ) |>
+    fmt_number(
+      columns = c(loglik, aic, bic, ks_stat, cvm_stat, ad_stat),
+      decimals = 4
+    ) |>
+    tab_spanner(label = "Information Criteria", columns = c(aic, bic)) |>
+    tab_spanner(label = "Goodness-of-Fit Statistics", columns = c(ks_stat, cvm_stat, ad_stat)) |>
+    cols_align(align = "center", columns = everything()) |>
+    cols_align(align = "left", columns = distribution) |>
+    tab_options(
+      table.font.size = 11,
+      heading.title.font.size = 13,
+      heading.subtitle.font.size = 10,
+      table.width = pct(100)
+    )
+}
+
+build_distribution_plots <- function(outcome) {
+
+  fit_gamma <- fitdist(data = outcome, "gamma")
+
+  shape <- fit_gamma$estimate["shape"]
+  rate  <- fit_gamma$estimate["rate"]
+  x_obs <- sort(fit_gamma$data)
+
+  plot_density <- data.frame(x = fit_gamma$data) |>
+    ggplot(aes(x = x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30,
+                   color = "azure4", fill = "lightgray", alpha = 0.5) +
+    stat_function(fun = dgamma, args = list(shape = shape, rate = rate),
+                  color = "#3AAF85", linetype = "dashed", linewidth = 0.8) +
+    labs(title = "Empirical vs Theoretical Density", x = "", y = "Density") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(color = "azure4", size = 14),
+      plot.subtitle = element_text(color = "azure4", size = 10),
+      axis.line = element_line(color = "azure4"),
+      axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+      axis.text = element_text(size = 8, colour = "azure4")
+    )
+
+  plot_qq <- data.frame(
+    empirical = x_obs,
+    theoretical = qgamma(ppoints(length(x_obs)), shape = shape, rate = rate)
+  ) |>
+    ggplot(aes(x = theoretical, y = empirical)) +
+    geom_point(color = "#1B6CA8", size = 1, alpha = 0.2) +
+    geom_abline(intercept = 0, slope = 1, color = "#3AAF85",
+                linetype = "dashed", linewidth = 0.8) +
+    labs(title = "Quantile-Quantile Plot", x = "Theoretical Quantiles", y = "Empirical Quantiles") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(color = "azure4", size = 14),
+      axis.line = element_line(color = "azure4"),
+      axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+      axis.text = element_text(size = 8, colour = "azure4")
+    )
+
+  plot_cdf <- data.frame(
+    x = x_obs,
+    empirical_cdf = ecdf(fit_gamma$data)(x_obs),
+    theoretical_cdf = pgamma(x_obs, shape = shape, rate = rate)
+  ) |>
+    ggplot(aes(x = x)) +
+    geom_line(aes(y = empirical_cdf), color = "lightgray", linewidth = 2.5) +
+    geom_line(aes(y = theoretical_cdf), color = "#3AAF85",
+              linetype = "dashed", linewidth = 0.8) +
+    labs(title = "Empirical vs Theoretical CDF",
+         subtitle = "CDF: Cumulative Distribution Function", x = "Data", y = "CDF") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(color = "azure4", size = 14),
+      plot.subtitle = element_text(color = "azure4", size = 10),
+      axis.line = element_line(color = "azure4"),
+      axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+      axis.text = element_text(size = 8, colour = "azure4")
+    )
+
+  plot_pp <- data.frame(
+    empirical_prob = ecdf(fit_gamma$data)(x_obs),
+    theoretical_prob = pgamma(x_obs, shape = shape, rate = rate)
+  ) |>
+    ggplot(aes(x = theoretical_prob, y = empirical_prob)) +
+    geom_point(color = "#1B6CA8", size = 1, alpha = 0.2) +
+    geom_abline(intercept = 0, slope = 1, color = "#3AAF85",
+                linetype = "dashed", linewidth = 0.8) +
+    labs(title = "P-P Plot", x = "Theoretical Probabilities", y = "Empirical Probabilities") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(color = "azure4", size = 14),
+      axis.line = element_line(color = "azure4"),
+      axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+      axis.text = element_text(size = 8, colour = "azure4")
+    )
+
+  ggarrange(plot_density, plot_qq, plot_cdf, plot_pp, ncol = 2, nrow = 2)
+}
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# (a) Web resources for visualizations (exported by framework 03_03)
+fig_b1_evaluate_distribution_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_b1_evaluate_distribution_maize.rds"),
+  trust = TRUE
+)
+
+tbl_b2_coefficients_full_model_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_tbl_b2_coefficients_full_model_maize.rds"),
+  trust = TRUE
+)
+
+fig_b2_diagnostic_plot_full_model_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_b2_diagnostic_plot_full_model_maize.rds"),
+  trust = TRUE
+)
+
+tbl_b3_wald_test_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_tbl_b3_wald_test_maize.rds"),
+  trust = TRUE
+)
+
+tbl_b4_coefficients_refined_model_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_tbl_b4_coefficients_refined_model_maize.rds"),
+  trust = TRUE
+)
+
+fig_b4_diagnostic_plot_refined_model_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_b4_diagnostic_plot_refined_model_maize.rds"),
+  trust = TRUE
+)
+
+fig_b5_evaluate_diagnostics_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_b5_evaluate_diagnostics_maize.rds"),
+  trust = TRUE
+)
+
+fig_c1_evaluate_distribution_non_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_c1_evaluate_distribution_non_maize.rds"),
+  trust = TRUE
+)
+
+tbl_c2_coefficients_full_model_non_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_tbl_c2_coefficients_full_model_non_maize.rds"),
+  trust = TRUE
+)
+
+fig_c2_diagnostic_plot_full_model_non_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_c2_diagnostic_plot_full_model_non_maize.rds"),
+  trust = TRUE
+)
+
+tbl_c3_wald_test_non_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_tbl_c3_wald_test_non_maize.rds"),
+  trust = TRUE
+)
+
+tbl_c4_coefficients_refined_model_non_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_tbl_c4_coefficients_refined_model_non_maize.rds"),
+  trust = TRUE
+)
+
+fig_c4_diagnostic_plot_refined_model_non_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_c4_diagnostic_plot_refined_model_non_maize.rds"),
+  trust = TRUE
+)
+
+fig_c5_evaluate_diagnostics_non_maize <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_03_fig_c5_evaluate_diagnostics_non_maize.rds"),
+  trust = TRUE
+)
+
+# (b) Fitted models for performance metrics
+models <- import(
+  here("..", "01_data", "02_processed", "models",
+       "03_03_zinc_models.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Significant predictor counts from Wald tests (maize and non-maize)
+n_predictors_maize <- tbl_b3_wald_test_maize |>
+  dplyr::filter(significant == "*") |>
+  nrow()
+
+n_predictors_non_maize <- tbl_c3_wald_test_non_maize |>
+  dplyr::filter(significant == "*") |>
+  nrow()
+
+# Collinearity of the refined maize model, on the degrees-of-freedom adjusted
+# VIF scale reported by the diagnostic grid
+vif_maize <- adjust_collinearity_df(models$model_zn_maize)
+max_vif_maize <- round(max(vif_maize$VIF), 1)
+n_vif_over_5 <- sum(vif_maize$VIF > 5)
+n_vif_terms <- nrow(vif_maize)
+```
+
+
+## Data Preparation
+
+### Source Data
+
+We use the cleaned ENCOVI dataset from the previous preparation step, containing 
+individuals with complete predictor variables and nutrient intake estimates.
+
+### Handling Extreme Values
+
+Gamma regression requires positive values and is sensitive to extreme outliers. 
+We apply conservative outlier detection:
+
+::: {.callout-tip}
+## Outlier Threshold
+Upper outliers identified as values exceeding **P95 + 1.5×IQR** (i.e., 95th percentile 
+plus 1.5 times the interquartile range). The threshold suits micronutrients:
+
+- Micronutrient intake distributions are markedly right-skewed
+- Biologically plausible high values arise from consumption of
+  micronutrient-dense or fortified foods
+- Retaining the upper tail supports model generalizability to populations with
+  varied dietary patterns
+:::
+
+### Survey Design
+
+All models incorporate ENCOVI's complex survey design (clustering and
+expansion weights), which places the estimates at the population level.
+
+
+## Modeling Zinc Intake from Maize
+
+### Distribution Selection
+
+Before modeling, we assess which statistical distribution best fits the zinc 
+intake data. Three candidate distributions are compared:
+
+```{r}
+#| label: tbl-b1-evaluate-distribution-maize
+#| tbl-cap: "Distribution fit comparison for zinc intake from maize"
+
+build_distribution_table(fig_b1_evaluate_distribution_maize)
+```
+
+```{r}
+#| label: fig-b1-evaluate-distribution-maize
+#| fig-cap: "Distribution assessment for zinc intake from maize"
+#| fig-alt: >
+#|   Four-panel goodness-of-fit display for zinc intake from maize against a
+#|   fitted gamma distribution. Top left: histogram of observed intake with the
+#|   theoretical gamma density overlaid as a dashed curve. Top right:
+#|   quantile-quantile plot of empirical versus theoretical quantiles. Bottom
+#|   left: empirical versus theoretical cumulative distribution functions.
+#|   Bottom right: probability-probability plot. Points and curves track the
+#|   reference diagonals closely, indicating the right-skewed data are well
+#|   described by the gamma distribution.
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+build_distribution_plots(fig_b1_evaluate_distribution_maize)
+```
+
+::: {.callout-important}
+## Distribution Selection
+**Gamma distribution** provides the best fit based on:
+
+- Lowest AIC/BIC (information criteria)
+- Highest Log-Likelihood
+
+Gamma regression with log link is appropriate for positive, right-skewed 
+continuous outcomes.
+:::
+
+### Full Model
+
+We first train a model including all 20 candidate predictors to identify 
+which variables significantly predict zinc intake from maize.
+
+```{r}
+#| label: tbl-b2-coefficients-full-model-maize
+#| tbl-cap: "Model coefficients for zinc intake from maize (full model)"
+
+tbl_b2_coefficients_full_model_maize
+```
+
+```{r}
+#| label: fig-b2-diagnostic-plot-full-model-maize
+#| fig-cap: "Observed vs predicted zinc intake from maize (full model)"
+#| fig-alt: >
+#|   Scatter chart of the full gamma model for zinc from maize. Observed zinc
+#|   intake in milligrams per day on the x-axis, model-predicted intake on the
+#|   y-axis. Points cluster along an upward diagonal, showing predictions
+#|   generally track observed values across the twenty-predictor full model.
+
+fig_b2_diagnostic_plot_full_model_maize |>
+  ggplot(aes(x = zn_individuo_dia_maiz, y = .fitted)) +
+  geom_point(alpha = 0.2, color = "steelblue4") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    plot.caption = element_text(size = 8, hjust = 1, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4", hjust = 1),
+    axis.text = element_text(size = 10, color = "azure4")
+  ) +
+  labs(
+    x = "Observed Zinc from Maize (mg/day)",
+    y = "Predicted Zinc from Maize (mg/day)"
+  )
+```
+
+### Variable Selection
+
+Not all predictors contribute meaningfully to prediction. We use **Wald tests** 
+to identify statistically significant variables and remove those that add 
+complexity without improving predictions.
+
+```{r}
+#| label: tbl-b3-wald-test-maize
+#| tbl-cap: "Wald test results for predictor significance (zinc from maize)"
+
+tbl_b3_wald_test_maize |>
+  gt() |>
+  tab_header(
+    title = "Variable Significance Testing",
+    subtitle = "Wald F-test results for zinc intake from maize model"
+  ) |>
+  fmt_number(
+    columns = f_statistic,
+    decimals = 2
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = everything(),
+      rows = significant == "*"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-important}
+## Variables Retained
+**`r n_predictors_maize` predictors** show significant relationships with zinc 
+intake from maize, spanning demographic, geographic, socioeconomic, housing 
+and asset categories. Variables that do not significantly predict zinc intake 
+from maize after controlling for other factors are excluded from the refined 
+model.
+:::
+
+### Refined Model
+
+The final model is fitted on the significant predictors alone.
+
+```{r}
+#| label: tbl-b4-coefficients-refined-model-maize
+#| tbl-cap: "Model coefficients for zinc intake from maize (refined model)"
+
+tbl_b4_coefficients_refined_model_maize
+```
+
+```{r}
+#| label: fig-b4-diagnostic-plot-refined-model-maize
+#| fig-cap: "Observed vs predicted zinc intake from maize (refined model)"
+#| fig-alt: >
+#|   Scatter chart of the refined gamma model for zinc from maize. Observed
+#|   zinc intake in milligrams per day on the x-axis, model-predicted intake on
+#|   the y-axis. Points follow an upward diagonal similar to the full model,
+#|   confirming that using only significant predictors preserves predictive
+#|   accuracy.
+
+fig_b4_diagnostic_plot_refined_model_maize |>
+  ggplot(aes(x = zn_individuo_dia_maiz, y = .fitted)) +
+  geom_point(alpha = 0.2, color = "steelblue4") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    plot.caption = element_text(size = 8, hjust = 1, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4", hjust = 1),
+    axis.text = element_text(size = 10, color = "azure4")
+  ) +
+  labs(
+    x = "Observed Zinc from Maize (mg/day)",
+    y = "Predicted Zinc from Maize (mg/day)"
+  )
+```
+
+### Model Diagnostics
+
+We verify the model meets statistical assumptions:
+
+```{r}
+#| label: fig-b5-evaluate-diagnostics-maize
+#| fig-cap: "Diagnostic plots for zinc from maize model"
+#| fig-alt: >
+#|   Panel of regression diagnostic plots for the refined zinc-from-maize gamma
+#|   model, covering residual behaviour, leverage, and predictor collinearity.
+#|   Residuals show no systematic pattern and are approximately normal, no
+#|   observations exert undue leverage, and the collinearity panel plots each
+#|   term's degrees-of-freedom adjusted variance inflation factor against shaded
+#|   low, moderate and high reference bands.
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+evaluate_gamma_model(models$model_zn_maize)
+```
+
+::: {.callout-tip}
+## Diagnostic Assessment
+- **Residuals**: No systematic patterns, approximately normal
+- **Leverage**: No overly influential observations
+- **Collinearity**: Degrees-of-freedom adjusted variance inflation factors (VIF)
+  reach a maximum of `r max_vif_maize`, with `r n_vif_over_5` of
+  `r n_vif_terms` terms above the conventional threshold of 5
+
+Factors and polynomial terms contribute several columns to the model matrix, so
+their generalized VIF is rescaled by the term's degrees of freedom. This places
+every term on the single-coefficient scale that the thresholds of 5 and 10
+refer to.
+:::
+
+
+## Modeling Zinc Intake from Non-Maize Sources
+
+Zinc from non-maize sources includes vegetables, fruits, legumes, and animal 
+products. This component remains **constant** in biofortification scenarios, 
+representing the baseline dietary zinc that would not change with maize 
+interventions.
+
+### Distribution Selection
+
+```{r}
+#| label: tbl-c1-evaluate-distribution-non-maize
+#| tbl-cap: "Distribution fit comparison for zinc intake from non-maize sources"
+
+build_distribution_table(fig_c1_evaluate_distribution_non_maize)
+```
+
+```{r}
+#| label: fig-c1-evaluate-distribution-non-maize
+#| fig-cap: "Distribution assessment for zinc intake from non-maize sources"
+#| fig-alt: >
+#|   Four-panel goodness-of-fit display for zinc intake from non-maize sources
+#|   against a fitted gamma distribution. Top left: histogram of observed intake
+#|   with the theoretical gamma density overlaid as a dashed curve. Top right:
+#|   quantile-quantile plot of empirical versus theoretical quantiles. Bottom
+#|   left: empirical versus theoretical cumulative distribution functions.
+#|   Bottom right: probability-probability plot. Points and curves align with
+#|   the reference diagonals, showing the gamma distribution again fits the
+#|   right-skewed data well.
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+build_distribution_plots(fig_c1_evaluate_distribution_non_maize)
+```
+
+::: {.callout-important}
+## Distribution Selection
+**Gamma distribution** again provides the best fit for non-maize zinc intake.
+:::
+
+### Full Model
+
+```{r}
+#| label: tbl-c2-coefficients-full-model-non-maize
+#| tbl-cap: "Model coefficients for zinc intake from non-maize sources (full model)"
+
+tbl_c2_coefficients_full_model_non_maize
+```
+
+```{r}
+#| label: fig-c2-diagnostic-plot-full-model-non-maize
+#| fig-cap: "Observed vs predicted zinc intake from non-maize sources (full model)"
+#| fig-alt: >
+#|   Scatter chart of the full gamma model for zinc from non-maize sources.
+#|   Observed zinc intake in milligrams per day on the x-axis, model-predicted
+#|   intake on the y-axis. Points cluster along an upward diagonal, showing
+#|   predictions broadly track observed values across the full model.
+
+fig_c2_diagnostic_plot_full_model_non_maize |>
+  ggplot(aes(x = zn_individuo_dia_no_maiz, y = .fitted)) +
+  geom_point(alpha = 0.2, color = "steelblue4") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    plot.caption = element_text(size = 8, hjust = 1, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4", hjust = 1),
+    axis.text = element_text(size = 10, color = "azure4")
+  ) +
+  labs(
+    x = "Observed Zinc from Non-Maize (mg/day)",
+    y = "Predicted Zinc from Non-Maize (mg/day)"
+  )
+```
+
+### Variable Selection
+
+```{r}
+#| label: tbl-c3-wald-test-non-maize
+#| tbl-cap: "Wald test results for predictor significance (zinc from non-maize)"
+
+tbl_c3_wald_test_non_maize |>
+  gt() |>
+  tab_header(
+    title = "Variable Significance Testing",
+    subtitle = "Wald F-test results for zinc intake from non-maize model"
+  ) |>
+  fmt_number(
+    columns = f_statistic,
+    decimals = 2
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = everything(),
+      rows = significant == "*"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-important}
+## Variables Retained
+**`r n_predictors_non_maize` predictors** significantly predict zinc intake from 
+non-maize sources, drawing from the same set of demographic, geographic, 
+socioeconomic and housing variables. The retained set differs from the maize model: the two outcomes are predicted
+by different subsets of the same candidate variables.
+:::
+
+### Refined Model
+
+```{r}
+#| label: tbl-c4-coefficients-refined-model-non-maize
+#| tbl-cap: "Model coefficients for zinc intake from non-maize sources (refined model)"
+
+tbl_c4_coefficients_refined_model_non_maize
+```
+
+```{r}
+#| label: fig-c4-diagnostic-plot-refined-model-non-maize
+#| fig-cap: "Observed vs predicted zinc intake from non-maize sources (refined model)"
+#| fig-alt: >
+#|   Scatter chart of the refined gamma model for zinc from non-maize sources.
+#|   Observed zinc intake in milligrams per day on the x-axis, model-predicted
+#|   intake on the y-axis. Points follow an upward diagonal comparable to the
+#|   full model, confirming that reducing to significant predictors retains
+#|   predictive accuracy.
+
+fig_c4_diagnostic_plot_refined_model_non_maize |>
+  ggplot(aes(x = zn_individuo_dia_no_maiz, y = .fitted)) +
+  geom_point(alpha = 0.2, color = "steelblue4") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    plot.caption = element_text(size = 8, hjust = 1, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4", hjust = 1),
+    axis.text = element_text(size = 10, color = "azure4")
+  ) +
+  labs(
+    x = "Observed Zinc from Non-Maize (mg/day)",
+    y = "Predicted Zinc from Non-Maize (mg/day)"
+  )
+```
+
+### Model Diagnostics
+
+```{r}
+#| label: fig-c5-evaluate-diagnostics-non-maize
+#| fig-cap: "Diagnostic plots for zinc from non-maize sources model"
+#| fig-alt: >
+#|   Panel of regression diagnostic plots for the refined zinc-from-non-maize
+#|   gamma model, covering residual behaviour, leverage, and predictor
+#|   collinearity. Residuals show no systematic pattern and are approximately
+#|   normal, no observations are unduly influential, and the collinearity panel
+#|   plots each term's degrees-of-freedom adjusted variance inflation factor
+#|   against shaded low, moderate and high reference bands.
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+evaluate_gamma_model(models$model_zn_non_maize)
+```
+
+
+## Summary
+
+### Final Model Performance
+
+```{r}
+#| label: tbl-model-performance
+#| tbl-cap: "Final refined model performance metrics"
+
+dplyr::bind_rows(
+  extract_gamma_model_metrics(models$model_zn_maize,     "Zinc from maize"),
+  extract_gamma_model_metrics(models$model_zn_non_maize, "Zinc from non-maize")
+) |>
+  # Reshape: metrics as rows, models as columns
+  tidyr::pivot_longer(
+    cols = -source,
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  tidyr::pivot_wider(
+    names_from = source,
+    values_from = value
+  ) |>
+  # Apply readable labels per metric
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      n_obs                 = "N observations",
+      n_predictors          = "N predictors",
+      pseudo_r2_mcfadden    = "Pseudo-R² (McFadden)",
+      pseudo_r2_cragg_uhler = "Pseudo-R² (Cragg-Uhler)",
+      aic                   = "AIC",
+      dispersion            = "Dispersion"
+    )
+  ) |>
+  gt() |>
+  cols_label(metric = "Metric") |>
+  fmt_number(
+    rows    = metric == "N observations",
+    columns = c(`Zinc from maize`, `Zinc from non-maize`),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    rows    = metric == "N predictors",
+    columns = c(`Zinc from maize`, `Zinc from non-maize`),
+    decimals = 0
+  ) |>
+  fmt_number(
+    rows    = metric %in% c("Pseudo-R² (McFadden)",
+                            "Pseudo-R² (Cragg-Uhler)",
+                            "Dispersion"),
+    columns = c(`Zinc from maize`, `Zinc from non-maize`),
+    decimals = 3
+  ) |>
+  fmt_number(
+    rows    = metric == "AIC",
+    columns = c(`Zinc from maize`, `Zinc from non-maize`),
+    decimals = 0
+  ) |>
+  tab_header(
+    title    = "Final Model Performance",
+    subtitle = "Refined gamma regression with log link"
+  ) |>
+  tab_footnote(
+    footnote  = "Pseudo-R² (McFadden) = 1 − (residual deviance / null deviance). Conservative measure; values above 0.2 are conventionally considered good for GLMs.",
+    locations = cells_body(columns = metric, rows = metric == "Pseudo-R² (McFadden)")
+  ) |>
+  tab_footnote(
+    footnote  = "Pseudo-R² (Cragg-Uhler), also known as Nagelkerke's R², is normalized to a [0, 1] range and generally yields higher values than McFadden. Both measures are reported for transparency.",
+    locations = cells_body(columns = metric, rows = metric == "Pseudo-R² (Cragg-Uhler)")
+  ) |>
+  tab_options(
+    table.font.size            = 11,
+    heading.title.font.size    = 13,
+    heading.subtitle.font.size = 10,
+    table.width                = pct(100)
+  )
+```
+
+### Model Comparison
+
+| Outcome | Final Predictors | Retained predictors (examples) |
+|---------|------------------|--------------------------------|
+| Zinc from maize | `r n_predictors_maize` variables | Age, department, education, area, garbage collection |
+| Zinc from non-maize | `r n_predictors_non_maize` variables | Age, household size, dwelling type, wall materials |
+
+### Key Findings
+
+1. **Higher maize share for zinc**: The proportion of zinc intake from
+   maize is higher than for iron (see
+   [Daily Nutrient Intake by Source](../01_nutritional_intakes/01_03_intake_calculation.qmd)
+   in Module 1), which makes a larger fraction of zinc intake
+   biofortification-modifiable
+
+2. **Geographic variation**: Department is retained in both models, consistent
+   with regional variation in dietary patterns
+
+3. **Differential role of area**: Urban/rural area is retained in the maize
+   model and not in the non-maize model, so it carries predictive power for
+   one intake source and not the other
+
+4. **Service and asset variables**: Garbage collection and computer ownership
+   are retained in the maize model, television and computer ownership in the
+   non-maize model
+
+### Application
+
+These models will be applied to SIVESNU 2018 children to predict their zinc 
+intake profiles based on their demographic and socioeconomic characteristics. 
+The predicted values enable linking nutritional status to stunting outcomes.

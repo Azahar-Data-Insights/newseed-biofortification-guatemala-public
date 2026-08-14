@@ -1,0 +1,394 @@
+---
+title: "Transfer Model: Plant-Based Food Percentage"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script develops a predictive model for the percentage of plant-based foods in individual diets using ENCOVI 2023 data. This model will be applied to SIVESNU 2018 children to estimate dietary composition based on demographic and socioeconomic characteristics.
+
+The workflow:
+
+1. Load modeling-ready data from the preparation script (cleaned predictors + outcomes)
+2. Create survey design with boundary adjustment for percentage values
+3. Evaluate distribution of plant food percentage variable
+4. Train full gamma regression model with identity link
+5. Perform variable selection using Wald tests
+6. Train refined model with significant predictors only
+7. Evaluate model diagnostics (residuals, leverage, collinearity)
+8. Save final model for SIVESNU transfer
+
+**Modeling approach**: Survey-weighted gamma regression with identity link, suitable for proportion data bounded between 0 and 1. Boundary values (0 and 1) are adjusted to 0.0001 and 0.9999 to satisfy gamma distribution requirements.
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  see,                # Visual backend for performance diagnostics
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to keep namespace clean):
+#   broom - augment() for model diagnostic data frames
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "models"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Preparation
+
+## A1. Load Modeling Data
+
+```{r}
+#| label: a1-load-data
+
+# Load modeling-ready data
+df_raw <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "03_01_modeling_ready_data.parquet")
+)
+
+# Define predictor variables for full model
+# Polynomial terms are applied to continuous predictors; nominal predictors
+# enter as factors, contributing one coefficient per level.
+predictor_variables <- c(
+  "parentesco", "sexo", "poly(edad, 2)", 
+  "departamento", "area", "poly(miembros_hogar, 3)", 
+  "propiedad", "poly(grado_estudios_hogar, 3)", "tipo_vivienda",
+  "material_paredes", "material_techo", "material_piso",
+  "poly(n_cuartos, 3)", "tipo_sanitario", "fuente_agua",
+  "recoleccion_basura", "electricidad", "televisor",
+  "telefonia_celular", "computadora"
+)
+```
+
+## A2. Adjust Boundary Values and Create Survey Design
+
+Gamma distribution requires positive values strictly greater than 0 and less than 1 for percentage data. Boundary values (0 and 1) are adjusted to 0.0001 and 0.9999 to satisfy distribution requirements while maintaining interpretability.
+
+```{r}
+#| label: a2-create-survey-design
+ 
+# Create the survey design with boundary adjustments
+survey_design <- df_raw |>
+  # Remove records with missing outcomes
+  drop_na(porcentaje_vegetales) |>
+  # Consolidate nominal levels before modeling;
+  # "Otro" is retired from tipo_vivienda because the level carries no observations
+  mutate(
+    material_piso = fct_recode(material_piso, "Madera" = "Parqué"),
+    tipo_vivienda = fct_drop(tipo_vivienda, only = "Otro")
+  ) |>
+  # Select variables for modeling
+  transmute(
+    # Survey design variables
+    upm, factor,
+    # Personal characteristics
+    parentesco, sexo, edad,
+    # Geographic characteristics
+    departamento, area,
+    # Household characteristics
+    miembros_hogar, propiedad, grado_estudios_hogar,
+    # Housing characteristics
+    tipo_vivienda, material_paredes, material_techo, material_piso,
+    n_cuartos, tipo_sanitario,
+    # Basic services
+    fuente_agua, recoleccion_basura,
+    # Household assets
+    electricidad, televisor, telefonia_celular, computadora,
+    # Outcome variable with boundary adjustment
+    porcentaje_vegetales = ifelse(porcentaje_vegetales == 1, 0.9999,
+                                   ifelse(porcentaje_vegetales == 0, 0.0001,
+                                          porcentaje_vegetales))
+  ) |>
+  # Create the survey design
+  as_survey_design(
+    ids = upm,              # Primary sampling units (clusters)
+    weights = factor,       # Expansion factors
+    strata = NULL           # No stratification in ENCOVI 2023
+  )
+```
+
+---
+
+# Phase B: Model Plant Food Percentage
+
+## B1. Evaluate Distribution
+
+Assess the distribution of plant food percentage to confirm appropriate regression family selection.
+
+```{r}
+#| label: fig-b1-evaluate-distribution-plant-percentage
+#| fig-cap: "Distribution assessment for plant food percentage"
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+# Export data for web resources
+export(
+  tibble(porcentaje_vegetales = survey_design$variables$porcentaje_vegetales),
+  here("01_data", "02_processed", "web_resources", "03_08_fig_b1_evaluate_distribution_plant_percentage.rds")
+)
+
+# Evaluate distribution fit for plant food percentage
+determine_distribution(survey_design$variables$porcentaje_vegetales)
+```
+
+**Decision**: The gamma distribution is selected for plant food percentage data (bounded between 0 and 1, right-skewed). Modeling proceeds with gamma regression and identity link, which suits proportion data.
+
+## B2. Train Full Model
+
+Train initial model with all predictor variables using survey-weighted gamma regression with identity link.
+
+```{r}
+#| label: b2-train-full-model
+#| warning: FALSE
+
+# Train full gamma regression model with identity link
+results_plant_full <- train_gamma_model_plant_foods(
+  formula = as.formula(paste("porcentaje_vegetales ~", 
+                             paste(predictor_variables, collapse = " + "))),
+  model_label = "Plant Food Percentage (Full Model)",
+  x_label = "Observed Plant Food Percentage",
+  y_label = "Predicted Plant Food Percentage",
+  design = survey_design
+)
+```
+
+```{r}
+#| label: tbl-b2-coefficients-full-model
+#| tbl-cap: "Model coefficients for plant food percentage (full model)"
+
+# Export data for web resources
+export(
+  broom::tidy(results_plant_full$model),
+  here("01_data", "02_processed", "web_resources", "03_08_tbl_b2_coefficients_full_model.rds")
+)
+
+# Display full model coefficients
+results_plant_full$coefficients
+```
+
+```{r}
+#| label: fig-b2-diagnostic-plot-full-model
+#| fig-cap: "Observed vs predicted plant food percentage (full model)"
+
+# Export data for web resources
+export(
+  results_plant_full$results,
+  here("01_data", "02_processed", "web_resources", "03_08_fig_b2_diagnostic_plot_full_model.rds")
+)
+
+# Display diagnostic scatter plot
+results_plant_full$plot
+```
+
+## B3. Variable Selection (Wald Tests)
+
+Perform Wald tests to identify significant predictors and reduce model complexity.
+
+```{r}
+#| label: tbl-b3-wald-tests
+#| tbl-cap: "Wald test results for predictor significance"
+
+# Perform Wald tests for all predictor variables
+wald_results <- map_dfr(
+  predictor_variables,
+  apply_wald_test,
+  model = results_plant_full$model
+)
+
+# Export data for web resources
+export(
+  wald_results,
+  here("01_data", "02_processed", "web_resources", "03_08_tbl_b3_wald_tests.rds")
+)
+
+wald_results |>
+  gt() |>
+  tab_header(
+    title = "Variable Significance Testing",
+    subtitle = "Wald F-test results for Plant Food Percentage"
+  ) |>
+  fmt_number(
+    columns = f_statistic,
+    decimals = 2
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = everything(),
+      rows = significant == "*"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+Non-significant variables (p ≥ 0.05) are removed to create a more parsimonious model.
+
+## B4. Train Refined Model
+
+Train final model with only statistically significant predictors.
+
+```{r}
+#| label: b4-train-refined-model
+
+# Automatically select significant predictors from Wald tests
+predictors_plant_refined <- wald_results |>
+  filter(significant == "*") |>
+  pull(variable)
+
+# Train refined gamma regression model with identity link
+results_plant_refined <- train_gamma_model_plant_foods(
+  formula = as.formula(paste("porcentaje_vegetales ~", 
+                             paste(predictors_plant_refined, collapse = " + "))),
+  model_label = "Plant Food Percentage (Refined Model)",
+  x_label = "Observed Plant Food Percentage",
+  y_label = "Predicted Plant Food Percentage",
+  design = survey_design
+)
+```
+
+```{r}
+#| label: tbl-b4-coefficients-refined-model
+#| tbl-cap: "Model coefficients for plant food percentage (refined model)"
+
+# Export data for web resources
+export(
+  broom::tidy(results_plant_refined$model),
+  here("01_data", "02_processed", "web_resources", "03_08_tbl_b4_coefficients_refined_model.rds")
+)
+
+# Display refined model coefficients
+results_plant_refined$coefficients
+```
+
+```{r}
+#| label: fig-b4-diagnostic-plot-refined-model
+#| fig-cap: "Observed vs predicted plant food percentage (refined model)"
+
+# Export data for web resources
+export(
+  results_plant_refined$results,
+  here("01_data", "02_processed", "web_resources", "03_08_fig_b4_diagnostic_plot_refined_model.rds")
+)
+
+# Display diagnostic scatter plot
+results_plant_refined$plot
+```
+
+## B5. Model Diagnostics
+
+Evaluate model assumptions and identify potential issues with residuals, leverage, and multicollinearity.
+
+```{r}
+#| label: fig-b5-evaluate-diagnostics
+#| fig-cap: "Diagnostic plots for plant food percentage model"
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+# Export data for web resources
+export(
+  broom::augment(results_plant_refined$model),
+  here("01_data", "02_processed", "web_resources", "03_08_fig_b5_evaluate_diagnostics.rds")
+)
+
+# Generate diagnostic plots
+evaluate_gamma_model(results_plant_refined$model)
+```
+
+---
+
+# Phase C: Export
+
+Save final refined model for application to SIVESNU data in subsequent transfer scripts.
+
+```{r}
+#| label: c-save-models
+
+# Extract final model
+model_plant_percentage <- results_plant_refined$model
+
+# Save model as RDS
+export(
+  list(
+    model_plant_percentage = model_plant_percentage
+  ),
+  here("01_data", "02_processed", 
+       "models", "03_08_plant_percentage_model.rds")
+)
+
+# Clean auxiliary objects
+rm(results_plant_refined, model_plant_percentage)
+```
+
+# Notes
+
+## Model Performance
+
+**Plant Food Percentage:**
+- Final predictors: variables retained by the Wald significance criterion (p < 0.05), reported in the refined model coefficient table above
+- Model fit: Pseudo-R² (Cragg-Uhler and McFadden) reported in the model summary above
+- Model diagnostics: residual patterns, leverage and collinearity assessed in the diagnostic plots above
+- Identity link function appropriate for bounded proportion data
+
+## Methodological Rationale
+
+The model uses an **identity link**:
+
+1. **Bounded outcome**: Plant food percentage is naturally bounded [0,1]
+2. **Linear interpretation**: Identity link preserves direct linear relationships with predictors
+3. **Boundary adjustment**: Values of exactly 0 and 1 adjusted to 0.0001 and 0.9999 to satisfy gamma distribution requirements
+4. **Convergence**: Gaussian model starting values improve convergence with identity link
+
+
+
+

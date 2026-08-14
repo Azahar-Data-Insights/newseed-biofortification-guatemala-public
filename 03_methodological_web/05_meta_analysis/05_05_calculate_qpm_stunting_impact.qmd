@@ -1,0 +1,787 @@
+---
+title: "QPM Stunting Impact"
+subtitle: "Module 5: Meta-analysis"
+---
+
+## Why Calculate QPM Stunting Impact?
+
+The Meta-analysis (Gunaratna) pathway quantifies the stunting reduction
+achievable through biofortified maize consumption. Using the 9% height
+growth velocity increase from @Gunaratna2010_QPM — a meta-analysis of 9
+community-based RCTs, of which 7 contributed to the height effect estimate
+after excluding Mexico (no height data reported) and Nicaragua (statistical
+outlier) — this module calculates the individual-level height increment
+attributable to quality protein maize (QPM) for each child based on their
+baseline HAZ, age, sex, and protein adequacy.
+
+The QPM height increment is modulated by a protein adequacy factor that
+carries individual-level heterogeneity: children meeting their protein
+requirement take the full 9% effect, and children far below their requirement
+take an attenuated one, following a rescaled logistic sigmoid. The modulation
+follows the mechanism QPM acts through, a higher protein quality (PDCAAS),
+which needs protein quantity in the diet to reach growth.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  patchwork,          # Multi-panel plot composition
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file (single source of truth)
+source(here("..", "02_code", "00_functions", "00_functions.R"))
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Web resources for visualizations (exported by framework 05_05)
+
+# Phase A — Growth velocity reference
+fig_a3_growth_velocity_curves <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_fig_a3_growth_velocity_curves.rds"),
+  trust = TRUE
+)
+
+# Phase B — Growth velocity assignment
+tbl_b2_growth_velocity_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_tbl_b2_growth_velocity_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b3_haz_below_neg4 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_tbl_b3_haz_below_neg4.rds"),
+  trust = TRUE
+)
+
+# Phase C — Protein adequacy factor
+tbl_c2_factor_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_tbl_c2_factor_summary.rds"),
+  trust = TRUE
+)
+
+# Phase E — Impact diagnostics
+tbl_e1_height_increment_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_tbl_e1_height_increment_summary.rds"),
+  trust = TRUE
+)
+
+tbl_e2_stunting_baseline_vs_qpm <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_tbl_e2_stunting_baseline_vs_qpm.rds"),
+  trust = TRUE
+)
+
+tbl_e3_stunting_by_department <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_tbl_e3_stunting_by_department.rds"),
+  trust = TRUE
+)
+
+fig_e4_delta_height_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_fig_e4_delta_height_distribution.rds"),
+  trust = TRUE
+)
+
+fig_e5_delta_haz_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_05_fig_e5_delta_haz_distribution.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Sigmoid parameters (fixed pipeline constants from framework 05_05)
+ADEQUACY_K  <- 8     # Sigmoid slope parameter
+ADEQUACY_R0 <- 0.5   # Inflection point (ratio where factor = 0.5)
+
+# Analytical cohort size (sum across tbl-b2 strata)
+n_children_total <- tbl_b2_growth_velocity_summary |>
+  summarise(n = sum(n)) |>
+  pull(n)
+
+# Children with HAZ below -4 SD (from tbl-b3)
+n_below_neg4_total <- tbl_b3_haz_below_neg4 |>
+  summarise(n = sum(n_below_neg4)) |>
+  pull(n)
+
+pct_below_neg4_overall <- tbl_b3_haz_below_neg4 |>
+  summarise(
+    n_total = sum(n_total),
+    n_below = sum(n_below_neg4)
+  ) |>
+  mutate(pct = n_below / n_total * 100) |>
+  pull(pct)
+
+# National stunting and HAZ change under full QPM coverage
+e2_value <- function(label) {
+  tbl_e2_stunting_baseline_vs_qpm |>
+    filter(metric_label == label) |>
+    pull(value)
+}
+
+stunting_baseline_pct <- e2_value("Stunting baseline (%)")
+stunting_qpm_pct      <- e2_value("Stunting with QPM (%)")
+stunting_reduction_pp <- abs(e2_value("Stunting reduction (pp)"))
+haz_baseline_mean     <- e2_value("Mean HAZ baseline")
+haz_qpm_mean          <- e2_value("Mean HAZ with QPM")
+haz_delta_mean        <- e2_value("Mean delta HAZ (QPM effect)")
+
+# Departmental spread of the modelled reduction
+dept_change_max <- max(abs(tbl_e3_stunting_by_department$change_pp))
+dept_change_min <- min(abs(tbl_e3_stunting_by_department$change_pp))
+dept_change_cor <- cor(tbl_e3_stunting_by_department$stunting_baseline,
+                       tbl_e3_stunting_by_department$change_pp)
+
+# Mean HAZ change by baseline stunting status, for the density comparison
+delta_haz_by_status <- fig_e5_delta_haz_distribution |>
+  group_by(stunting_label) |>
+  summarise(mean_delta = mean(delta_haz_qpm), .groups = "drop")
+
+mean_delta_haz_stunted <- delta_haz_by_status |>
+  filter(stunting_label == "Stunted (baseline)") |>
+  pull(mean_delta)
+
+mean_delta_haz_not_stunted <- delta_haz_by_status |>
+  filter(stunting_label == "Not stunted (baseline)") |>
+  pull(mean_delta)
+```
+
+
+## Data and Growth Velocity Reference
+
+The framework loads the
+[bioavailability-enriched dataset](05_04_calculate_bioavailability_inadequacy.qmd)
+and WHO Child Growth Standards (0-60 months, daily resolution) plus
+WHO 2007 Reference [@deOnis2007_GrowthReference] (61-71 months, monthly 
+resolution). The combined reference table provides complete coverage for 
+calculating 12-month growth velocity for children aged 6-59 months at 
+baseline (endline ages 18-71 months).
+
+### Growth Velocity by Baseline HAZ
+
+```{r}
+#| label: fig-a3-growth-velocity-curves
+#| fig-cap: "12-month growth velocity by baseline age and HAZ category"
+#| fig-alt: >
+#|   Line chart with two panels, one for boys and one for girls, showing baseline
+#|   age in months on the x-axis and expected 12-month growth velocity in
+#|   centimetres on the y-axis. Each panel draws one line per baseline
+#|   height-for-age category, from minus 4 to plus 3 standard deviations. All
+#|   lines slope downward, so growth velocity decreases with age, consistent with
+#|   the deceleration of linear growth under age 5. The lines are clearly
+#|   separated by category, with lower height-for-age children showing lower
+#|   absolute velocities.
+#| fig-width: 10
+#| fig-height: 7
+
+fig_a3_growth_velocity_curves |>
+  ggplot(aes(x = edad_meses, y = velocity_cm, color = sd_label)) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ sex_label) +
+  scale_color_manual(
+    values = c(
+      "SD -4" = "#67001F", "SD -3" = "#B2182B", "SD -2" = "#D6604D",
+      "SD -1" = "#F4A582", "SD 0 (median)" = "#333333",
+      "SD +1" = "#92C5DE", "SD +2" = "#4393C3", "SD +3" = "#2166AC"
+    ),
+    name = "Baseline HAZ Category"
+  ) +
+  labs(
+    title = "Expected 12-Month Growth Velocity by Baseline Age and HAZ Category",
+    subtitle = "Computed from WHO Child Growth Standards (0-60m) and WHO 2007 Reference (61-71m)",
+    x = "Baseline Age (months)",
+    y = "Growth Velocity (cm / 12 months)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 13, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 8, color = "azure4"),
+    strip.text = element_text(size = 10, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+```
+
+Growth velocity decreases with age in every HAZ category, consistent with the
+deceleration of linear growth in children under 5. Children with lower baseline
+HAZ carry lower absolute growth velocities: at 12 months the reference gives
+9.6 cm per year at −4 SD against 12.2 cm at the median. The curves are
+separated across categories, which is the variation the interpolation reads
+each child's velocity from.
+
+
+## Meta-Analysis and Modulation Parameters
+
+The effect size from @Gunaratna2010_QPM is a 9% increase in height growth
+velocity (multiplicative ratio = 1.09; 95% CI: 6-15%, p < 0.0001), derived
+from a meta-analysis of 7 community-based RCTs (main dataset) in children
+with mild-to-moderate undernutrition and maize-dependent diets. The
+intervention is projected over 12 months for the cohort of children aged
+6-59 months at baseline.
+
+The protein adequacy factor is a rescaled logistic sigmoid with slope
+parameter k = `r ADEQUACY_K` and inflection point r₀ = `r ADEQUACY_R0`.
+The biological basis is a dose-response relationship with a homeostatic
+tolerance zone near full adequacy and accelerated decline below metabolic
+breakpoints (Scheffler et al., 2021; @Gunaratna2010_QPM).
+
+
+## Growth Velocity Assignment
+
+### Interpolation and Validation
+
+For each child, the expected 12-month growth velocity is interpolated
+linearly between the two adjacent HAZ categories in the WHO reference
+table. A child with HAZ = -2.3 receives 70% weight from the SD(-2)
+velocity and 30% from the SD(-3) velocity, avoiding artificial
+discontinuities.
+
+```{r}
+#| label: tbl-b2-growth-velocity-summary
+#| tbl-cap: "Growth velocity assignment summary by age group and sex"
+
+tbl_b2_growth_velocity_summary |>
+  gt(groupname_col = "age_group_5") |>
+  tab_header(
+    title = "12-Month Growth Velocity Assignment",
+    subtitle = "Interpolated from WHO growth velocity tables by baseline HAZ, age, and sex"
+  ) |>
+  cols_label(
+    sexo = "Sex",
+    n = "N",
+    n_assigned = "Assigned",
+    pct_assigned = "% Assigned",
+    mean_gv = "Mean (cm)",
+    sd_gv = "SD (cm)",
+    min_gv = "Min (cm)",
+    max_gv = "Max (cm)"
+  ) |>
+  fmt_number(columns = c(pct_assigned), decimals = 1) |>
+  fmt_number(columns = c(mean_gv, sd_gv, min_gv, max_gv), decimals = 2) |>
+  tab_source_note("Growth velocity: expected cm of growth in 12 months, interpolated between adjacent HAZ categories.") |>
+  tab_source_note("All children aged 6-59 months receive a velocity assignment. WHO under-5 standards (0-60m) and WHO 2007 reference (61-71m) provide complete endline coverage.") |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 12,
+    table.width = pct(100),
+    column_labels.font.weight = "bold"
+  )
+```
+
+::: {.callout-note}
+## Complete Assignment
+Each of the `r format(n_children_total, big.mark = ",")` children in the cohort
+receives a growth velocity assignment. Mean velocity falls from 12.1 cm per 12
+months at 6-11 months to 5.4 cm at 48-59 months (see
+@tbl-b2-growth-velocity-summary), following the deceleration in the reference.
+:::
+
+### HAZ Clamping Below -4 SD
+
+Children with baseline HAZ below -4 SD receive the growth velocity at the
+-4 SD boundary. The WHO expanded tables extend coverage to -4 SD,
+improving coverage for Guatemala's left-shifted distribution.
+
+```{r}
+#| label: tbl-b3-haz-below-neg4
+#| tbl-cap: "Children with baseline HAZ below -4 SD (growth velocity clamped to -4 SD boundary)"
+
+tbl_b3_haz_below_neg4 |>
+  gt(groupname_col = "age_group_5") |>
+  tab_header(
+    title = "Children with Baseline HAZ Below -4 SD",
+    subtitle = "Growth velocity assigned at the -4 SD boundary value (clamped, not extrapolated)"
+  ) |>
+  cols_label(
+    sexo = "Sex",
+    n_total = "N (with GV)",
+    n_below_neg4 = "N Below -4 SD",
+    pct_below_neg4 = "% Below -4 SD",
+    mean_haz_clamped_group = "Mean HAZ (clamped group)",
+    min_haz = "Min HAZ"
+  ) |>
+  fmt_number(columns = c(pct_below_neg4), decimals = 1) |>
+  fmt_number(columns = c(mean_haz_clamped_group, min_haz), decimals = 2) |>
+  sub_missing(missing_text = "---") |>
+  tab_source_note("These children receive the same growth velocity as a child at HAZ = -4.0.") |>
+  tab_source_note("WHO expanded tables extend coverage to -4 SD. Values beyond this boundary are conservatively assigned the -4 SD velocity.") |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 12,
+    table.width = pct(100),
+    column_labels.font.weight = "bold"
+  )
+```
+
+::: {.callout-note}
+## Boundary Treatment
+`r round(pct_below_neg4_overall, 1)`% of children,
+`r format(n_below_neg4_total, big.mark = ",")` in total, have a baseline HAZ
+below -4 SD, with the lowest observed at -5.24. They take the velocity at the
+-4 SD boundary, which the reference tables cover, and the QPM increment for
+these children is computed on that value.
+:::
+
+
+## Protein Adequacy Factor
+
+### Rescaled Logistic Sigmoid
+
+The protein adequacy factor modulates the QPM effect based on the child's
+protein adequacy ratio under the intervention. The function satisfies
+three anchor conditions: f(0) = 0, f(r₀) = 0.5, and f(1) = 1.
+
+$$f(r) = \frac{\sigma(r) - \sigma(0)}{\sigma(1) - \sigma(0)}, \quad \sigma(r) = \frac{1}{1 + e^{-k(r - r_0)}}$$
+
+Where k = `r ADEQUACY_K` (slope) and r₀ = `r ADEQUACY_R0` (inflection
+point). Near full adequacy, between ratios 0.8 and 1.0, the factor stays close
+to 1, which is the homeostatic tolerance zone. Below a ratio of 0.4 it declines
+sharply, at the metabolic breakpoints where protein intake constrains growth.
+
+```{r}
+#| label: fig-c1-sigmoid-curve
+#| fig-cap: "Theoretical protein adequacy factor: rescaled logistic sigmoid"
+#| fig-alt: >
+#|   Line chart showing the protein adequacy ratio (QPM intake divided by
+#|   requirement) on the x-axis from 0 to 1.2 and the modulating adequacy factor
+#|   on the y-axis from 0 to 1. The curve is an S-shaped logistic sigmoid rising
+#|   from 0 at a ratio of 0, passing through 0.5 at the inflection point marked by
+#|   dashed reference lines at ratio 0.5, and levelling off near 1 as the ratio
+#|   approaches and exceeds full adequacy. The steep central rise and flat upper
+#|   plateau show that children near full protein adequacy receive close to the
+#|   full QPM effect while the effect declines sharply below a ratio of about 0.4.
+#| fig-width: 8
+#| fig-height: 5
+
+# Precompute sigmoid anchor values for rescaling
+sigmoid_f0 <- 1 / (1 + exp(-ADEQUACY_K * (0 - ADEQUACY_R0)))
+sigmoid_f1 <- 1 / (1 + exp(-ADEQUACY_K * (1 - ADEQUACY_R0)))
+
+df_sigmoid_curve <- tibble(
+  ratio = seq(0, 1.2, by = 0.005)
+) |>
+  mutate(
+    sigmoid_raw = 1 / (1 + exp(-ADEQUACY_K * (ratio - ADEQUACY_R0))),
+    adequacy_factor = pmin(1, pmax(0,
+      (sigmoid_raw - sigmoid_f0) / (sigmoid_f1 - sigmoid_f0)
+    ))
+  )
+
+df_sigmoid_curve |>
+  ggplot(aes(x = ratio, y = adequacy_factor)) +
+  geom_line(color = "#3AAF85", linewidth = 1.0) +
+  geom_vline(xintercept = 0.5, linetype = "dashed",
+             color = "grey70", linewidth = 0.3) +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             color = "grey70", linewidth = 0.3) +
+  annotate("text", x = 0.52, y = 0.47,
+           label = "Inflection (r0 = 0.5)",
+           hjust = 0, size = 3, color = "grey40") +
+  coord_cartesian(xlim = c(0, 1.2), ylim = c(0, 1.05)) +
+  scale_x_continuous(breaks = seq(0, 1.2, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  labs(
+    title = "Protein Adequacy Factor: Theoretical Sigmoid Curve",
+    subtitle = "Rescaled logistic sigmoid (k = 8, r0 = 0.5) — anchor conditions: f(0) = 0, f(r0) = 0.5, f(1) = 1",
+    x = "Protein Adequacy Ratio (QPM intake / requirement)",
+    y = "Adequacy Factor"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 13, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 8, color = "azure4")
+  )
+```
+
+```{r}
+#| label: tbl-c2-factor-summary
+#| tbl-cap: "Distribution of protein adequacy factor by age group"
+
+tbl_c2_factor_summary |>
+  gt() |>
+  tab_header(
+    title = "Protein Adequacy Factor by Age Group",
+    subtitle = "Mean values for children with assigned growth velocity"
+  ) |>
+  cols_label(
+    age_group_5 = "Age Group",
+    n = "N",
+    mean_adequacy = "Mean",
+    sd_adequacy = "SD",
+    median_adequacy = "Median",
+    min_adequacy = "Min"
+  ) |>
+  fmt_number(columns = c(mean_adequacy, sd_adequacy,
+                         median_adequacy, min_adequacy), decimals = 3) |>
+  tab_source_note("Adequacy factor: rescaled sigmoid (k=8, r0=0.5) applied to QPM protein adequacy ratio.") |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 12,
+    table.width = pct(100),
+    column_labels.font.weight = "bold"
+  )
+```
+
+::: {.callout-important}
+## Adequacy Factor Distribution
+The mean factor ranges from 0.777 at 6-11 months, the lowest of the five
+bands, to 0.895 at 24-35 months (see @tbl-c2-factor-summary). Medians sit at
+1.000 in four bands and 0.984 at 6-11 months, so most children take the
+unattenuated effect and the sigmoid acts on the lower tail of the protein
+adequacy distribution. The minimum is 0 in every band.
+:::
+
+
+## QPM Height Increment and Stunting Reclassification
+
+The QPM-attributable height increment combines three components:
+
+$$\Delta h_{QPM} = v_{12m} \times E \times A$$
+
+Where $v_{12m}$ is the 12-month growth velocity, $E$ = 0.09 (meta-analysis
+effect size), and $A$ is the protein adequacy factor. The final height
+under QPM is $h_{QPM} = h_{baseline} + v_{12m} + \Delta h_{QPM}$, and HAZ
+is recalculated using WHO LMS parameters at the endline age.
+
+
+## Results
+
+### Height Increment by Age Group
+
+```{r}
+#| label: tbl-e1-height-increment-summary
+#| tbl-cap: "QPM-attributable height increment by age group"
+
+tbl_e1_height_increment_summary |>
+  gt() |>
+  tab_header(
+    title = "QPM-Attributable Height Increment by Age Group",
+    subtitle = "ENCOVI 2023, children 6-59 months — 100% coverage scenario (survey-weighted)"
+  ) |>
+  cols_label(
+    age_group_5 = "Age Group",
+    n = "N",
+    mean_gv = "Growth Vel. (cm/12m)",
+    mean_gv_low = "95% CI",
+    mean_gv_upp = "",
+    mean_delta_h = "QPM Increment (cm)",
+    mean_delta_h_low = "95% CI",
+    mean_delta_h_upp = "",
+    mean_delta_haz = "Delta HAZ",
+    mean_delta_haz_low = "95% CI",
+    mean_delta_haz_upp = ""
+  ) |>
+  cols_merge(columns = c(mean_gv_low, mean_gv_upp), pattern = "[{1}, {2}]") |>
+  cols_merge(columns = c(mean_delta_h_low, mean_delta_h_upp), pattern = "[{1}, {2}]") |>
+  cols_merge(columns = c(mean_delta_haz_low, mean_delta_haz_upp), pattern = "[{1}, {2}]") |>
+  fmt_number(columns = c(mean_gv, mean_gv_low), decimals = 2) |>
+  fmt_number(columns = c(mean_delta_h, mean_delta_h_low), decimals = 3) |>
+  fmt_number(columns = c(mean_delta_haz, mean_delta_haz_low), decimals = 4) |>
+  tab_source_note("Effect size: 9% (Gunaratna et al., 2010). Modulation: sigmoid protein adequacy factor (k=8, r0=0.5).") |>
+  tab_source_note("N: unweighted sample size. All estimates survey-weighted.") |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 12,
+    table.width = pct(100),
+    column_labels.font.weight = "bold"
+  )
+```
+
+::: {.callout-note}
+## Age-Dependent Impact
+The QPM height increment falls from 0.854 cm at 6-11 months to 0.424 cm at
+48-59 months (see @tbl-e1-height-increment-summary), which follows the growth
+velocity it is a proportion of. The corresponding change in HAZ moves in the
+same direction, from 0.292 to 0.088.
+:::
+
+### National Stunting Impact
+
+```{r}
+#| label: tbl-e2-stunting-baseline-vs-qpm
+#| tbl-cap: "Stunting impact: baseline vs. QPM intervention (100% coverage)"
+
+tbl_e2_stunting_baseline_vs_qpm |>
+  gt() |>
+  tab_header(
+    title = "Stunting Impact: Baseline vs. QPM Intervention (100% Coverage)",
+    subtitle = "ENCOVI 2023, children 6-59 months (survey-weighted)"
+  ) |>
+  cols_label(
+    n = "N",
+    metric_label = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(columns = value, decimals = 2) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = value,
+                           rows = metric_label == "Stunting reduction (pp)")
+  ) |>
+  tab_source_note("Stunting: HAZ < -2 (WHO). QPM effect: 9% growth velocity increase (Gunaratna, 2010).") |>
+  tab_source_note("N: unweighted sample size. All estimates survey-weighted.") |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 12,
+    table.width = pct(100),
+    column_labels.font.weight = "bold"
+  )
+```
+
+::: {.callout-important}
+## Stunting Reduction
+At 100% QPM coverage the modelled national stunting prevalence moves from
+`r round(stunting_baseline_pct, 1)`% to `r round(stunting_qpm_pct, 1)`%, a
+reduction of `r round(stunting_reduction_pp, 1)` percentage points, and mean
+HAZ from `r round(haz_baseline_mean, 3)` to `r round(haz_qpm_mean, 3)`, a
+change of `r round(haz_delta_mean, 3)`. This is the upper bound of the model,
+computed with all maize replaced by biofortified varieties.
+:::
+
+### Departmental Impact
+
+```{r}
+#| label: tbl-e3-stunting-by-department
+#| tbl-cap: "Stunting impact by department (100% coverage)"
+
+tbl_e3_stunting_by_department |>
+  gt() |>
+  tab_header(
+    title = "Stunting Impact by Department — QPM Intervention (100% Coverage)",
+    subtitle = "ENCOVI 2023 (survey-weighted)"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n = "N",
+    stunting_baseline = "Baseline (%)",
+    stunting_qpm = "QPM (%)",
+    change_pp = "Change (pp)",
+    mean_haz_baseline = "HAZ Baseline",
+    mean_haz_qpm = "HAZ QPM",
+    mean_delta_haz = "Delta HAZ"
+  ) |>
+  fmt_number(columns = c(stunting_baseline, stunting_qpm, change_pp),
+             decimals = 1) |>
+  fmt_number(columns = c(mean_haz_baseline, mean_haz_qpm, mean_delta_haz),
+             decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = change_pp, rows = change_pp < 0)
+  ) |>
+  tab_source_note("QPM effect: 9% growth velocity increase × sigmoid protein adequacy factor.") |>
+  tab_source_note("N: unweighted sample size. All estimates survey-weighted.") |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 12,
+    table.width = pct(100),
+    column_labels.font.weight = "bold"
+  )
+```
+
+The modelled reduction ranges from `r round(dept_change_max, 1)` percentage
+points in Chiquimula to `r round(dept_change_min, 1)` in Guatemala (see
+@tbl-e3-stunting-by-department). It is negatively correlated with baseline
+prevalence, at `r round(dept_change_cor, 2)`, so departments starting higher
+tend to move further, though the relation is loose: Totonicapán carries the
+highest baseline at 70.0% and a reduction of 5.8 pp, while Chiquimula starts at
+55.6% and reaches 14.5. The mean HAZ change is close to uniform across
+departments, between 0.128 and 0.167, so what varies is how many children the
+change carries across the −2 threshold rather than the size of the change
+itself.
+
+### QPM Height Increment Distribution
+
+```{r}
+#| label: fig-e4-delta-height-distribution
+#| fig-cap: "Distribution of QPM-attributable height increment by age group and sex"
+#| fig-alt: >
+#|   Faceted density plot with one panel per age group in a single row, showing
+#|   the QPM-attributable height increment in centimetres on the x-axis and
+#|   density on the y-axis. Within each panel two distributions are overlaid for
+#|   male and female children. The increment is largest for the youngest children
+#|   and its distribution shifts toward smaller values in older age groups,
+#|   reflecting the higher growth velocity of younger children.
+#| fig-width: 10
+#| fig-height: 6
+
+fig_e4_delta_height_distribution |>
+  ggplot(aes(x = delta_height_qpm, fill = sex_label)) +
+  geom_density(alpha = 0.5, color = NA) +
+  facet_wrap(~ age_group_5, nrow = 1) +
+  scale_fill_manual(
+    values = c("Male" = "#1B6CA8", "Female" = "#3AAF85"),
+    name = "Sex"
+  ) +
+  labs(
+    title = "QPM-Attributable Height Increment by Age Group and Sex",
+    subtitle = "ENCOVI 2023 — Effect size 9% × sigmoid protein adequacy factor",
+    x = "QPM Height Increment (cm)",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 13, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 8, color = "azure4"),
+    strip.text = element_text(size = 9, face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+```{r}
+#| label: fig-e5-delta-haz-distribution
+#| fig-cap: "Distribution of HAZ change attributable to QPM by baseline stunting status"
+#| fig-alt: >
+#|   Density plot showing the change in height-for-age z-score attributable to
+#|   QPM on the x-axis and density on the y-axis, with two overlaid distributions
+#|   for children stunted versus not stunted at baseline. A dashed reference line
+#|   marks zero change. Both distributions lie to the right of zero and overlap
+#|   closely, with the not-stunted group sitting marginally further right. Both
+#|   are bimodal, separating children near full protein adequacy from those the
+#|   sigmoid factor attenuates.
+#| fig-width: 10
+#| fig-height: 5
+
+fig_e5_delta_haz_distribution |>
+  ggplot(aes(x = delta_haz_qpm, fill = stunting_label)) +
+  geom_density(alpha = 0.5, color = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "gray50", linewidth = 0.5) +
+  scale_fill_manual(
+    values = c("Stunted (baseline)" = "#E76F51",
+               "Not stunted (baseline)" = "#3AAF85"),
+    name = "Baseline Status"
+  ) +
+  labs(
+    title = "Distribution of HAZ Change Attributable to QPM",
+    subtitle = "ENCOVI 2023 — Stratified by baseline stunting status",
+    x = "Delta HAZ (QPM - Baseline endline)",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 13, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 8, color = "azure4"),
+    legend.position = "bottom"
+  )
+```
+
+The two groups receive HAZ changes of similar magnitude, with a mean of
+`r round(mean_delta_haz_not_stunted, 3)` among children not stunted at baseline
+against `r round(mean_delta_haz_stunted, 3)` among those who are. The ordering
+follows the growth velocity reference: a lower baseline HAZ carries a lower
+expected 12-month velocity, and the QPM increment is a fixed proportion of that
+velocity. The bimodal structure corresponds to the protein adequacy factor,
+which separates children near full adequacy from those the sigmoid attenuates.
+
+
+## Summary
+
+### Key Findings
+
+1. **Growth velocity**: All `r format(n_children_total, big.mark = ",")`
+   children receive WHO-based growth velocity assignments interpolated by
+   baseline HAZ, age, and sex. Only `r round(pct_below_neg4_overall, 1)`%
+   require clamping below -4 SD.
+
+2. **Protein adequacy modulation**: The mean adequacy factor ranges from 0.777
+   to 0.895 across age groups (see @tbl-c2-factor-summary), with medians at or
+   just below 1.0, so the sigmoid acts on the lower tail.
+
+3. **National impact**: At 100% coverage, modelled stunting prevalence moves
+   from `r round(stunting_baseline_pct, 1)`% to
+   `r round(stunting_qpm_pct, 1)`% and mean HAZ by
+   `r round(haz_delta_mean, 3)` (see @tbl-e2-stunting-baseline-vs-qpm).
+
+4. **Departmental variation**: The reduction ranges from
+   `r round(dept_change_min, 1)` to `r round(dept_change_max, 1)` percentage
+   points (see @tbl-e3-stunting-by-department), while the mean HAZ change stays
+   between 0.128 and 0.167, so the spread comes from how many children each
+   department holds near the -2 threshold.
+
+::: {.callout-warning}
+## Limitations
+
+1. **Effect size baseline and modulation** — The 9% growth velocity
+   increase from Gunaratna et al. (2010) is applied as the baseline
+   effect, with individual modulation through each child's protein
+   adequacy ratio under the intervention (sigmoid factor described in the
+   protein adequacy section above). Children meeting their protein
+   requirement take close to the full 9% effect and children far below it take
+   an attenuated one. The meta-analysis confidence interval of 6-15% marks
+   heterogeneity across populations that this single mechanism does not
+   represent.
+
+2. **Cross-sectional to longitudinal** — Each child is projected forward 12
+   months with their current characteristics held fixed.
+
+3. **Protein as sole modulator** — Protein adequacy is the only quantity that
+   modulates the QPM effect; energy, micronutrients and infection burden do
+   not enter the modulation.
+
+4. **Age range extension** — The Gunaratna meta-analysis is calibrated
+   primarily on children 6-24 months, and the extension to 25-59 months
+   applies the protein quality mechanism across the full 6-59 month range.
+
+5. **Boundary clamping** — The
+   `r format(n_below_neg4_total, big.mark = ",")` children below -4 SD take the
+   velocity at that boundary, which sets a floor on the increment assigned to
+   the most affected children.
+:::
+
+### Application
+
+This dataset — containing baseline and QPM stunting profiles for the
+analytical cohort — is the primary input for the scenario simulation
+pipeline (Module 6), which combines the individual-level QPM impact with
+production coverage scenarios to estimate population-level stunting
+reduction under different adoption levels.

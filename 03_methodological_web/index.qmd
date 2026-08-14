@@ -1,0 +1,427 @@
+::: {.content-visible when-profile="es"}
+::: {.hidden}
+{{< meta title >}}
+:::
+:::
+
+::: {.content-visible when-profile="en"}
+
+::: {.lead-paragraph}
+Guatemala has one of the highest stunting rates in the world. Biofortified maize varieties are bred to contain higher levels of iron, zinc, and quality protein (lysine and tryptophan) so that an everyday staple food can deliver more nutrition to households.
+
+This site documents the methodology used to estimate the potential impact of biofortified maize for both the children who eat the maize and for the farmers who grow it.
+:::
+
+## Model description
+
+This framework is an **ex-ante model**: it projects the impacts of biofortified maize across the country in advance of large-scale rollout.
+
+::: {.section-intro}
+The ex-ante model is built as a sequence of distinct analytical problems, each solved using real Guatemalan data and **chained together** so that the output of one stage becomes the input of the next. The chain starts from reported household food consumption and ends in a nationwide simulation of impact. Every stage is documented in full on this site; this page shows how those stages connect.
+
+The model addresses two questions:
+
+- **The nutritional dimension** — how biofortified maize changes children's nutrient intake, and how that change translates into improved growth and reduced stunting.
+- **The economic dimension** — which farmers are likely to adopt the improved seed, and how adoption affects household income.
+
+Both dimensions are combined in a **two-dimensional simulation** across 22 departments and a range of production coverage levels (the share of maize-growing area planted with biofortified seed).
+:::
+
+## From seed to national simulation
+
+The intervention follows a short logical chain: biofortified seed increases the nutrient content of the maize that households consume, which raises children's nutrient intake, which is linked to improved growth and lower stunting rates. Estimating the magnitude of each link from Guatemalan data is what the model does, and the diagram below shows the stages it is organised into. A parallel branch follows the agronomic consequences of the same intervention for farmers.
+
+:::
+
+::: {.content-visible when-profile="es"}
+
+::: {.lead-paragraph}
+Guatemala presenta una de las tasas de desnutrición crónica infantil más altas del mundo. Las variedades de maíz biofortificado se obtienen por fitomejoramiento convencional con mayor contenido de hierro, zinc y proteína de calidad —lisina y triptófano—, de modo que un alimento básico cotidiano aporte más nutrición a los hogares.
+
+Este sitio documenta la metodología empleada para estimar el impacto potencial del maíz biofortificado, tanto en los niños que lo consumen como en los agricultores que lo cultivan.
+:::
+
+## Descripción del modelo
+
+Este marco de análisis es un **modelo ex ante**: proyecta los impactos del maíz biofortificado en todo el país antes de su despliegue a gran escala.
+
+::: {.section-intro}
+El modelo ex ante se construye como una secuencia de problemas analíticos diferenciados, cada uno resuelto con datos guatemaltecos reales y **encadenados entre sí**, de manera que la salida de una etapa es la entrada de la siguiente. La cadena parte del consumo de alimentos declarado por los hogares y termina en una simulación nacional de impacto. Cada etapa está documentada en detalle en este sitio; esta página muestra cómo se conectan.
+
+El modelo responde a dos preguntas:
+
+- **La dimensión nutricional** — cómo modifica el maíz biofortificado la ingesta de nutrientes de los niños, y cómo se traduce ese cambio en una mejora del crecimiento y una reducción de la desnutrición crónica.
+- **La dimensión económica** — qué agricultores tienen mayor probabilidad de adoptar la semilla mejorada, y cómo afecta la adopción a los ingresos del hogar.
+
+Ambas dimensiones se combinan en una **simulación bidimensional** en los 22 departamentos y en un rango de niveles de superficie sembrada con maíz biofortificado.
+:::
+
+## De la semilla a la simulación nacional
+
+La intervención sigue una cadena lógica breve: la semilla biofortificada aumenta el contenido de nutrientes del maíz que consumen los hogares, lo que eleva la ingesta de nutrientes de los niños, lo que se vincula con una mejora del crecimiento y con tasas más bajas de desnutrición crónica. Estimar la magnitud de cada eslabón a partir de datos guatemaltecos es lo que hace el modelo, y el diagrama siguiente muestra las etapas en que se organiza. Una rama paralela sigue las consecuencias agronómicas de la misma intervención para los agricultores.
+
+:::
+
+::: {.content-visible when-profile="en"}
+
+```{=html}
+<div style="max-width: 840px; margin: 30px auto;">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 536" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Model stages: biofortified maize seed feeds in parallel into the nutritional branch, from individual nutrient intakes to child growth and stunting, and into the economic branch, from farmer adoption to biofortified maize supply; both converge in a two-dimensional simulation">
+    <defs>
+      <linearGradient id="cgRed" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#C44441"/>
+        <stop offset="100%" stop-color="#A63937"/>
+      </linearGradient>
+      <linearGradient id="cgGold" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#E3AE68"/>
+        <stop offset="100%" stop-color="#D89A4C"/>
+      </linearGradient>
+      <marker id="arrowGray" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L6,3 L0,6 Z" fill="#9a9a9a"/>
+      </marker>
+    </defs>
+    <style>
+      .cc-title { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:700; font-size:15.5px; fill:#ffffff; }
+      .cc-title-d { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:700; font-size:15.5px; fill:#54311A; }
+      .cc-sub   { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:400; font-size:12px; fill:#ffffff; }
+      .cc-sub-d { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:400; font-size:12px; fill:#54311A; }
+      .cc-axis  { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:600; font-size:11.5px; letter-spacing:0.04em; }
+    </style>
+
+    <!-- Shared origin: seed -->
+    <rect x="256" y="16" width="328" height="70" rx="10" fill="url(#cgRed)"/>
+    <text x="420" y="46" text-anchor="middle" class="cc-title">Biofortified maize seed</text>
+    <text x="420" y="68" text-anchor="middle" class="cc-sub">Ex-ante starting point</text>
+
+    <!-- Split into the two branches -->
+    <line x1="420" y1="86" x2="420" y2="108" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="236" y1="108" x2="604" y2="108" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="236" y1="108" x2="236" y2="150" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGray)"/>
+    <line x1="604" y1="108" x2="604" y2="150" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+    <!-- Axis labels -->
+    <text x="120" y="140" text-anchor="middle" class="cc-axis" fill="#A63937">NUTRITIONAL</text>
+    <text x="722" y="140" text-anchor="middle" class="cc-axis" fill="#8F5716">ECONOMIC</text>
+
+    <!-- ===== NUTRITIONAL BRANCH (left) ===== -->
+    <rect x="72" y="154" width="328" height="64" rx="10" fill="url(#cgRed)"/>
+    <text x="236" y="182" text-anchor="middle" class="cc-title">Individual nutrient intakes</text>
+    <text x="236" y="203" text-anchor="middle" class="cc-sub">Household consumption split per person</text>
+    <line x1="236" y1="218" x2="236" y2="242" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+    <rect x="72" y="244" width="328" height="64" rx="10" fill="url(#cgRed)"/>
+    <text x="236" y="272" text-anchor="middle" class="cc-title">Intake estimated for surveyed children</text>
+    <text x="236" y="293" text-anchor="middle" class="cc-sub">Transfer models, adjusted for bioavailability</text>
+    <line x1="236" y1="308" x2="236" y2="332" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+    <rect x="72" y="334" width="328" height="64" rx="10" fill="url(#cgRed)"/>
+    <text x="236" y="362" text-anchor="middle" class="cc-title">Child growth and stunting</text>
+    <text x="236" y="383" text-anchor="middle" class="cc-sub">Two independent methods, one impact calculation</text>
+
+    <!-- ===== ECONOMIC BRANCH (right) ===== -->
+    <rect x="440" y="154" width="328" height="64" rx="10" fill="url(#cgGold)"/>
+    <text x="604" y="182" text-anchor="middle" class="cc-title-d">Farmer adoption of the seed</text>
+    <text x="604" y="203" text-anchor="middle" class="cc-sub-d">Modeled by farmer segment</text>
+    <line x1="604" y1="218" x2="604" y2="242" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+    <rect x="440" y="244" width="328" height="64" rx="10" fill="url(#cgGold)"/>
+    <text x="604" y="272" text-anchor="middle" class="cc-title-d">Change in household income</text>
+    <text x="604" y="293" text-anchor="middle" class="cc-sub-d">Yield change and seed cost, by segment</text>
+    <line x1="604" y1="308" x2="604" y2="332" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+    <rect x="440" y="334" width="328" height="64" rx="10" fill="url(#cgGold)"/>
+    <text x="604" y="362" text-anchor="middle" class="cc-title-d">Biofortified maize supply</text>
+    <text x="604" y="383" text-anchor="middle" class="cc-sub-d">Determines coverage reaching households</text>
+
+    <!-- ===== Convergence into the simulation ===== -->
+    <line x1="236" y1="398" x2="236" y2="436" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="604" y1="398" x2="604" y2="436" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="236" y1="436" x2="604" y2="436" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="420" y1="436" x2="420" y2="458" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+    <rect x="256" y="462" width="328" height="58" rx="10" fill="#54311A"/>
+    <text x="420" y="487" text-anchor="middle" class="cc-title">Two-dimensional simulation</text>
+    <text x="420" y="507" text-anchor="middle" font-family="'Segoe UI', Tahoma, sans-serif" font-size="12" fill="#e7dccd">By department and coverage level</text>
+  </svg>
+</div>
+```
+
+::: {.section-intro}
+The two dimensions begin from the same point — the decision to plant biofortified seed — and run **in parallel**. The economic branch determines how biofortified maize adoption impacts farmer incomes and how much biofortified maize reaches households at each coverage level; the nutritional branch determines what that maize does for child growth. The national simulation combines both.
+:::
+
+:::
+
+::: {.content-visible when-profile="es"}
+
+```{=html}
+<div style="max-width: 840px; margin: 30px auto;">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 536" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Etapas del modelo: la semilla de maíz biofortificado alimenta en paralelo la rama nutricional, desde la ingesta individual de nutrientes hasta el crecimiento infantil y la desnutrición crónica, y la rama económica, desde la adopción por el agricultor hasta la oferta de maíz biofortificado; ambas convergen en una simulación bidimensional">
+    <defs>
+      <linearGradient id="cgRedEs" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#C44441"/>
+        <stop offset="100%" stop-color="#A63937"/>
+      </linearGradient>
+      <linearGradient id="cgGoldEs" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#E3AE68"/>
+        <stop offset="100%" stop-color="#D89A4C"/>
+      </linearGradient>
+      <marker id="arrowGrayEs" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L6,3 L0,6 Z" fill="#9a9a9a"/>
+      </marker>
+    </defs>
+    <style>
+      .cc-title { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:700; font-size:15.5px; fill:#ffffff; }
+      .cc-title-d { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:700; font-size:15.5px; fill:#54311A; }
+      .cc-sub   { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:400; font-size:12px; fill:#ffffff; }
+      .cc-sub-d { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:400; font-size:12px; fill:#54311A; }
+      .cc-axis  { font-family: 'Segoe UI', Tahoma, sans-serif; font-weight:600; font-size:11.5px; letter-spacing:0.04em; }
+    </style>
+
+    <!-- Origen compartido: la semilla -->
+    <rect x="256" y="16" width="328" height="70" rx="10" fill="url(#cgRedEs)"/>
+    <text x="420" y="46" text-anchor="middle" class="cc-title">Semilla de maíz biofortificado</text>
+    <text x="420" y="68" text-anchor="middle" class="cc-sub">Punto de partida del modelo ex ante</text>
+
+    <!-- Bifurcación en las dos ramas -->
+    <line x1="420" y1="86" x2="420" y2="108" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="236" y1="108" x2="604" y2="108" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="236" y1="108" x2="236" y2="150" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGrayEs)"/>
+    <line x1="604" y1="108" x2="604" y2="150" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGrayEs)"/>
+
+    <!-- Rótulos de eje -->
+    <text x="120" y="140" text-anchor="middle" class="cc-axis" fill="#A63937">NUTRICIONAL</text>
+    <text x="722" y="140" text-anchor="middle" class="cc-axis" fill="#8F5716">ECONÓMICA</text>
+
+    <!-- ===== RAMA NUTRICIONAL (izquierda) ===== -->
+    <rect x="72" y="154" width="328" height="64" rx="10" fill="url(#cgRedEs)"/>
+    <text x="236" y="182" text-anchor="middle" class="cc-title">Ingesta individual de nutrientes</text>
+    <text x="236" y="203" text-anchor="middle" class="cc-sub">Consumo del hogar repartido por persona</text>
+    <line x1="236" y1="218" x2="236" y2="242" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGrayEs)"/>
+
+    <rect x="72" y="244" width="328" height="64" rx="10" fill="url(#cgRedEs)"/>
+    <text x="236" y="272" text-anchor="middle" class="cc-title">Ingesta estimada en los niños encuestados</text>
+    <text x="236" y="293" text-anchor="middle" class="cc-sub">Modelos de transferencia, ajustados por biodisponibilidad</text>
+    <line x1="236" y1="308" x2="236" y2="332" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGrayEs)"/>
+
+    <rect x="72" y="334" width="328" height="64" rx="10" fill="url(#cgRedEs)"/>
+    <text x="236" y="362" text-anchor="middle" class="cc-title">Crecimiento infantil y desnutrición crónica</text>
+    <text x="236" y="383" text-anchor="middle" class="cc-sub">Dos métodos independientes, un impacto calculado</text>
+
+    <!-- ===== RAMA ECONÓMICA (derecha) ===== -->
+    <rect x="440" y="154" width="328" height="64" rx="10" fill="url(#cgGoldEs)"/>
+    <text x="604" y="182" text-anchor="middle" class="cc-title-d">Adopción de la semilla</text>
+    <text x="604" y="203" text-anchor="middle" class="cc-sub-d">Modelada por segmento</text>
+    <line x1="604" y1="218" x2="604" y2="242" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGrayEs)"/>
+
+    <rect x="440" y="244" width="328" height="64" rx="10" fill="url(#cgGoldEs)"/>
+    <text x="604" y="272" text-anchor="middle" class="cc-title-d">Cambio en los ingresos del hogar</text>
+    <text x="604" y="293" text-anchor="middle" class="cc-sub-d">Cambio de rendimiento y costo de semilla, por segmento</text>
+    <line x1="604" y1="308" x2="604" y2="332" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGrayEs)"/>
+
+    <rect x="440" y="334" width="328" height="64" rx="10" fill="url(#cgGoldEs)"/>
+    <text x="604" y="362" text-anchor="middle" class="cc-title-d">Oferta de maíz biofortificado</text>
+    <text x="604" y="383" text-anchor="middle" class="cc-sub-d">Determina la cobertura en los hogares</text>
+
+    <!-- ===== Convergencia en la simulación ===== -->
+    <line x1="236" y1="398" x2="236" y2="436" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="604" y1="398" x2="604" y2="436" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="236" y1="436" x2="604" y2="436" stroke="#9a9a9a" stroke-width="2"/>
+    <line x1="420" y1="436" x2="420" y2="458" stroke="#9a9a9a" stroke-width="2" marker-end="url(#arrowGrayEs)"/>
+
+    <rect x="256" y="462" width="328" height="58" rx="10" fill="#54311A"/>
+    <text x="420" y="487" text-anchor="middle" class="cc-title">Simulación bidimensional</text>
+    <text x="420" y="507" text-anchor="middle" font-family="'Segoe UI', Tahoma, sans-serif" font-size="12" fill="#e7dccd">Por departamento y nivel de cobertura</text>
+  </svg>
+</div>
+```
+
+::: {.section-intro}
+Las dos dimensiones parten del mismo punto —la decisión de sembrar semilla biofortificada— y discurren **en paralelo**. La rama económica determina cómo afecta la adopción del maíz biofortificado a los ingresos de los agricultores y cuánto maíz biofortificado llega a los hogares en cada nivel de cobertura; la rama nutricional determina qué aporta ese maíz al crecimiento infantil. La simulación nacional combina ambas.
+:::
+
+:::
+
+::: {.content-visible when-profile="en"}
+
+## Two dimensions, modeled separately, simulated together
+
+::: {.dimension-grid}
+
+::: {.dimension-card}
+### Nutritional dimension
+Children's daily food consumption is estimated from household survey data, the maize contribution is separated from the rest of the diet, and the effect of biofortification on nutrient intake is estimated.
+
+Estimating the resulting change in child growth and stunting rates is the most demanding step in the model: growth depends on many factors beyond diet, and the link between nutrient intake and growth is indirect. For this reason, child growth and stunting reduction are estimated through **two independent pathways**:
+
+- **Covariate prediction** — a statistical model relating each child's nutrient profile to height-for-age, applied to a simulated child population.
+- **Meta-analysis (Gunaratna)** — a published effect size for quality protein maize, applied to the Guatemalan child population.
+:::
+
+::: {.dimension-card .economic}
+### Economic dimension
+Guatemalan maize farmers are characterised from national survey data, calibrated against the official agricultural census.
+
+The model then estimates **which farmers are likely to adopt** the biofortified seed and **how adoption changes household income**. Adoption determines how much biofortified maize is produced, and therefore how much reaches households at each coverage level — the link between an agricultural intervention and a nutritional outcome.
+:::
+
+:::
+
+::: {.method-note}
+**Why two pathways for stunting.** The two pathways rest on different data sources and different modelling assumptions. The covariate pathway derives the relationship between nutrient intake and growth from the Guatemalan anthropometric survey; the meta-analysis pathway applies an externally published effect size for quality protein maize. Estimating the same outcome by two routes with independent stunting-estimation machinery, applied to the same upstream adoption and distribution scenario, allows the convergence of their results to be examined directly. With the 2028 seed at full production coverage, the two pathways converge on a reduction of **5.6 to 5.8 percentage points** in child stunting prevalence.
+:::
+
+## How the model is built: six modules
+
+The ex-ante model is implemented as six modules. Each module solves one problem in the chain and passes its result to the next. Modules 1, 3, 4 and 5 build and apply the nutritional dimension, module 2 covers the economic dimension, and module 6 combines both into the national simulation. Each module links to its full technical documentation.
+
+:::
+
+::: {.content-visible when-profile="es"}
+
+## Dos dimensiones, modeladas por separado y simuladas en conjunto
+
+::: {.dimension-grid}
+
+::: {.dimension-card}
+### Dimensión nutricional
+El consumo diario de alimentos de los niños se estima a partir de datos de encuestas de hogares, se separa la contribución del maíz del resto de la dieta y se estima el efecto de la biofortificación sobre la ingesta de nutrientes.
+
+Estimar el cambio resultante en el crecimiento infantil y en las tasas de desnutrición crónica es el paso más exigente del modelo: el crecimiento depende de muchos factores además de la dieta, y el vínculo entre la ingesta de nutrientes y el crecimiento es indirecto. Por este motivo, el crecimiento infantil y la reducción de la desnutrición crónica se estiman mediante **dos vías independientes**:
+
+- **Predicción por covariables** — un modelo estadístico que relaciona el perfil de nutrientes de cada niño con la talla para la edad, aplicado a una población infantil simulada.
+- **Metaanálisis (Gunaratna)** — un tamaño de efecto publicado para el maíz de proteína de calidad, aplicado a la población infantil guatemalteca.
+:::
+
+::: {.dimension-card .economic}
+### Dimensión económica
+Los agricultores guatemaltecos de maíz se caracterizan a partir de datos de encuestas nacionales, calibrados con el censo agropecuario oficial.
+
+El modelo estima después **qué agricultores tienen mayor probabilidad de adoptar** la semilla biofortificada y **cómo modifica la adopción los ingresos del hogar**. La adopción determina cuánto maíz biofortificado se produce y, por tanto, cuánto llega a los hogares en cada nivel de cobertura: el vínculo entre una intervención agrícola y un resultado nutricional.
+:::
+
+:::
+
+::: {.method-note}
+**Por qué dos vías para la desnutrición crónica infantil.** Las dos vías se apoyan en fuentes de datos distintas y en supuestos de modelización distintos. La vía de covariables deriva la relación entre ingesta de nutrientes y crecimiento de la encuesta antropométrica guatemalteca; la vía de metaanálisis aplica un tamaño de efecto publicado externamente para el maíz de proteína de calidad. Estimar el mismo resultado por dos rutas con maquinaria de estimación independiente, aplicadas al mismo escenario de adopción y distribución, permite examinar directamente la convergencia de sus resultados. Con la semilla 2028 y la superficie sembrada al máximo, ambas vías convergen en una reducción de **5,6 a 5,8 puntos porcentuales** en la prevalencia de la desnutrición crónica infantil.
+:::
+
+## Cómo se construye el modelo: seis módulos
+
+El modelo ex ante se implementa en seis módulos. Cada uno resuelve un problema de la cadena y pasa su resultado al siguiente. Los módulos 1, 3, 4 y 5 construyen y aplican la dimensión nutricional, el módulo 2 cubre la dimensión económica y el módulo 6 combina ambas en la simulación nacional. Cada módulo enlaza con su documentación técnica completa, disponible en inglés.
+
+:::
+
+::: {.content-visible when-profile="en"}
+
+```{=html}
+<div style="max-width:780px;">
+<a class="module-link-card" href="01_nutritional_intakes/01_01_load_and_prepare_base_data.html"><span class="mod-tag">Module 1 · Nutritional</span><span class="mod-title">Nutrient Intakes</span><span class="mod-desc">Household surveys record food consumption at the level of the whole household, not the individual. This module reconstructs individual daily nutrient intake from household food consumption (ENCOVI 2023) combined with INCAP food composition tables, distributing household consumption to each member through the Adult Male Equivalent method. The maize contribution is kept separate from the rest of the diet, so that the effect of replacing conventional maize with biofortified maize can be isolated later.</span></a>
+<a class="module-link-card econ" href="02_economic_impact/02_01_prepare_agricultural_data.html"><span class="mod-tag">Module 2 · Economic</span><span class="mod-title">Economic Impact</span><span class="mod-desc">This module characterises maize farmers from the agricultural section of ENCOVI 2023, calibrated to the Guatemalan Ministry of Agriculture (MAGA) census so that the sample represents the national farming population. Farmers are grouped into segments based on the type of maize seed they typically plant, the likelihood of adopting biofortified seed is modeled for each, and the income consequences of adoption — through changes in yield and seed cost — are estimated by segment. The resulting production determines how much biofortified maize is available in the food system at each coverage level.</span></a>
+<a class="module-link-card" href="03_transfer_models/03_01_prepare_modeling_data.html"><span class="mod-tag">Module 3 · Nutritional</span><span class="mod-title">Transfer Models</span><span class="mod-desc">Nutrient intake is observed in the consumption survey (ENCOVI), while child growth is measured in a separate anthropometric survey (SIVESNU). The two surveys share no common identifier that would link a child to their diet. This module bridges that gap: survey-weighted regression models relate sociodemographic characteristics — available in both surveys — to nutrient intake, so that intake can be estimated for the children in the anthropometric survey. Separate models for maize and non-maize sources allow biofortification to be simulated directly.</span></a>
+<a class="module-link-card" href="04_covariate_prediction/04_01_prepare_sivesnu_nutritional_data.html"><span class="mod-tag">Module 4 · Nutritional</span><span class="mod-title">Covariate Prediction</span><span class="mod-desc">This module estimates the change in child growth and associated stunting reduction attributable to biofortified maize. It accounts for nutrient bioavailability — the proportion of an ingested nutrient the body can absorb and utilize, which varies with the food matrix, the chemical form of the nutrient, and the composition of the rest of the diet — and incorporates micronutrient supplementation (Chispitas) already reaching part of the population. A model then relates each child's nutrient profile to height-for-age. Because the surveys do not cover every combination of characteristics needed for nationwide simulation, a simulated child population representative of the country is generated. This is the first of the two stunting pathways.</span></a>
+<a class="module-link-card" href="05_meta_analysis/05_01_prepare_sivesnu_height_data.html"><span class="mod-tag">Module 5 · Nutritional</span><span class="mod-title">Meta-analysis</span><span class="mod-desc">This module estimates the stunting reduction attributable to quality protein maize using a published meta-analysis effect size (Gunaratna et al., 2010), applied to the Guatemalan child population. Resting on different data and assumptions from module 4, it provides a second, independent estimate of the same outcome.</span></a>
+<a class="module-link-card sim" href="06_scenarios/06_01_calculate_market_baseline.html"><span class="mod-tag">Module 6 · Simulation</span><span class="mod-title">Scenarios</span><span class="mod-desc">The final module combines the nutritional and economic dimensions into the national ex-ante simulation, across 22 departments and a range of production coverage levels. It accounts for the geographic distribution of supply, including redistribution of biofortified maize between departments, to estimate impact under each scenario.</span></a>
+</div>
+```
+
+:::
+
+::: {.content-visible when-profile="es"}
+
+```{=html}
+<div style="max-width:780px;">
+<a class="module-link-card" href="../01_nutritional_intakes/01_01_load_and_prepare_base_data.html"><span class="mod-tag">Módulo 1 · Nutricional</span><span class="mod-title">Ingestas de nutrientes</span><span class="mod-desc">Las encuestas de hogares registran el consumo de alimentos del conjunto del hogar, no de cada individuo. Este módulo reconstruye la ingesta diaria individual de nutrientes a partir del consumo del hogar (ENCOVI 2023) combinado con las tablas de composición de alimentos del INCAP, repartiendo el consumo del hogar entre sus miembros mediante el método del equivalente de varón adulto. La contribución del maíz se mantiene separada del resto de la dieta, de modo que el efecto de sustituir el maíz convencional por el biofortificado pueda aislarse más adelante.</span></a>
+<a class="module-link-card econ" href="../02_economic_impact/02_01_prepare_agricultural_data.html"><span class="mod-tag">Módulo 2 · Económico</span><span class="mod-title">Impacto económico</span><span class="mod-desc">Este módulo caracteriza a los agricultores de maíz a partir de la sección agropecuaria de la ENCOVI 2023, calibrada con el censo del Ministerio de Agricultura, Ganadería y Alimentación (MAGA) para que la muestra represente a la población agrícola nacional. Los agricultores se agrupan en segmentos según el tipo de semilla de maíz que suelen sembrar, se modela para cada uno la probabilidad de adoptar semilla biofortificada y se estiman por segmento las consecuencias sobre los ingresos —a través del cambio de rendimiento y del costo de la semilla—. La producción resultante determina cuánto maíz biofortificado hay disponible en el sistema alimentario en cada nivel de cobertura.</span></a>
+<a class="module-link-card" href="../03_transfer_models/03_01_prepare_modeling_data.html"><span class="mod-tag">Módulo 3 · Nutricional</span><span class="mod-title">Modelos de transferencia</span><span class="mod-desc">La ingesta de nutrientes se observa en la encuesta de consumo (ENCOVI), mientras que el crecimiento infantil se mide en una encuesta antropométrica distinta (SIVESNU). Ninguna de las dos comparte un identificador que vincule a un niño con su dieta. Este módulo salva esa distancia: modelos de regresión ponderados por diseño muestral relacionan características sociodemográficas —disponibles en ambas encuestas— con la ingesta de nutrientes, de modo que esta pueda estimarse para los niños de la encuesta antropométrica. Modelos separados para las fuentes de maíz y no maíz permiten simular la biofortificación directamente.</span></a>
+<a class="module-link-card" href="../04_covariate_prediction/04_01_prepare_sivesnu_nutritional_data.html"><span class="mod-tag">Módulo 4 · Nutricional</span><span class="mod-title">Predicción por covariables</span><span class="mod-desc">Este módulo estima el cambio en el crecimiento infantil y la reducción asociada de la desnutrición crónica atribuibles al maíz biofortificado. Incorpora la biodisponibilidad de los nutrientes —la proporción de un nutriente ingerido que el organismo puede absorber y utilizar, que varía con la matriz alimentaria, la forma química del nutriente y la composición del resto de la dieta— y la suplementación con micronutrientes (Chispitas) que ya alcanza a parte de la población. Un modelo relaciona después el perfil de nutrientes de cada niño con la talla para la edad. Dado que las encuestas no cubren todas las combinaciones de características necesarias para la simulación nacional, se genera una población infantil simulada representativa del país. Esta es la primera de las dos vías de estimación de la desnutrición crónica.</span></a>
+<a class="module-link-card" href="../05_meta_analysis/05_01_prepare_sivesnu_height_data.html"><span class="mod-tag">Módulo 5 · Nutricional</span><span class="mod-title">Metaanálisis</span><span class="mod-desc">Este módulo estima la reducción de la desnutrición crónica atribuible al maíz de proteína de calidad mediante un tamaño de efecto publicado en un metaanálisis (Gunaratna et al., 2010), aplicado a la población infantil guatemalteca. Apoyado en datos y supuestos distintos de los del módulo 4, aporta una segunda estimación independiente del mismo resultado.</span></a>
+<a class="module-link-card sim" href="../06_scenarios/06_01_calculate_market_baseline.html"><span class="mod-tag">Módulo 6 · Simulación</span><span class="mod-title">Escenarios</span><span class="mod-desc">El módulo final combina las dimensiones nutricional y económica en la simulación nacional ex ante, en los 22 departamentos y en un rango de niveles de superficie sembrada con maíz biofortificado. Tiene en cuenta la distribución geográfica de la oferta, incluida la redistribución de maíz biofortificado entre departamentos, para estimar el impacto en cada escenario.</span></a>
+</div>
+```
+
+:::
+
+::: {.content-visible when-profile="en"}
+
+## Where the numbers come from
+
+The model is built on national data sources.
+
+::: {.table-scroll}
+| Dataset                  | Description                                 | Year      | Provider                  |
+|--------------------------|---------------------------------------------|-----------|---------------------------|
+| ENCOVI                   | National Survey of Living Conditions        | 2023      | INE Guatemala             |
+| SIVESNU                  | National Anthropometric Surveillance System | 2018      | SESAN / INCAP             |
+| ENSMI                    | National Maternal and Child Health Survey   | 2014–2015 | MSPAS / INE               |
+| INE                      | Vital statistics: annual births             | 2019–2023 | INE Guatemala             |
+| INCAP                    | Food composition tables                     | 2014      | INCAP Guatemala           |
+| WHO                      | Child growth standards (height-for-age)     | 2006      | World Health Organization |
+| MAGA                     | Agricultural production statistics          | 2023      | Ministry of Agriculture   |
+| OSRM / OpenStreetMap     | Departmental travel-time matrix (22×22)     | 2026      | Open routing project      |
+:::
+
+:::
+
+::: {.content-visible when-profile="es"}
+
+## De dónde salen los datos
+
+El modelo se construye sobre fuentes de datos nacionales.
+
+::: {.table-scroll}
+| Conjunto de datos        | Descripción                                             | Año       | Proveedor                        |
+|--------------------------|---------------------------------------------------------|-----------|----------------------------------|
+| ENCOVI                   | Encuesta Nacional de Condiciones de Vida                | 2023      | INE Guatemala                    |
+| SIVESNU                  | Sistema Nacional de Vigilancia Antropométrica           | 2018      | SESAN / INCAP                    |
+| ENSMI                    | Encuesta Nacional de Salud Materno Infantil             | 2014–2015 | MSPAS / INE                      |
+| INE                      | Estadísticas vitales: nacimientos anuales               | 2019–2023 | INE Guatemala                    |
+| INCAP                    | Tablas de composición de alimentos                      | 2014      | INCAP Guatemala                  |
+| OMS                      | Patrones de crecimiento infantil (talla para la edad)   | 2006      | Organización Mundial de la Salud |
+| MAGA                     | Estadísticas de producción agropecuaria                 | 2023      | Ministerio de Agricultura        |
+| OSRM / OpenStreetMap     | Matriz departamental de tiempos de viaje (22×22)        | 2026      | Proyecto de enrutamiento abierto |
+:::
+
+:::
+
+::: {.content-visible when-profile="en"}
+
+## Citation
+
+:::
+
+::: {.content-visible when-profile="es"}
+
+## Cita
+
+:::
+
+```bibtex
+@software{newseed_biofortification_guatemala,
+  title  = {Biofortified Maize Impact Assessment Framework for Guatemala},
+  author = {Sánchez Tormo, Julia María and Palomo Llinares, Rubén and
+            Soto Méndez, María José and Adams, Katherine P. and Bowen, Curt},
+  year    = {2026},
+  version = {4.0.0},
+  license = {AGPL-3.0},
+  url     = {https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public}
+}
+```
+
+::: {.content-visible when-profile="en"}
+
+## Contact
+
+- **Methodology and analysis**: Azahar Data Insights — [azahardata.com](https://azahardata.com)
+- **Client**: Semilla Nueva — [semillanueva.org](https://semillanueva.org)
+
+:::
+
+::: {.content-visible when-profile="es"}
+
+## Contacto
+
+- **Metodología y análisis**: Azahar Data Insights · [azahardata.com](https://azahardata.com)
+- **Cliente**: Semilla Nueva — [semillanueva.org](https://semillanueva.org)
+
+:::

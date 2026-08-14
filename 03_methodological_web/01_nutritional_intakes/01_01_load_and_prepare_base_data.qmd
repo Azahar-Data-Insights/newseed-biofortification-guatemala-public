@@ -1,0 +1,340 @@
+---
+title: "Data Sources and Integration"
+subtitle: "Module 1: Nutrient Intakes"
+---
+
+## Overview
+
+In the Guatemalan data context, estimating nutrient intake from household survey
+data requires integrating multiple data sources: consumption records from a
+nationally representative survey, food composition tables with nutrient content,
+and expert-provided conversions to translate local measurement units into
+standardized weights.
+
+This module loads and integrates three primary sources to create a unified
+analytical dataset:
+
+1. **ENCOVI 2023** — Guatemala's National Survey of Living Conditions provides
+   household food consumption records, demographic characteristics, and
+   socioeconomic indicators for over 10,000 households.
+
+2. **INCAP 2014** — The Instituto de Nutrición de Centro América y Panamá
+   (INCAP) Food Composition Table for Central America contains
+   nutrient content (energy, protein, iron, zinc) and amino acid profiles
+   (lysine, tryptophan, methionine, cysteine, threonine) for foods common in
+   the Guatemalan diet.
+
+3. **Expert protein-quality and conversion data** — Two contributions that
+   complete the INCAP base:
+
+   - **Protein quality scores (PDCAAS)** — Amino acid profiles and Protein
+     Digestibility Corrected Amino Acid Scores compiled from the literature
+     by nutrition expert María José Soto Méndez (FINUT) — principally
+     [@Boye2012_PDCAAS], [@SuarezLopez2006_PDCAAS] and FAO amino acid data,
+     following the FAO/WHO/UNU reference methodology [@WHO2007_ProteinAminoAcid].
+     Where no literature value was available for a food, the score was derived
+     from comparable food groups. These scores are delivered as an additional
+     column in the composition table for direct application in the framework.
+   - **Unit conversion factors** — Weights in grams for non-standard units
+     (bags, packages, cups) compiled through on-site market research in
+     Guatemalan supermarkets and markets, addressing the gap left by the
+     original composition tables where most entries lacked complete gram
+     equivalences.
+
+The integration process standardizes food quantities to grams and links
+consumption records to nutritional composition. The distribution of household
+intake to individuals is documented in [Intake Calculation](01_03_intake_calculation.qmd).
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+pacman::p_unload(all = TRUE)
+
+# Load required packages (using pacman for automatic installation)
+pacman::p_load(
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  tidyverse,      # General purpose data manipulation
+  arrow,          # Parquet file handling
+  gt              # Table formatting and presentation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script.
+tbl_data_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_01_tbl_c1_data_summary.rds"),
+  trust = TRUE
+)
+```
+
+
+## ENCOVI 2023: Household Survey Data
+
+ENCOVI (Encuesta Nacional de Condiciones de Vida) is Guatemala's primary source
+for household-level socioeconomic data. The 2023 survey includes a detailed food
+consumption module where households report foods purchased and obtained during
+the previous 15 days, along with quantities and measurement units.
+
+Three datasets are loaded from ENCOVI:
+
+- **Food consumption** — Individual food items with quantities, units, and
+  acquisition method (purchased vs. obtained without purchase).
+- **Household characteristics** — Housing conditions, basic services, and assets
+  used as socioeconomic predictors in transfer models.
+- **Individual demographics** — Age, sex, education, and household relationship
+  for each person, enabling individual-level intake calculations.
+
+
+## INCAP 2014: Food Composition Tables
+
+INCAP maintains the reference food composition database for the region. The
+2014 edition provides
+nutrient content per 100g for foods commonly consumed in Guatemala.
+
+The integrated composition database combines three provenance layers, each
+documented at the value level:
+
+- **INCAP composition base** — Energy, protein, iron, zinc, and the
+  edible-portion factor, transcribed from the INCAP food composition report
+  for Central American foods.
+- **Amino acid profiles** — Essential amino acids including lysine and
+  tryptophan, critical for assessing protein quality in maize-based diets,
+  compiled from the literature by María José Soto Méndez (FINUT).
+- **PDCAAS scores** — Protein Digestibility Corrected Amino Acid Scores
+  indicating protein quality relative to human requirements
+  [@Boye2012_PDCAAS]. Literature-based scores were compiled by FINUT; where no
+  literature value was available, the score was derived from comparable food
+  groups [@SuarezLopez2006_PDCAAS].
+
+The composition tables are keyed by food code (`ali`) and linked to the ENCOVI
+survey food code (`codine`), which is the operative join key to consumption
+records. All nutrient values are expressed on a per-gram basis to
+facilitate calculations with varying portion sizes.
+
+::: {.callout-tip}
+## Protein Quality Score Assignment
+Each food in the composition database carries a PDCAAS value assigned through
+one of three routes:
+
+- **Literature-based and derived scores** — Most foods receive a score
+  compiled by María José Soto Méndez (FINUT) from the literature
+  (Boye et al., 2012; Suárez López et al., 2006), or derived from comparable food
+  groups where no literature value was available.
+- **Negligible protein contribution** — Foods that provide no meaningful
+  dietary protein (sugars, fats and oils, salt, soft drinks) are assigned a
+  conservative value of 0.1, reflecting their negligible contribution to
+  protein quality.
+- **Insufficient composition data** — Where composition data are too sparse to
+  assign a value, the same conservative 0.1 default is applied so that protein
+  quality estimates are not inflated for foods with undetermined digestibility.
+:::
+
+```{r}
+#| label: tbl-pdcaas-coverage
+#| tbl-cap: "PDCAAS assignment across the composition database"
+
+# Read from the composition table: the assignment routes are reported only here
+# Deduplicate on `codine`, the unique operative key, since `ali` repeats across rows
+incap_composition <- read_parquet(
+  here("..", "01_data", "03_external", "incap_food_composition.parquet")
+) |>
+  select(codine, pdcaas) |>
+  distinct()
+
+n_total <- nrow(incap_composition)
+n_default <- sum(is.na(incap_composition$pdcaas))
+n_negligible <- sum(incap_composition$pdcaas == 0.1, na.rm = TRUE)
+n_scored <- n_total - n_default - n_negligible
+
+tibble(
+  Category = c(
+    "Literature-based or derived score",
+    "Negligible protein contribution (0.1)",
+    "Insufficient composition data (0.1 default)",
+    "Total"
+  ),
+  N = c(n_scored, n_negligible, n_default, n_total),
+  Percentage = c(
+    n_scored / n_total,
+    n_negligible / n_total,
+    n_default / n_total,
+    1
+  )
+) |>
+  gt() |>
+  fmt_percent(columns = Percentage, decimals = 1) |>
+  cols_align(align = "right", columns = c(N, Percentage)) |>
+  tab_options(
+    table.font.size = px(14),
+    heading.align = "left"
+  )
+```
+
+
+## Food Unit Equivalences
+
+Household surveys record food quantities in local measurement units — bags
+(*bolsas*), packages (*paquetes*), trays (*bandejas*), dozens (*docenas*) — that
+vary by food type and regional packaging conventions. Converting these to grams
+requires local expertise.
+
+The food equivalence table was compiled by María José Soto (FINUT) through
+on-site market research in Guatemala during 2024. The table provides:
+
+| Data Element | Purpose |
+|--------------|---------|
+| **Gram conversions** | Weight in grams for each food-unit combination |
+| **Plant-based classification** | Identifies foods containing phytates that affect mineral bioavailability |
+| **Survey frequency** | Number of times each unit appears in ENCOVI responses |
+
+The conversions reflect the retail packaging that survey respondents report
+against. A *bolsa* (bag) of rice, for example, has a different weight than a
+*bolsa* of beans, and both differ from standardized INCAP reference weights.
+
+
+## Household Socioeconomic Variables
+
+Household characteristics from ENCOVI are recoded into interpretable factor
+variables. These serve as predictors in the transfer models that estimate
+nutrient intake for SIVESNU children (source of anthropometric data) based on
+their household conditions.
+
+The variables capture multiple dimensions of socioeconomic status:
+
+- **Housing quality** — Wall, roof, and floor materials.
+- **Basic services** — Water source, sanitation, electricity.
+- **Assets** — Television, telephone, computer ownership.
+- **Geographic context** — Department and urban/rural classification.
+
+Individual nutrient intake is derived from household intake using Adult Male
+Equivalent (AME) factors. See
+[Intake Calculation](01_03_intake_calculation.qmd) for the methodology and
+application.
+
+
+## Summary
+
+### ENCOVI 2023 Survey Data
+
+```{r}
+#| label: tbl-summary-encovi
+
+tbl_data_summary$encovi_summary |>
+  gt() |>
+  tab_header(
+    title = "ENCOVI 2023 Survey Data",
+    subtitle = "Loaded datasets overview"
+  ) |>
+  fmt_number(
+    columns = c(Observations, Variables),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_label(
+    Dataset = "Dataset",
+    Observations = "N",
+    Variables = "Variables"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+```
+
+### INCAP 2014 Food Composition Database
+
+```{r}
+#| label: tbl-summary-incap
+
+tbl_data_summary$incap_summary |>
+  gt() |>
+  tab_header(
+    title = "INCAP 2014 Food Composition Database",
+    subtitle = "Integrated composition tables with amino acids and PDCAAS"
+  ) |>
+  cols_label(
+    Component = "Component",
+    Status = "Available"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+```
+
+### External Expert Data
+
+```{r}
+#| label: tbl-summary-external
+
+tbl_data_summary$external_summary |>
+  gt() |>
+  tab_header(
+    title = "External Expert Data",
+    subtitle = "María José Soto (FINUT) contributions"
+  ) |>
+  fmt_number(
+    columns = Count,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_label(
+    Dataset = "Dataset",
+    Count = "N",
+    Description = "Description"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+```
+
+### Processed Base Data
+
+```{r}
+#| label: tbl-summary-processed
+
+tbl_data_summary$processed_summary |>
+  gt() |>
+  tab_header(
+    title = "Processed Base Data",
+    subtitle = "Cleaned and prepared datasets for nutrient intake calculations"
+  ) |>
+  fmt_number(
+    columns = Count,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  sub_missing(
+    columns = Percentage,
+    missing_text = "—"
+  ) |>
+  cols_label(
+    Dataset = "Dataset",
+    Count = "N",
+    Percentage = "%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  )
+```

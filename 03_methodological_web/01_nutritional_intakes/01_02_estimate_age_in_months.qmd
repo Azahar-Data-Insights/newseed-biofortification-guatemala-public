@@ -1,0 +1,917 @@
+---
+title: "Estimate Age in Months"
+subtitle: "Module 1: Nutrient Intakes"
+---
+
+## Why Estimate Age in Months?
+
+ENCOVI 2023 records age as integer years, which creates two methodological
+limitations for the biofortification impact analysis:
+
+1. **Loss of the 6-11 month population** — Children reported as `edad == 0`
+   cannot be separated into those under 6 months (excluded due to exclusive
+   breastfeeding) and those aged 6-11 months (part of the study population).
+   Without month-level resolution, as shown in
+   @tbl-c1-age-distribution-pre, the entire age-0 cohort must be excluded,
+   losing the children aged 6-11 months who should be included.
+
+2. **Imprecision in anthropometric modeling** — WHO LMS growth reference tables
+   require age in months. Using integer years introduces up to ±5.5 months of
+   error in a range where growth curves have steep gradients, distorting
+   height-for-age Z-score calculations.
+
+This module resolves both limitations by generating a synthetic `edad_meses`
+variable using empirical birth distributions from the Guatemala National
+Statistics Institute (INE) vital statistics registry (2019-2023)
+[@INE2024_NacimientosVitales]. Each birth-year cohort is matched to the 
+corresponding age-in-years group. Month assignment uses a greedy quota-filling 
+algorithm that distributes children to birth months so that the survey-weighted 
+distribution matches the observed INE proportions by department and sex.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+pacman::p_unload(all = TRUE)
+
+# Load required packages (using pacman for automatic installation)
+pacman::p_load(
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  tidyverse,      # General purpose data manipulation
+  gt,             # Table formatting and presentation
+  scales          # Number formatting (percent_format)
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script.
+tbl_a1_file_metadata <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_a1_file_metadata.rds"),
+  trust = TRUE
+)
+
+tbl_a3_loading_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_a3_loading_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b1_proportion_validation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_b1_proportion_validation.rds"),
+  trust = TRUE
+)
+
+fig_b2_seasonal_patterns <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_fig_b2_seasonal_patterns.rds"),
+  trust = TRUE
+)
+
+fig_b2_sex_differential <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_fig_b2_sex_differential.rds"),
+  trust = TRUE
+)
+
+tbl_c1_age_distribution_pre <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_c1_age_distribution_pre.rds"),
+  trust = TRUE
+)
+
+tbl_c2_cohort_mapping <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_c2_cohort_mapping.rds"),
+  trust = TRUE
+)
+
+tbl_d3_assignment_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_d3_assignment_summary.rds"),
+  trust = TRUE
+)
+
+fig_e1_month_distribution_by_cohort <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_fig_e1_month_distribution_by_cohort.rds"),
+  trust = TRUE
+)
+
+fig_e2_edad_meses_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_fig_e2_edad_meses_distribution.rds"),
+  trust = TRUE
+)
+
+fig_e3_department_age_boxplot <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_fig_e3_department_age_boxplot.rds"),
+  trust = TRUE
+)
+
+tbl_e4_weighted_deviation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_e4_weighted_deviation.rds"),
+  trust = TRUE
+)
+
+tbl_e5_sibling_separation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_03_tbl_e5_sibling_separation.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Extract concrete figures used in narrative text.
+n_recovered <- tbl_d3_assignment_summary |>
+  filter(Category == "Children 6-11 months (synthetic assignment)") |>
+  pull(N)
+
+n_children_0_4 <- tbl_d3_assignment_summary |>
+  filter(Category == "Children 0-4 years (synthetic assignment)") |>
+  pull(N)
+
+mean_dev_pp_max <- tbl_e4_weighted_deviation |>
+  summarise(max_mean = max(mean_abs_dev) * 100) |>
+  pull(max_mean) |>
+  round(1)
+
+twins_row <- tbl_e5_sibling_separation |>
+  filter(separation_class == "Twins (0 months)")
+n_twins <- twins_row |> pull(n_pairs)
+pct_twins <- (twins_row |> pull(pct)) * 100
+```
+
+
+## Data Sources
+
+The INE publishes annual vital statistics with births disaggregated by month
+of occurrence, department of maternal residence, and sex. Five years of data
+(2019-2023) are loaded and standardized to construct department- and
+sex-specific birth seasonality profiles.
+
+Each birth year maps to one ENCOVI age cohort: children aged 0 years were
+born in 2023, aged 1 in 2022, and so on through age 4 (born 2019). This
+one-to-one mapping allows the INE distributions to serve as population-level
+reference weights for synthetic month assignment within each cohort.
+
+::: {.callout-note}
+## Data Structure
+The unified registry consolidates five annual INE releases (2019-2023) into a
+single table of births by year, month, department, and sex. Records classified
+as "Extranjero" or "Ignorado" are excluded from proportion calculations, as
+ENCOVI assigns all children to one of the 22 departments.
+:::
+
+```{r}
+#| label: tbl-a1-file-metadata
+#| tbl-cap: "INE birth registry file metadata"
+
+tbl_a1_file_metadata |>
+  gt() |>
+  tab_header(
+    title = "INE Birth Registry Source",
+    subtitle = "Guatemala vital statistics, births by month, department, and sex"
+  ) |>
+  cols_label(
+    year = "Year",
+    source = "Source File",
+    coverage = "Coverage"
+  ) |>
+  cols_align(align = "center", columns = year) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+The table above documents the documentary coverage of the unified birth
+registry: five birth years (2019-2023), each mapping to one ENCOVI age cohort,
+consolidated into a single source providing births by month, department, and sex.
+
+```{r}
+#| label: tbl-a3-loading-summary
+#| tbl-cap: "Birth data loading summary by year"
+
+tbl_a3_loading_summary |>
+  gt() |>
+  tab_header(
+    title = "Birth Registry Data Summary",
+    subtitle = "INE Guatemala vital statistics (2019-2023)"
+  ) |>
+  cols_label(
+    birth_year = "Year",
+    n_records = "Records",
+    n_departments = "Departments",
+    n_months = "Months",
+    total_births = "Total Births"
+  ) |>
+  fmt_number(columns = c(n_records, total_births), decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "center") |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = n_departments, rows = n_departments != 22)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = n_months, rows = n_months != 12)
+  ) |>
+  tab_footnote(
+    footnote = "Expected: 22 departments x 12 months x 2 sexes = 528 records per year.",
+    locations = cells_column_labels(columns = n_records)
+  ) |>
+  tab_footnote(
+    footnote = "Red cells indicate deviations from expected values.",
+    locations = cells_title(groups = "subtitle")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Data Completeness
+All five years contain exactly 528 records (22 departments × 12 months ×
+2 sexes), matching the expected record grid for the vital statistics registry.
+Total annual births range from approximately 331,000 to 366,000 across the
+period.
+:::
+
+
+## Birth Seasonality Patterns
+
+Before using INE birth proportions for month assignment, we verify that
+birth timing carries meaningful departmental and sex-specific variation
+beyond a uniform distribution. If births were uniformly distributed, each
+month would contain 8.33% (1/12) of annual births.
+
+```{r}
+#| label: tbl-b1-proportion-validation
+#| tbl-cap: "Proportion sum validation by stratum"
+
+tbl_b1_proportion_validation |>
+  gt() |>
+  tab_header(
+    title = "Birth Proportion Validation",
+    subtitle = "Sum of monthly proportions by year (expected = 1.000 per stratum)"
+  ) |>
+  cols_label(
+    birth_year = "Year",
+    n_strata = "Strata (dept x sex)",
+    min_sum = "Min Sum",
+    max_sum = "Max Sum",
+    mean_sum = "Mean Sum",
+    all_valid = "All Valid"
+  ) |>
+  fmt_number(columns = c(min_sum, max_sum, mean_sum), decimals = 4) |>
+  cols_align(align = "center") |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = all_valid, rows = all_valid == TRUE)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+Within each (year × department × sex) stratum the monthly proportions sum to
+1, which is the structural condition the quota-based assignment algorithm
+operates on.
+
+### Departmental Patterns
+
+```{r}
+#| label: fig-b2-seasonal-patterns
+#| fig-cap: "Monthly birth proportions by department (2019-2023 average)"
+#| fig-alt: >
+#|   Faceted line chart with 22 panels, one per department, ordered by
+#|   seasonal variability. Each panel plots month (January to December) on
+#|   the x-axis against the proportion of annual births on the y-axis, with
+#|   a dashed reference line at the uniform 8.33%. Most departments dip in
+#|   November and December and peak in the first quarter, showing systematic
+#|   seasonal timing that departs from a uniform distribution.
+#| fig-width: 10
+#| fig-height: 12
+
+uniform_ref <- 1 / 12
+
+fig_b2_seasonal_patterns |>
+  mutate(
+    departamento = fct_reorder(departamento, mean_prop, .fun = sd, .desc = TRUE)
+  ) |>
+  ggplot(aes(x = mes, y = mean_prop)) +
+  geom_hline(
+    yintercept = uniform_ref,
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_line(color = "#1B6CA8", linewidth = 0.6) +
+  geom_point(color = "#1B6CA8", size = 1.3) +
+  facet_wrap(~ departamento, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = 1:12, labels = substr(month.abb, 1, 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Monthly Birth Proportions by Department",
+    subtitle = "Average 2019-2023. Dashed line = uniform distribution (8.33%)",
+    x = "Month",
+    y = "Proportion of Annual Births"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 7, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4", size = 8),
+    panel.grid.minor = element_blank()
+  )
+```
+
+All 22 departments show seasonal patterns that depart from the uniform
+distribution (dashed green line), with most departments exhibiting a trough
+in November-December and peaks in the first quarter of the year. The month
+assignment therefore draws on department-specific empirical proportions.
+
+### Sex Differential
+
+```{r}
+#| label: fig-b2-sex-differential
+#| fig-cap: "Male-to-female birth ratio by month (national average 2019-2023)"
+#| fig-alt: >
+#|   Lollipop chart with points and vertical stems for each month from
+#|   January to December on the x-axis and the male-to-female birth ratio
+#|   on the y-axis, zoomed to a range of 0.99 to 1.06 with a dashed
+#|   reference line at parity (1.0). Every month sits above parity, between
+#|   about 1.02 and 1.05, reflecting the biological excess of male births.
+#| fig-width: 9
+#| fig-height: 5
+
+fig_b2_sex_differential |>
+  ggplot(aes(x = mes_label, y = ratio_mf)) +
+  geom_hline(
+    yintercept = 1,
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+  geom_segment(
+    aes(xend = mes_label, yend = 1),
+    color = "#1B6CA8",
+    linewidth = 0.8
+  ) +
+  geom_point(color = "#1B6CA8", size = 3) +
+  coord_cartesian(ylim = c(0.99, 1.06)) +
+  labs(
+    title = "Male-to-Female Birth Ratio by Month",
+    subtitle = "National aggregate 2019-2023. Dashed line = parity (1.0)",
+    x = "Month",
+    y = "M/F Ratio"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The male-to-female birth ratio exceeds parity in every month (range:
+1.02-1.05), consistent with the documented global biological excess of male
+births. This sex differential, combined with departmental seasonality, is why
+the month assignment is conditioned on both department and sex.
+
+
+## ENCOVI Children and Cohort Mapping
+
+### Target Population
+
+ENCOVI 2023 contains `r format(n_children_0_4, big.mark = ",")` children aged
+0-4 years, distributed across five single-year age groups. These children form
+the population requiring synthetic month assignment.
+
+```{r}
+#| label: tbl-c1-age-distribution-pre
+#| tbl-cap: "Age distribution of children 0-4 years before month assignment"
+
+tbl_c1_age_distribution_pre |>
+  gt() |>
+  tab_header(
+    title = "Children Aged 0-4 Years in ENCOVI 2023",
+    subtitle = "Distribution by age (integer years) and sex before month assignment (sampled children, unweighted)"
+  ) |>
+  cols_label(
+    edad = "Age (years)",
+    Hombre = "Male",
+    Mujer = "Female",
+    Total = "Total"
+  ) |>
+  fmt_number(columns = c(Hombre, Mujer, Total), decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "center") |>
+  grand_summary_rows(
+    fns = list(Total = ~ sum(.)),
+    columns = c(Hombre, Mujer, Total),
+    fmt = ~ fmt_number(., decimals = 0, use_seps = TRUE)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Cohort Mapping Logic
+
+Each integer age maps to a single birth-year cohort. A child aged `n` years
+was born in `2023 - n`. Within each cohort, the 12 possible birth months
+define a 12-month age range.
+
+```{r}
+#| label: tbl-c2-cohort-mapping
+#| tbl-cap: "Age-to-cohort mapping for synthetic month assignment"
+
+tbl_c2_cohort_mapping |>
+  gt() |>
+  tab_header(
+    title = "Cohort Mapping: ENCOVI Age to INE Birth Year",
+    subtitle = "Each integer age maps to a birth year and 12-month range"
+  ) |>
+  cols_label(
+    edad = "Age (years)",
+    birth_year = "Birth Year",
+    month_offset = "Month Offset",
+    age_range_months = "Age Range (months)"
+  ) |>
+  cols_align(align = "center") |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Cohort Assignment Assumption
+This mapping assumes children were interviewed during 2023 and that their
+reported age reflects completed years. For children interviewed near their
+birthday, the resulting imprecision is bounded at ±1 month within the cohort.
+:::
+
+
+## Synthetic Month Assignment
+
+### Assignment Algorithm
+
+Within each stratum (birth year × department × sex), the algorithm distributes
+children to birth months using a greedy quota-filling approach:
+
+1. Calculate target population per month from INE proportions and total
+   survey-weighted population in the stratum.
+2. Sort children by survey weight (descending), with random tie-breaking.
+3. Assign each child to the month with the largest remaining quota,
+   subtracting the child's weight from that month's quota.
+
+The **survey-weighted** (population-represented) distribution of assigned
+months therefore follows the INE reference proportions.
+
+A child assigned birth month `m` within a given birth year receives
+`edad_meses = month_offset + (12 - m)`, mapping January births to the oldest
+position within the cohort and December births to the youngest.
+
+::: {.callout-important}
+## Population-Level Quota Matching
+The algorithm operates on survey-weighted quotas. A department with 50
+sampled children representing 5,000 individuals therefore produces a weighted
+distribution that follows INE proportions at the population level — the level
+at which results are reported. The greedy approach is quasi-deterministic:
+stochasticity is limited to tie-breaking among children with identical survey
+weights.
+:::
+
+### Biological Plausibility Correction
+
+Within households containing multiple children aged 0-4 years, independent
+stratum-based assignment can produce age-in-months values that are biologically
+implausible for siblings. Two children from the same mother cannot be born
+less than 9 months apart unless they are twins (age difference of exactly
+0 months).
+
+The post-assignment correction identifies all sibling pairs where the assigned
+age separation falls in the invalid range (1-8 months) and reassigns the child
+with the smaller survey weight to the valid birth month with the largest
+remaining INE quota in that child's stratum. The correction is iterative:
+after each reassignment, all sibling pairs within the household are
+re-evaluated.
+
+### Assignment Results
+
+```{r}
+#| label: tbl-d3-assignment-summary
+#| tbl-cap: "Age in months assignment summary"
+
+tbl_d3_assignment_summary |>
+  gt() |>
+  tab_header(
+    title = "Synthetic Age-in-Months Assignment Summary",
+    subtitle = "ENCOVI 2023 individual dataset"
+  ) |>
+  cols_label(
+    Category = "Category",
+    N = "N"
+  ) |>
+  fmt_number(columns = N, decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = N) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      rows = Category == "Children 6-11 months (synthetic assignment)"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      rows = Category == "Children 6-11 months (synthetic assignment)"
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Study Population Recovery
+The synthetic month assignment identifies
+`r format(n_recovered, big.mark = ",")` children aged 6-11 months, who cannot
+be separated from infants under 6 months on integer age alone (both report
+`edad == 0`). This extends the study population to the intended 6-59 month
+range, covering the complementary feeding window.
+:::
+
+
+## Validation
+
+### Distributional Match to INE Proportions
+
+The primary validation compares the survey-weighted distribution of assigned
+birth months against the INE reference proportions for each cohort. Grey
+segments show the deviation between observed (blue dots) and expected (green
+crosses) proportions.
+
+```{r}
+#| label: fig-e1-month-distribution-by-cohort
+#| fig-cap: "Synthetic assignment vs INE expected birth proportions by cohort"
+#| fig-alt: >
+#|   Faceted chart with one panel per cohort. Each panel plots birth month
+#|   (January to December) on the x-axis against proportion on the y-axis.
+#|   Blue dots mark the observed survey-weighted proportions, a green dashed
+#|   line with crosses marks the INE expected proportions, and grey vertical
+#|   segments connect them to show the deviation. Observed and expected
+#|   values track closely across cohorts, indicating the synthetic month
+#|   assignment reproduces the reference distribution.
+#| fig-width: 12
+#| fig-height: 8
+
+fig_e1_month_distribution_by_cohort |>
+  ggplot(aes(x = birth_month_inferred)) +
+  geom_segment(
+    aes(xend = birth_month_inferred, y = prop_expected, yend = prop_observed),
+    color = "grey70",
+    linewidth = 0.4
+  ) +
+  geom_point(aes(y = prop_observed), color = "#1B6CA8", size = 2) +
+  geom_line(
+    aes(y = prop_expected),
+    color = "#3AAF85",
+    linewidth = 0.7,
+    linetype = "dashed"
+  ) +
+  geom_point(aes(y = prop_expected), color = "#3AAF85", size = 1.5, shape = 4) +
+  facet_wrap(~ cohort_label, ncol = 3, scales = "fixed") +
+  scale_x_continuous(breaks = 1:12, labels = substr(month.abb, 1, 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Synthetic Assignment vs INE Expected Birth Proportions",
+    subtitle = "Blue dots = observed (survey-weighted). Green dashed = INE expected. Grey segments = deviation",
+    x = "Birth Month",
+    y = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4", size = 9),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Age Distribution in Study Population
+
+```{r}
+#| label: fig-e2-edad-meses-distribution
+#| fig-cap: "Distribution of edad_meses for children 0-59 months"
+#| fig-alt: >
+#|   Histogram of synthetic age in months (0 to 59) on the x-axis against
+#|   count of children on the y-axis, using one-month bins. A dashed
+#|   vertical line at 5.5 months marks the boundary between the excluded
+#|   under-6-months group and the 6-59 months study population. The bars
+#|   are roughly uniform across the full range, consistent with comparable
+#|   birth cohort sizes in ENCOVI.
+#| fig-width: 10
+#| fig-height: 6
+
+fig_e2_edad_meses_distribution |>
+  ggplot(aes(x = edad_meses)) +
+  geom_histogram(
+    binwidth = 1,
+    fill = "#1B6CA8",
+    color = "white",
+    alpha = 0.7
+  ) +
+  geom_vline(
+    xintercept = 5.5,
+    color = "#E07A5F",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = 2.7, y = Inf,
+    label = "< 6 months\n(excluded)",
+    vjust = 1.5,
+    hjust = 0.5,
+    color = "#E07A5F",
+    size = 3.5,
+    fontface = "italic"
+  ) +
+  annotate(
+    "text",
+    x = 32, y = Inf,
+    label = "6-59 months\n(study population)",
+    vjust = 1.5,
+    hjust = 0.5,
+    color = "#3AAF85",
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  scale_x_continuous(breaks = seq(0, 59, by = 6)) +
+  labs(
+    title = "Distribution of Synthetic Age in Months",
+    subtitle = "ENCOVI 2023 children 0-59 months. Dashed line = 6-month boundary",
+    x = "Age (months)",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The histogram shows a relatively uniform distribution of age in months across
+the 0-59 range, consistent with approximately equal birth cohort sizes in
+ENCOVI. The 6-month boundary (dashed red line) clearly separates the excluded
+breastfeeding population from the study population.
+
+### Departmental Age Distribution
+
+```{r}
+#| label: fig-e3-department-age-boxplot
+#| fig-cap: "Synthetic edad_meses distribution by department for children 6-59 months"
+#| fig-alt: >
+#|   Horizontal box-and-whisker chart with one box per department, ordered
+#|   by median. Department runs along the y-axis and synthetic age in months
+#|   (6 to 59) along the x-axis. Medians cluster around 30 to 40 months with
+#|   comparable interquartile ranges and no department showing distributional
+#|   anomalies, indicating no systematic assignment bias.
+#| fig-width: 10
+#| fig-height: 8
+
+fig_e3_department_age_boxplot |>
+  mutate(
+    departamento = fct_reorder(departamento, edad_meses, .fun = median)
+  ) |>
+  ggplot(aes(x = departamento, y = edad_meses)) +
+  geom_boxplot(
+    fill = "#1B6CA8",
+    alpha = 0.3,
+    color = "azure4",
+    outlier.size = 0.8,
+    outlier.alpha = 0.4
+  ) +
+  coord_flip() +
+  labs(
+    title = "Synthetic Age Distribution by Department",
+    subtitle = "Children 6-59 months, ENCOVI 2023",
+    x = NULL,
+    y = "Age (months)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    axis.text.y = element_text(size = 9),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Departmental boxplots confirm that the synthetic age distribution is
+well-behaved across all 22 departments, with median ages centered around
+30-40 months and comparable interquartile ranges. No department shows
+distributional anomalies that would suggest systematic assignment bias.
+
+### Weighted Deviation from INE Proportions
+
+The primary quality metric quantifies the departure of the synthetic
+assignment from the target INE birth proportions. For each department, the
+mean and maximum absolute deviation are calculated across all cohort-month
+strata.
+
+```{r}
+#| label: tbl-e4-weighted-deviation
+#| tbl-cap: "Weighted deviation from INE proportions by department"
+
+tbl_e4_weighted_deviation |>
+  gt() |>
+  tab_header(
+    title = "Weighted Deviation from INE Birth Proportions",
+    subtitle = "By department, across all cohorts and months"
+  ) |>
+  cols_move(columns = n_children, after = departamento) |>
+  cols_label(
+    departamento = "Department",
+    n_children = "N Children (sample)",
+    n_strata = "Strata (cohort x month)",
+    mean_abs_dev = "Mean |Deviation|",
+    max_abs_dev = "Max |Deviation|"
+  ) |>
+  fmt_number(columns = c(mean_abs_dev, max_abs_dev), decimals = 4) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "center", columns = c(n_children, n_strata, mean_abs_dev, max_abs_dev)) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = mean_abs_dev, rows = mean_abs_dev > 0.02)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = mean_abs_dev, rows = mean_abs_dev <= 0.02)
+  ) |>
+  tab_footnote(
+    footnote = "Green = mean deviation <= 2pp. Red = exceeds 2pp. Higher deviations correlate with smaller sample sizes and the discrete nature of the assignment algorithm. Max deviation captures the worst individual stratum (single month x cohort combination).",
+    locations = cells_column_labels(columns = mean_abs_dev)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Assignment Quality
+All 22 departments achieve mean absolute deviations below
+`r mean_dev_pp_max` percentage points from the INE target proportions. The
+departments with the highest deviations are those with smaller sample sizes
+where the discrete nature of the assignment algorithm has a proportionally
+larger impact.
+:::
+
+### Sibling Age Separation
+
+Sibling age separations are reported after the biological plausibility
+correction. Valid sibling pairs have an age difference of exactly 0 months
+(twins) or at least 9 months (minimum full gestation period).
+
+```{r}
+#| label: tbl-e5-sibling-separation
+#| tbl-cap: "Sibling age separation diagnostic after biological plausibility correction"
+
+tbl_e5_sibling_separation |>
+  gt() |>
+  tab_header(
+    title = "Sibling Age Separation Distribution",
+    subtitle = "All sibling pairs in households with 2+ children aged 0-4 years, after biological plausibility correction"
+  ) |>
+  cols_label(
+    separation_class = "Separation Category",
+    n_pairs = "N Pairs",
+    pct = "Proportion"
+  ) |>
+  fmt_number(columns = n_pairs, decimals = 0) |>
+  fmt_percent(columns = pct, decimals = 1) |>
+  cols_align(align = "left", columns = separation_class) |>
+  cols_align(align = "center", columns = c(n_pairs, pct)) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(
+      columns = n_pairs,
+      rows = separation_class == "Invalid (1-8 months)"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = n_pairs,
+      rows = separation_class != "Invalid (1-8 months)"
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Biological Plausibility
+After the correction, as shown in @tbl-e5-sibling-separation, no sibling
+pairs remain in the invalid 1-8 month separation range. The majority of
+pairs are separated by more than 24 months, consistent with typical
+inter-birth intervals in Guatemala. Approximately
+`r format(n_twins, big.mark = ",")` pairs (`r round(pct_twins, 1)`%) are
+classified as twins (0-month separation), inferred from the algorithm
+output rather than directly observed (ENCOVI does not record twin status).
+:::
+
+
+## Summary
+
+### Key Findings
+
+1. **Study population coverage**: The synthetic month assignment identifies
+   `r format(n_recovered, big.mark = ",")` children aged 6-11 months, extending
+   the study population to the specified 6-59 month range.
+
+2. **Distributional accuracy**: Survey-weighted month distributions track INE
+   birth proportions with mean deviations below `r mean_dev_pp_max`
+   percentage points in each of the 22 departments.
+
+3. **Biological consistency**: As documented in @tbl-e5-sibling-separation, no
+   sibling pair remains in the impossible 1-8 month separation range after the
+   plausibility correction.
+
+4. **Seasonal information carried through**: The assignment reproduces
+   departmental and sex-specific birth seasonality.
+
+::: {.callout-warning}
+## Limitations
+
+1. **Interview timing assumption** — The lack of individual-level interview
+   dates means cohort assignment is approximate. A child whose household was
+   interviewed near the child's birthday may be misclassified by one cohort.
+   This ambiguity affects approximately 1/12 of children at each boundary.
+
+2. **Residual stochasticity** — The assignment is quasi-deterministic, with a
+   random component limited to tie-breaking among children with identical
+   survey weights. Individual-level assignments are synthetic and should not
+   be interpreted as observed values.
+
+3. **Twin identification** — The pairs classified as twins (0-month
+   separation, see @tbl-e5-sibling-separation) are inferred rather than
+   observed, as ENCOVI does not record twin status.
+:::
+
+### Application
+
+This dataset provides month-level age resolution for all ENCOVI 2023
+individuals, enabling precise WHO LMS Z-score calculations in downstream
+anthropometric modeling. The synthetic `edad_meses` variable is used by
+subsequent scripts in both the Covariate prediction pathway (individual
+consumption allocation) and the Meta-analysis (Gunaratna) pathway
+(height-for-age Z-score computation).

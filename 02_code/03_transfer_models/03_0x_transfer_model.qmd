@@ -1,0 +1,607 @@
+---
+title: "Transfer Model: `r params$nutrient_label`"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+params:
+  nutrient_id: "iron"
+  nutrient_label: "Iron Intake"
+  var_prefix: "fe"
+  var_maize: "fe_individuo_dia_maiz"
+  var_non_maize: "fe_individuo_dia_no_maiz"
+  units: "mg/day"
+  script_number: "03_02"
+  model_filename: "03_02_iron_models.rds"
+  outlier_quantile: 0.95
+  outlier_label: "P95 + 1.5×IQR"
+  distribution_fn: "determine_distribution"
+  overview_text: "This script develops predictive models for iron intake (maize vs non-maize sources) using ENCOVI 2023 data."
+---
+
+# Overview
+
+`r params$overview_text`
+
+These models will be applied to SIVESNU 2018 children to estimate their nutrient profiles based on demographic and socioeconomic characteristics.
+
+The workflow:
+
+1.  Load modeling-ready data from the preparation script (cleaned predictors + outcomes)
+2.  Create survey design with outlier removal
+3.  Evaluate distribution of `r tolower(params$nutrient_label)` variables (maize and non-maize)
+4.  Train full gamma regression models with polynomial terms where applicable
+5.  Perform variable selection using Wald tests
+6.  Train refined models with significant predictors only
+7.  Evaluate model diagnostics (residuals, leverage, collinearity)
+8.  Save final models for SIVESNU transfer
+
+**Modeling approach**: Survey-weighted gamma regression with log link, suitable for positive continuous outcomes with right-skewed distributions.
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clean environment (preserve params injected by Quarto)
+rm(list = setdiff(ls(), "params"))
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export (export() for RDS model output)
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  glue,               # String interpolation in table headers
+  broom,              # augment() for model diagnostics
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  see,                # Visual backend for performance diagnostics
+  tidyverse           # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions, including the distribution helpers resolved at
+# runtime through match.fun()
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# --- Resolve parameters into local variables -------------------------------
+
+nutrient_id      <- params$nutrient_id
+nutrient_label   <- params$nutrient_label
+var_prefix       <- params$var_prefix
+var_maize        <- params$var_maize
+var_non_maize    <- params$var_non_maize
+units            <- params$units
+model_filename   <- params$model_filename
+# Reconstruct script_number from model_filename, whose non-numeric suffix
+# keeps it a string through the Quarto execute_params round trip
+script_number    <- sub("^([0-9]{2}_[0-9]{2})_.*$", "\\1", model_filename)
+outlier_quantile <- params$outlier_quantile
+outlier_label    <- params$outlier_label
+distribution_fn  <- match.fun(params$distribution_fn)
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "models"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+
+```
+
+# Phase A: Data Loading and Preparation
+
+## A1. Load Modeling Data
+
+```{r}
+#| label: a1-load-data
+
+# Load modeling-ready data
+df_raw <- read_parquet(
+  here("01_data", "02_processed",
+       "transfer", "03_01_modeling_ready_data.parquet")
+)
+
+# Define predictor variables for full model
+# Polynomial terms are applied to continuous predictors; nominal predictors
+# enter as factors, contributing one coefficient per level.
+predictor_variables <- c(
+  "parentesco", "sexo", "poly(edad, 2)",
+  "departamento", "area", "poly(miembros_hogar, 3)",
+  "propiedad", "poly(grado_estudios_hogar, 3)", "tipo_vivienda",
+  "material_paredes", "material_techo", "material_piso",
+  "poly(n_cuartos, 3)", "tipo_sanitario", "fuente_agua",
+  "recoleccion_basura", "electricidad", "televisor",
+  "telefonia_celular", "computadora"
+)
+```
+
+## A2. Handle Outliers
+
+Remove extreme values that could distort model training. Zero values cannot be modeled with gamma distribution (log link requires positive values).
+
+**Outlier threshold:** Upper outliers are identified as values exceeding `r outlier_label`. `r if (outlier_quantile == 0.95) "The threshold suits micronutrients, whose dietary intake distributions are markedly right-skewed and where biologically plausible high values arise from consumption of micronutrient-dense or fortified foods. Retaining the upper tail supports model generalizability to populations with varied dietary patterns." else "The threshold suits macronutrients and amino acids, whose distributions are more stable and where extreme values are consistent with measurement error."`
+
+```{r}
+#| label: a2-remove-outliers
+
+# Remove outliers and invalid values for modeling
+df_clean <- df_raw |>
+  # Remove records with missing outcomes
+  drop_na(all_of(c(var_maize, var_non_maize))) |>
+  # Remove zero values (incompatible with gamma distribution)
+  filter(
+    .data[[var_maize]] > 0,
+    .data[[var_non_maize]] > 0
+  ) |>
+  # Remove upper outliers
+  filter(
+    .data[[var_maize]] <= quantile(df_raw[[var_maize]], outlier_quantile, na.rm = TRUE) +
+      1.5 * IQR(df_raw[[var_maize]], na.rm = TRUE),
+    .data[[var_non_maize]] <= quantile(df_raw[[var_non_maize]], outlier_quantile, na.rm = TRUE) +
+      1.5 * IQR(df_raw[[var_non_maize]], na.rm = TRUE)
+  )
+```
+
+
+## A3. Create Survey Design
+
+Establish the survey design incorporating sampling weights and clustering structure for population-level inference.
+
+```{r}
+#| label: a3-create-survey-design
+ 
+# Create the survey design
+survey_design <- df_clean |>
+  # Consolidate nominal levels before modeling;
+  # "Otro" is retired from tipo_vivienda because the level carries no observations
+  mutate(
+    material_piso = fct_recode(material_piso, "Madera" = "Parqué"),
+    tipo_vivienda = fct_drop(tipo_vivienda, only = "Otro")
+  ) |>
+  # Select variables for modeling
+  transmute(
+    # Survey design variables
+    upm, factor,
+    # Personal characteristics
+    parentesco, sexo, edad,
+    # Geographic characteristics
+    departamento, area,
+    # Household characteristics
+    miembros_hogar, propiedad, grado_estudios_hogar,
+    # Housing characteristics
+    tipo_vivienda, material_paredes, material_techo, material_piso,
+    n_cuartos, tipo_sanitario,
+    # Basic services
+    fuente_agua, recoleccion_basura,
+    # Household assets
+    electricidad, televisor, telefonia_celular, computadora,
+    # Outcome variables
+    !!sym(var_maize) := .data[[var_maize]],
+    !!sym(var_non_maize) := .data[[var_non_maize]]
+  ) |>
+  # Create the survey design
+  as_survey_design(
+    ids = upm,              # Primary sampling units (clusters)
+    weights = factor,       # Expansion factors
+    strata = NULL           # No stratification in ENCOVI 2023
+  )
+```
+
+---
+
+# Phase B: Model `r nutrient_label` from Maize
+
+## B1. Evaluate Distribution
+
+Assess the distribution of `r tolower(nutrient_label)` from maize to select appropriate regression family.
+
+```{r}
+#| label: fig-b1-evaluate-distribution-maize
+#| fig-cap: !expr paste0("Distribution assessment for ", tolower(params$nutrient_label), " from maize")
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+# Evaluate distribution fit for nutrient from maize
+df_b1_dist_maize <- survey_design$variables[[var_maize]]
+export(df_b1_dist_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_b1_evaluate_distribution_maize.rds")))
+distribution_fn(df_b1_dist_maize)
+
+# Cleanup auxiliary objects
+rm(df_b1_dist_maize)
+```
+
+**Decision**: The gamma distribution is selected for `r tolower(nutrient_label)` data (positive, right-skewed, continuous). Modeling proceeds with gamma regression and log link.
+
+## B2. Train Full Model
+
+Train initial model with all predictor variables using survey-weighted gamma regression.
+
+```{r}
+#| label: b2-train-full-model-maize
+#| warning: FALSE
+
+# Train full gamma regression model for nutrient from maize
+results_maize_full <- train_gamma_model(
+  formula = as.formula(paste(var_maize, "~", paste(predictor_variables, collapse = " + "))),
+  model_label = paste0(nutrient_label, " from Maize (Full Model)"),
+  x_label = paste0("Observed ", nutrient_label, " from Maize (", units, ")"),
+  y_label = paste0("Predicted ", nutrient_label, " from Maize (", units, ")"),
+  design = survey_design
+)
+```
+
+```{r}
+#| label: tbl-b2-coefficients-full-model-maize
+#| tbl-cap: !expr paste0("Model coefficients for ", tolower(params$nutrient_label), " from maize (full model)")
+
+# Display model coefficients
+df_b2_coef_maize <- results_maize_full$coefficients
+export(df_b2_coef_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_tbl_b2_coefficients_full_model_maize.rds")))
+df_b2_coef_maize
+
+# Cleanup auxiliary objects
+rm(df_b2_coef_maize)
+```
+
+```{r}
+#| label: fig-b2-diagnostic-plot-full-model-maize
+#| fig-cap: !expr paste0("Observed vs predicted ", tolower(params$nutrient_label), " from maize (full model)")
+
+# Display diagnostic scatter plot
+df_b2_diag_maize <- augment(results_maize_full$model)
+export(df_b2_diag_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_b2_diagnostic_plot_full_model_maize.rds")))
+results_maize_full$plot
+
+# Cleanup auxiliary objects
+rm(df_b2_diag_maize)
+```
+
+## B3. Variable Selection (Wald Tests)
+
+Perform Wald tests to identify statistically significant predictors and remove non-significant variables to improve model parsimony.
+
+```{r}
+#| label: tbl-b3-wald-test-maize
+#| tbl-cap: !expr paste0("Wald test results for predictor significance (", tolower(params$nutrient_label), " from maize)")
+
+# Perform Wald test for each predictor
+df_b3_wald_maize <- map_dfr(
+  predictor_variables,
+  apply_wald_test,
+  model = results_maize_full$model
+)
+export(df_b3_wald_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_tbl_b3_wald_test_maize.rds")))
+df_b3_wald_maize |>
+  gt() |>
+  tab_header(
+    title = "Variable Significance Testing",
+    subtitle = paste("Wald F-test results for", tolower(nutrient_label), "from maize model")
+  ) |>
+  fmt_number(
+    columns = f_statistic,
+    decimals = 2
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = everything(),
+      rows = significant == "*"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+**Decision**: Variables with p-value < 0.05 retained for refined model.
+
+## B4. Train Refined Model
+
+```{r}
+#| label: b4-train-refined-model-maize
+
+# Automatically select significant predictors from Wald tests
+predictors_maize <- df_b3_wald_maize |>
+  filter(significant == "*") |>
+  pull(variable)
+
+# Train refined gamma regression model
+results_maize_refined <- train_gamma_model(
+  formula = as.formula(paste(var_maize, "~", paste(predictors_maize, collapse = " + "))),
+  model_label = paste0(nutrient_label, " from Maize (Refined Model)"),
+  x_label = paste0("Observed ", nutrient_label, " from Maize (", units, ")"),
+  y_label = paste0("Predicted ", nutrient_label, " from Maize (", units, ")"),
+  design = survey_design
+)
+```
+
+```{r}
+#| label: tbl-b4-coefficients-refined-model-maize
+#| tbl-cap: !expr paste0("Model coefficients for ", tolower(params$nutrient_label), " from maize (refined model)")
+
+# Display refined model coefficients
+df_b4_coef_maize <- results_maize_refined$coefficients
+export(df_b4_coef_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_tbl_b4_coefficients_refined_model_maize.rds")))
+df_b4_coef_maize
+
+# Cleanup auxiliary objects
+rm(df_b4_coef_maize)
+```
+
+```{r}
+#| label: fig-b4-diagnostic-plot-refined-model-maize
+#| fig-cap: !expr paste0("Observed vs predicted ", tolower(params$nutrient_label), " from maize (refined model)")
+
+# Display diagnostic scatter plot
+df_b4_diag_maize <- augment(results_maize_refined$model)
+export(df_b4_diag_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_b4_diagnostic_plot_refined_model_maize.rds")))
+results_maize_refined$plot
+
+# Cleanup auxiliary objects
+rm(df_b4_diag_maize)
+```
+
+## B5. Model Diagnostics
+
+Evaluate model assumptions: linearity of residuals, homoscedasticity, influential observations, and multicollinearity.
+
+```{r}
+#| label: fig-b5-evaluate-diagnostics-maize
+#| fig-cap: !expr paste0("Diagnostic plots for ", tolower(params$nutrient_label), " from maize model")
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+# Generate diagnostic plots
+df_b5_diag_maize <- augment(results_maize_refined$model)
+export(df_b5_diag_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_b5_evaluate_diagnostics_maize.rds")))
+evaluate_gamma_model(results_maize_refined$model)
+
+# Cleanup auxiliary objects
+rm(df_b5_diag_maize)
+```
+
+---
+
+# Phase C: Model `r nutrient_label` from Non-Maize Sources
+
+
+Model `r tolower(nutrient_label)` from non-maize foods (vegetables, fruits, animal products, legumes, etc.).
+
+## C1. Evaluate Distribution
+
+```{r}
+#| label: fig-c1-evaluate-distribution-non-maize
+#| fig-cap: !expr paste0("Distribution assessment for ", tolower(params$nutrient_label), " from non-maize sources")
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+# Evaluate distribution fit for nutrient from non-maize sources
+df_c1_dist_non_maize <- survey_design$variables[[var_non_maize]]
+export(df_c1_dist_non_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_c1_evaluate_distribution_non_maize.rds")))
+distribution_fn(df_c1_dist_non_maize)
+
+# Cleanup auxiliary objects
+rm(df_c1_dist_non_maize)
+```
+
+**Decision**: The gamma distribution is selected for `r tolower(nutrient_label)` from non-maize sources. Modeling proceeds with gamma regression and log link.
+
+## C2. Train Full Model
+
+```{r}
+#| label: c2-train-full-model-non-maize
+
+# Train full gamma regression model for nutrient from non-maize sources
+results_non_maize_full <- train_gamma_model(
+  formula = as.formula(paste(var_non_maize, "~", paste(predictor_variables, collapse = " + "))),
+  model_label = paste0(nutrient_label, " from Non-Maize Sources (Full Model)"),
+  x_label = paste0("Observed ", nutrient_label, " from Non-Maize (", units, ")"),
+  y_label = paste0("Predicted ", nutrient_label, " from Non-Maize (", units, ")"),
+  design = survey_design
+)
+```
+
+```{r}
+#| label: tbl-c2-coefficients-full-model-non-maize
+#| tbl-cap: !expr paste0("Model coefficients for ", tolower(params$nutrient_label), " from non-maize sources (full model)")
+
+# Display model coefficients
+df_c2_coef_non_maize <- results_non_maize_full$coefficients
+export(df_c2_coef_non_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_tbl_c2_coefficients_full_model_non_maize.rds")))
+df_c2_coef_non_maize
+
+# Cleanup auxiliary objects
+rm(df_c2_coef_non_maize)
+```
+
+```{r}
+#| label: fig-c2-diagnostic-plot-full-model-non-maize
+#| fig-cap: !expr paste0("Observed vs predicted ", tolower(params$nutrient_label), " from non-maize sources (full model)")
+
+# Display diagnostic scatter plot
+df_c2_diag_non_maize <- augment(results_non_maize_full$model)
+export(df_c2_diag_non_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_c2_diagnostic_plot_full_model_non_maize.rds")))
+results_non_maize_full$plot
+
+# Cleanup auxiliary objects
+rm(df_c2_diag_non_maize)
+```
+
+## C3. Variable Selection (Wald Tests)
+
+```{r}
+#| label: tbl-c3-wald-test-non-maize
+#| tbl-cap: !expr paste0("Wald test results for predictor significance (", tolower(params$nutrient_label), " from non-maize)")
+
+# Perform Wald test for each predictor
+df_c3_wald_non_maize <- map_dfr(
+  predictor_variables,
+  apply_wald_test,
+  model = results_non_maize_full$model
+)
+export(df_c3_wald_non_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_tbl_c3_wald_test_non_maize.rds")))
+df_c3_wald_non_maize |>
+  gt() |>
+  tab_header(
+    title = "Variable Significance Testing",
+    subtitle = paste("Wald F-test results for", tolower(nutrient_label), "from non-maize model")
+  ) |>
+  fmt_number(
+    columns = f_statistic,
+    decimals = 2
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = everything(),
+      rows = significant == "*"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+**Decision**: Retain only statistically significant predictors (p < 0.05) for refined model.
+
+## C4. Train Refined Model
+
+```{r}
+#| label: c4-train-refined-model-non-maize
+
+# Automatically select significant predictors from Wald tests
+predictors_non_maize <- df_c3_wald_non_maize |>
+  filter(significant == "*") |>
+  pull(variable)
+
+# Train refined gamma regression model
+results_non_maize_refined <- train_gamma_model(
+  formula = as.formula(paste(var_non_maize, "~", paste(predictors_non_maize, collapse = " + "))),
+  model_label = paste0(nutrient_label, " from Non-Maize Sources (Refined Model)"),
+  x_label = paste0("Observed ", nutrient_label, " from Non-Maize (", units, ")"),
+  y_label = paste0("Predicted ", nutrient_label, " from Non-Maize (", units, ")"),
+  design = survey_design
+)
+```
+
+```{r}
+#| label: tbl-c4-coefficients-refined-model-non-maize
+#| tbl-cap: !expr paste0("Model coefficients for ", tolower(params$nutrient_label), " from non-maize sources (refined model)")
+
+# Display refined model coefficients
+df_c4_coef_non_maize <- results_non_maize_refined$coefficients
+export(df_c4_coef_non_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_tbl_c4_coefficients_refined_model_non_maize.rds")))
+df_c4_coef_non_maize
+
+# Cleanup auxiliary objects
+rm(df_c4_coef_non_maize)
+```
+
+```{r}
+#| label: fig-c4-diagnostic-plot-refined-model-non-maize
+#| fig-cap: !expr paste0("Observed vs predicted ", tolower(params$nutrient_label), " from non-maize sources (refined model)")
+
+# Display diagnostic scatter plot
+df_c4_diag_non_maize <- augment(results_non_maize_refined$model)
+export(df_c4_diag_non_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_c4_diagnostic_plot_refined_model_non_maize.rds")))
+results_non_maize_refined$plot
+
+# Cleanup auxiliary objects
+rm(df_c4_diag_non_maize)
+```
+
+## C5. Model Diagnostics
+
+```{r}
+#| label: fig-c5-evaluate-diagnostics-non-maize
+#| fig-cap: !expr paste0("Diagnostic plots for ", tolower(params$nutrient_label), " from non-maize sources model")
+#| fig-width: 10
+#| fig-height: 8
+#| warning: FALSE
+
+# Generate diagnostic plots
+df_c5_diag_non_maize <- augment(results_non_maize_refined$model)
+export(df_c5_diag_non_maize, here("01_data", "02_processed", "web_resources", paste0(script_number, "_fig_c5_evaluate_diagnostics_non_maize.rds")))
+evaluate_gamma_model(results_non_maize_refined$model)
+
+# Cleanup auxiliary objects
+rm(df_c5_diag_non_maize)
+```
+
+---
+
+# Phase D: Export
+
+Save final refined models for application to SIVESNU data in subsequent transfer scripts.
+
+```{r}
+#| label: d-save-models
+
+# Extract final models
+model_maize     <- results_maize_refined$model
+model_non_maize <- results_non_maize_refined$model
+
+# Build named list preserving original naming convention
+model_list <- setNames(
+  list(model_maize, model_non_maize),
+  c(paste0("model_", var_prefix, "_maize"),
+    paste0("model_", var_prefix, "_non_maize"))
+)
+
+# Save models as RDS
+export(
+  model_list,
+  here("01_data", "02_processed",
+       "models", model_filename)
+)
+
+# Clean auxiliary objects
+rm(results_maize_full, results_maize_refined,
+   results_non_maize_full, results_non_maize_refined,
+   model_maize, model_non_maize)
+```
+
+# Notes
+
+## Model Performance
+
+**`r nutrient_label` from Maize:**
+
+- Final predictors: `r length(predictors_maize)` variables
+- Significant predictors: `r paste(predictors_maize, collapse = ", ")`
+- Model diagnostics: Assessed via residual plots, leverage analysis, and collinearity checks above
+
+**`r nutrient_label` from Non-Maize:**
+
+- Final predictors: `r length(predictors_non_maize)` variables
+- Significant predictors: `r paste(predictors_non_maize, collapse = ", ")`
+- Model diagnostics: Assessed via residual plots, leverage analysis, and collinearity checks above

@@ -1,0 +1,697 @@
+---
+title: "Calculate FIES Rasch Model Score"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script calculates the Food Insecurity Experience Scale (FIES) score using the Rasch model methodology recommended by FAO. The Rasch model transforms the ordinal raw score into an interval-scale measure that accounts for item severity and response patterns.
+
+1. Load SIVESNU data with bioavailability calculations (from Script 04_03)
+2. Verify FIES variables coding (Yes/No responses)
+3. Prepare binary matrix for Rasch model (0/1 coding)
+4. Fit Rasch model using FAO's RM.weights package
+5. Extract individual food insecurity scores
+6. Validate results against raw scores
+7. Save processed dataset with Rasch-based FIES score
+
+**Key methodological decisions**:
+
+-   **Rasch model implementation**: Uses FAO's `RM.weights` package, specifically designed for FIES analysis with survey weights support.
+
+-   **Item ordering**: FIES items follow increasing severity (worry → food deprivation), which is captured in the Rasch item difficulty parameters.
+
+-   **Score interpretation**: Higher Rasch scores indicate greater food insecurity, calibrated to the FAO global reference scale.
+
+**FIES questions** (C001-C008 in survey):
+
+1. Worried about not having enough food
+2. Unable to eat healthy/nutritious food
+3. Ate only a few kinds of foods (low variety)
+4. Had to skip a meal
+5. Ate less than thought should
+6. Household ran out of food
+7. Felt hungry but did not eat
+8. Went without eating for a whole day
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  RM.weights,         # FAO Rasch Model for FIES
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  gt,                 # Table formatting and presentation
+  tidyverse           # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Verification
+
+## A1. Load SIVESNU Data with Bioavailability
+
+Load SIVESNU 2018 children's data with bioavailability calculations from Script 04_03.
+
+```{r}
+#| label: a1-load-data
+
+df_input <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "04_03_sivesnu_bioavailable.parquet")
+)
+```
+
+## A2. Verify FIES Item Response Distribution
+
+Examine the current state of FIES variables to confirm proper coding before Rasch model application.
+
+```{r}
+#| label: tbl-a2-fies-distribution
+#| tbl-cap: "FIES Item Response Distribution"
+
+# Define FIES item descriptions (FAO standard ordering by severity)
+fies_descriptions <- tibble(
+  item = paste0("fies", 1:8),
+  code = paste0("C00", 1:8),
+  description = c(
+    "Worried about not having enough food",
+    "Unable to eat healthy/nutritious food",
+    "Ate only a few kinds of foods",
+    "Had to skip a meal",
+    "Ate less than should",
+    "Household ran out of food",
+    "Felt hungry but did not eat",
+    "Went without eating for a whole day"
+  ),
+  severity = c(
+    "Mild", "Mild", "Mild",
+    "Moderate", "Moderate", "Moderate",
+    "Severe", "Severe"
+  )
+)
+
+# Calculate response distribution for each FIES item
+fies_summary <- df_input |>
+  select(fies1:fies8) |>
+  pivot_longer(everything(), names_to = "item", values_to = "response") |>
+  summarise(
+    n_yes = sum(response == "Yes", na.rm = TRUE),
+    n_no = sum(response == "No", na.rm = TRUE),
+    n_na = sum(is.na(response)),
+    pct_yes = n_yes / (n_yes + n_no) * 100,
+    .by = item
+  ) |>
+  left_join(fies_descriptions, by = "item") |>
+  arrange(item) |>
+  select(code, description, severity, n_yes, n_no, n_na, pct_yes)
+
+# Export data for web resources
+export(fies_summary, here("01_data", "02_processed", "web_resources", "04_04_tbl_a2_fies_distribution.rds"))
+
+# Display as GT table
+fies_summary |>
+  gt() |>
+  tab_header(
+    title = "FIES Item Response Distribution",
+    subtitle = "Food Insecurity Experience Scale (8 items)"
+  ) |>
+  cols_label(
+    code = "Code",
+    description = "Question",
+    severity = "Severity",
+    n_yes = "Yes",
+    n_no = "No",
+    n_na = "NA",
+    pct_yes = "% Yes"
+  ) |>
+  fmt_number(columns = c(n_yes, n_no, n_na), decimals = 0) |>
+  fmt_number(columns = pct_yes, decimals = 1) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = severity == "Mild", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = severity == "Moderate", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = severity == "Severe", columns = severity)
+  ) |>
+  tab_source_note(
+    source_note = "Source: SIVESNU 2018. Items ordered by increasing severity per FAO FIES methodology."
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Clean auxiliary objects
+rm(fies_descriptions, fies_summary)
+```
+
+---
+
+# Phase B: Rasch Model Estimation
+
+## B1. Fit Rasch Model
+
+Convert FIES responses to binary format (0/1) and apply FAO's Rasch model implementation using the `RM.weights` package.
+
+```{r}
+#| label: b1-fit-rasch-model
+
+# Define FIES item descriptions for later use
+fies_descriptions <- tibble(
+ item = paste0("fies", 1:8),
+  code = paste0("C00", 1:8),
+  description = c(
+    "Worried about not having enough food",
+    "Unable to eat healthy/nutritious food",
+    "Ate only a few kinds of foods",
+    "Had to skip a meal",
+    "Ate less than should",
+    "Household ran out of food",
+    "Felt hungry but did not eat",
+    "Went without eating for a whole day"
+  ),
+  severity = c("Mild", "Mild", "Mild", "Moderate", "Moderate", "Moderate", "Severe", "Severe")
+)
+
+# Create binary data frame for Rasch model (0 = No, 1 = Yes)
+# Note: RM.w expects a data.frame with integer 0/1 values
+fies_df <- df_input |>
+  select(fies1:fies8) |>
+  mutate(across(everything(), ~ if_else(.x == "Yes", 1L, 0L))) |>
+  as.data.frame()
+
+# Extract weights as numeric vector
+fies_weights <- df_input$pesonino
+
+# Fit weighted Rasch model (following FAO example pattern)
+rasch_model <- RM.w(fies_df, fies_weights)
+```
+
+## B2. Item Difficulty Parameters
+
+Extract and display item difficulty (severity) parameters from the Rasch model. Higher values indicate more severe food insecurity experiences.
+
+```{r}
+#| label: tbl-b2-item-parameters
+#| tbl-cap: "FIES Item Difficulty Parameters (Rasch Model)"
+
+# Extract item parameters
+item_params <- tibble(
+  item = paste0("fies", 1:8),
+  difficulty = rasch_model$b
+) |>
+  left_join(fies_descriptions, by = "item") |>
+  arrange(difficulty) |>
+  mutate(rank = row_number()) |>
+  select(rank, code, description, severity, difficulty)
+
+# Export data for web resources
+export(item_params, here("01_data", "02_processed", "web_resources", "04_04_tbl_b2_item_parameters.rds"))
+
+# Display as GT table
+item_params |>
+  gt() |>
+  tab_header(
+    title = "FIES Item Difficulty Parameters",
+    subtitle = "Rasch model estimates (ordered by difficulty)"
+  ) |>
+  cols_label(
+    rank = "Rank",
+    code = "Code",
+    description = "Question",
+    severity = "Severity",
+    difficulty = "Difficulty (β)"
+  ) |>
+  fmt_number(columns = difficulty, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = severity == "Mild", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = severity == "Moderate", columns = severity)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = severity == "Severe", columns = severity)
+  ) |>
+  tab_source_note(
+    source_note = "Higher difficulty = more severe food insecurity. Negative values = more common experiences."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(item_params)
+```
+
+## B3. Raw Score Severity Parameters
+
+The Rasch model transforms ordinal raw scores (0-8) into interval-scale severity parameters. These parameters are used to assign individual food insecurity scores.
+
+```{r}
+#| label: tbl-b3-raw-score-parameters
+#| tbl-cap: "Severity Parameters by Raw Score"
+
+# Extract raw score parameters
+raw_score_params <- tibble(
+  raw_score = 0:8,
+  severity = rasch_model$a,
+  se = rasch_model$se.a
+) |>
+  mutate(
+    classification = case_when(
+      raw_score == 0 ~ "Food Secure",
+      raw_score <= 3 ~ "Mild FI",
+      raw_score <= 6 ~ "Moderate FI",
+      raw_score >= 7 ~ "Severe FI"
+    )
+  )
+
+# Export data for web resources
+export(raw_score_params, here("01_data", "02_processed", "web_resources", "04_04_tbl_b3_raw_score_parameters.rds"))
+
+raw_score_params |>
+  gt() |>
+  tab_header(
+    title = "FIES Severity Parameters by Raw Score",
+    subtitle = "Rasch model transformation"
+  ) |>
+  cols_label(
+    raw_score = "Raw Score",
+    severity = "Severity (θ)",
+    se = "Std. Error",
+    classification = "Classification"
+  ) |>
+  fmt_number(columns = c(severity, se), decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = classification == "Food Secure", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = classification == "Mild FI", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = classification == "Moderate FI", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = classification == "Severe FI", columns = classification)
+  ) |>
+  tab_source_note(
+    source_note = "FI = Food Insecurity. Classification follows FAO thresholds."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+---
+
+# Phase C: Score Assignment and Validation
+
+## C1. Assign Individual Rasch Scores
+
+Map each individual's raw score to the corresponding Rasch severity parameter.
+
+```{r}
+#| label: c1-assign-individual-scores
+
+# Create lookup table for raw score to Rasch severity mapping
+score_lookup <- tibble(
+  fies_raw_score = 0:8,
+  fies_rasch_score = rasch_model$a
+)
+
+# Assign Rasch scores to individuals
+df_rasch <- df_input |>
+  left_join(score_lookup, by = "fies_raw_score")
+```
+
+## C2. Validation - Raw Score vs Rasch Score
+
+Compare the distribution of raw scores (simple sum) with Rasch-transformed scores.
+
+```{r}
+#| label: tbl-c2-score-comparison
+#| tbl-cap: "Distribution of FIES Scores: Raw vs Rasch"
+
+# Create survey design
+svy_rasch <- df_rasch |>
+  as_survey_design(
+    ids = conglomerado,
+    weights = pesonino
+  )
+
+# Summarize by raw score
+score_comparison <- svy_rasch |>
+  group_by(fies_raw_score) |>
+  summarise(
+    n = n(),
+    pct = survey_mean(vartype = NULL) * 100,
+    mean_rasch = survey_mean(fies_rasch_score, vartype = NULL)
+  ) |>
+  left_join(
+    raw_score_params |> select(raw_score, classification),
+    by = c("fies_raw_score" = "raw_score")
+  )
+
+# Export data for web resources
+export(score_comparison, here("01_data", "02_processed", "web_resources", "04_04_tbl_c2_score_comparison.rds"))
+
+score_comparison |>
+  gt() |>
+  tab_header(
+    title = "FIES Score Distribution",
+    subtitle = "Raw scores mapped to Rasch severity parameters"
+  ) |>
+  cols_label(
+    fies_raw_score = "Raw Score",
+    n = "N",
+    pct = "% (weighted)",
+    mean_rasch = "Rasch Score (θ)",
+    classification = "Classification"
+  ) |>
+  fmt_number(columns = pct, decimals = 1) |>
+  fmt_number(columns = mean_rasch, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = classification == "Food Secure", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(rows = classification == "Mild FI", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFE0B2"),
+    locations = cells_body(rows = classification == "Moderate FI", columns = classification)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = classification == "Severe FI", columns = classification)
+  ) |>
+  tab_source_note(
+    source_note = "Rasch scores provide interval-scale measurement; raw scores are ordinal."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+
+# Clean auxiliary objects
+rm(svy_rasch, score_comparison)
+```
+
+## C3. Model Fit Statistics
+
+Assess Rasch model quality through reliability and item fit statistics.
+
+```{r}
+#| label: tbl-c3-model-fit
+#| tbl-cap: "Rasch Model Fit Statistics"
+
+# Compile fit statistics
+fit_stats <- tibble(
+  statistic = c(
+    "Rasch Reliability (observed)",
+    "Rasch Reliability (flat)",
+    "Complete Cases",
+    "Convergence"
+  ),
+  value = c(
+    sprintf("%.3f", rasch_model$reliab),
+    sprintf("%.3f", rasch_model$reliab.fl),
+    as.character(rasch_model$n.compl),
+    rasch_model$converged
+  )
+)
+
+# Export data for web resources
+export(fit_stats, here("01_data", "02_processed", "web_resources", "04_04_tbl_c3_model_fit.rds"))
+
+fit_stats |>
+  gt() |>
+  tab_header(
+    title = "Rasch Model Fit Statistics"
+  ) |>
+  cols_label(
+    statistic = "Statistic",
+    value = "Value"
+  ) |>
+  tab_source_note(
+    source_note = "Reliability > 0.7 indicates acceptable measurement precision."
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+## C4. Distribution Visualization
+
+```{r}
+#| label: fig-c4-rasch-distribution
+#| fig-cap: "Distribution of FIES Rasch Scores"
+#| fig-height: 7
+#| fig-width: 10
+
+# Prepare classification for coloring
+df_plot <- df_rasch |>
+  mutate(
+    classification = factor(
+      case_when(
+        fies_raw_score == 0 ~ "Food Secure",
+        fies_raw_score <= 3 ~ "Mild FI",
+        fies_raw_score <= 6 ~ "Moderate FI",
+        fies_raw_score >= 7 ~ "Severe FI"
+      ),
+      levels = c("Food Secure", "Mild FI", "Moderate FI", "Severe FI")
+    )
+  )
+
+# Export data for web resources
+export(df_plot, here("01_data", "02_processed", "web_resources", "04_04_fig_c4_rasch_distribution.rds"))
+
+# Define color palette matching table colors
+fi_colors <- c(
+  "Food Secure" = "#D4EDDA",
+  "Mild FI" = "#FFF3CD",
+  "Moderate FI" = "#FFE0B2",
+  "Severe FI" = "#FFCDD2"
+)
+
+# Histogram of Rasch scores
+ggplot(df_plot, aes(x = fies_rasch_score, fill = classification)) +
+  geom_histogram(bins = 9, color = "white", linewidth = 0.5) +
+  scale_fill_manual(values = fi_colors, name = "Classification") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  annotate("text", x = -0.3, y = Inf, label = "← Less severe", 
+           hjust = 1, vjust = 2, size = 3, color = "gray40") +
+  annotate("text", x = 0.3, y = Inf, label = "More severe →", 
+           hjust = 0, vjust = 2, size = 3, color = "gray40") +
+  labs(
+    title = "Distribution of Food Insecurity (Rasch Scale)",
+    subtitle = "Children 6-59 months, SIVESNU 2018",
+    x = "FIES Rasch Score (θ)",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, color = "gray30", face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray50"),
+    axis.title = element_text(size = 10, color = "gray40"),
+    legend.position = "bottom"
+  )
+
+# Clean auxiliary object
+rm(df_plot, fi_colors)
+```
+
+---
+
+# Phase D: Export
+
+```{r}
+#| label: d-save-output
+
+# Prepare final dataset
+df_output <- df_rasch |>
+  select(
+    # === Identifiers ===
+    nboletahogar, conglomerado, pesonino,
+    
+    # === Demographics ===
+    parentesco, sexo, edad_an, edad_mes, edad_grupos,
+    
+    # === Geographic ===
+    departamento, area,
+    
+    # === Household characteristics ===
+    miembros_hogar_original, n_cuartos_original,
+    grado_estudios, grado_estudios_hogar,
+    propiedad, tipo_vivienda,
+    material_paredes, material_techo, material_piso,
+    
+    # === Basic services ===
+    cocina, tipo_sanitario, fuente_agua, recoleccion_basura,
+    
+    # === Household assets ===
+    electricidad, televisor, telefonia_fija, telefonia_celular, computadora,
+    
+    # === Food security (FIES) ===
+    fies1, fies2, fies3, fies4, fies5, fies6, fies7, fies8,
+    fies_raw_score,
+    fies_rasch_score,
+    
+    # === Nutritional intake by source ===
+    fe_mg_maiz, fe_mg_nomaiz,
+    zn_mg_maiz, zn_mg_nomaiz,
+    prot_g_maiz, prot_g_nomaiz,
+    lys_mg_maiz, lys_mg_nomaiz,
+    trp_mg_maiz, trp_mg_nomaiz,
+    ene_kcal_maiz, ene_kcal_nomaiz,
+
+    # === Raw transfer-model predictions (preserved from 04_01) ===
+    # Pre-FIES, pre-quantile-mapping, pre-alignment. Diagnostics only.
+    fe_mg_maiz_raw, fe_mg_nomaiz_raw,
+    zn_mg_maiz_raw, zn_mg_nomaiz_raw,
+    prot_g_maiz_raw, prot_g_nomaiz_raw,
+    lys_mg_maiz_raw, lys_mg_nomaiz_raw,
+    trp_mg_maiz_raw, trp_mg_nomaiz_raw,
+    ene_kcal_maiz_raw, ene_kcal_nomaiz_raw,
+
+    # === Dietary composition ===
+    per_vegetales,
+    
+    # === Bioavailable micronutrients ===
+    zn_mg_total, taz_mg, zn_fractional_absorption,
+    fe_mg_total, fe_absorption_factor, fe_absorbed_mg,
+    
+    # === Total intake (other nutrients) ===
+    prot_g_total, lys_mg_total, trp_mg_total, ene_kcal_total,
+    
+    # === Chispitas supplementation ===
+    receives_chispitas, adherence_factor_final,
+    fe_chispitas_effective_mg, zn_chispitas_effective_mg
+  )
+
+# Save final dataset
+write_parquet(
+  df_output,
+  here("01_data", "02_processed", 
+       "transfer", "04_04_sivesnu_fies_rasch.parquet")
+)
+
+# Clean auxiliary objects
+rm(fies_df, fies_weights, fies_descriptions, rasch_model, df_rasch, fit_stats)
+```
+
+# Notes
+
+## Methodology
+
+### Rasch Model for FIES
+
+The Rasch model is a one-parameter Item Response Theory (IRT) model that transforms ordinal raw scores into interval-scale measurements. Key properties:
+
+-   **Item difficulty parameters (β)**: Represent the severity level at which each item is typically reported. Items with negative β are reported by most respondents (less severe); items with positive β are reported only by severely food insecure respondents.
+
+-   **Person severity parameters (θ)**: Represent individual food insecurity levels on the same scale as item difficulties. Higher θ indicates greater food insecurity.
+
+-   **Interval-scale measurement**: Rasch scores have equal intervals, making differences comparable across the scale.
+
+### Weighted Estimation
+
+Survey weights were applied during model estimation so that item parameters reflect the Guatemalan population. This is appropriate because:
+
+1. SIVESNU uses complex sampling with unequal selection probabilities
+2. Population-representative item parameters enable valid comparisons with FAO global reference scales
+3. Individual scores are assigned using population-calibrated parameters
+
+### Classification Thresholds
+
+FAO classification based on raw scores:
+
+| Raw Score | Classification |
+|-----------|----------------|
+| 0         | Food Secure    |
+| 1-3       | Mild FI        |
+| 4-6       | Moderate FI    |
+| 7-8       | Severe FI      |
+
+## Limitations
+
+1. **Extreme scores**: Raw scores 0 and 8 require assumptions for parameter estimation (handled by RM.weights default settings).
+
+2. **Local independence**: Rasch model assumes conditional independence between items given the latent trait; residual correlations may indicate violation.
+
+3. **Unidimensionality**: FIES assumes a single food insecurity dimension; model fit statistics should be checked.
+
+## References
+
+-   FAO (2016). Methods for estimating comparable rates of food insecurity experienced by adults throughout the world. Rome: Food and Agriculture Organization.
+
+-   Cafiero C, Viviani S, Nord M (2018). Food security measurement in a global context: The Food Insecurity Experience Scale. *Measurement* 116:146-152.
+
+-   Nord M (2014). Introduction to Item Response Theory applied to Food Security Measurement. FAO Technical Paper.
+
+

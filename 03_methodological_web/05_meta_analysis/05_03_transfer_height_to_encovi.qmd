@@ -1,0 +1,1068 @@
+---
+title: "Transfer Height to ENCOVI"
+subtitle: "Module 5: Meta-analysis"
+---
+
+## Why Transfer Height to ENCOVI?
+
+ENCOVI 2023 does not include anthropometric measurements for children. To
+estimate the stunting impact of biofortified maize, we need individual-level
+height predictions that can be converted to height-for-age z-scores (HAZ).
+This module bridges that gap through a four-stage pipeline:
+
+1. **GAM prediction** — Apply the
+   [trained height model](05_02_transfer_model_height.qmd) to ENCOVI 2023
+   children using their socioeconomic profiles
+2. **Quantile mapping** — Calibrate predicted heights against
+   Guatemala-specific reference distributions derived from ENSMI stunting
+   prevalence and WHO growth standards
+3. **HAZ calculation** — Convert calibrated heights to height-for-age
+   z-scores and classify stunting status
+4. **Weight calibration** — Adjust survey weights to match ENSMI 2014-2015
+   departmental stunting prevalence
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file (single source of truth)
+source(here("..", "02_code", "00_functions", "00_functions.R"))
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Web resources for visualizations (exported by framework 05_03)
+tbl_a3_lms_overview <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_a3_lms_overview.rds"),
+  trust = TRUE
+)
+
+tbl_b1_population_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_b1_population_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b2_exclusion_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_b2_exclusion_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b5_missing_values <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_b5_missing_values.rds"),
+  trust = TRUE
+)
+
+tbl_c2_prediction_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_c2_prediction_summary.rds"),
+  trust = TRUE
+)
+
+fig_c2_predicted_height_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_fig_c2_predicted_height_distribution.rds"),
+  trust = TRUE
+)
+
+tbl_d1_strata_counts <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_d1_strata_counts.rds"),
+  trust = TRUE
+)
+
+tbl_d2_reference_params <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_d2_reference_params.rds"),
+  trust = TRUE
+)
+
+tbl_d4_qm_height_comparison <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_d4_qm_height_comparison.rds"),
+  trust = TRUE
+)
+
+tbl_d4_qm_by_stratum <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_d4_qm_by_stratum.rds"),
+  trust = TRUE
+)
+
+fig_d4_height_density_comparison <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_fig_d4_height_density_comparison.rds"),
+  trust = TRUE
+)
+
+tbl_e2_haz_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_e2_haz_summary.rds"),
+  trust = TRUE
+)
+
+tbl_e2_haz_by_department <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_e2_haz_by_department.rds"),
+  trust = TRUE
+)
+
+fig_e2_haz_density <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_fig_e2_haz_density.rds"),
+  trust = TRUE
+)
+
+fig_e2_haz_by_age_sex <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_fig_e2_haz_by_age_sex.rds"),
+  trust = TRUE
+)
+
+tbl_f3_calibration_diagnostics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_f3_calibration_diagnostics.rds"),
+  trust = TRUE
+)
+
+tbl_f3_departmental_validation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_f3_departmental_validation.rds"),
+  trust = TRUE
+)
+
+tbl_f3_national_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_f3_national_summary.rds"),
+  trust = TRUE
+)
+
+tbl_g1_final_validation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_03_tbl_g1_final_validation.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Final N children retained (from tbl-g1 — "Total children 6-59 months")
+n_children_final <- tbl_g1_final_validation |>
+  filter(Check == "Total children 6-59 months") |>
+  pull(Value) |>
+  as.integer()
+
+# National stunting prevalence target (from tbl-f3-national-summary)
+ensmi_national_stunting <- tbl_f3_national_summary |>
+  filter(Metric == "ENSMI 2014-2015 official stunting prevalence") |>
+  pull(Value)
+
+# Departments matched exactly (from tbl-g1 — "Departments with ENSMI match (0.00 pp)")
+n_departments_matched <- tbl_g1_final_validation |>
+  filter(Check == "Departments with ENSMI match (0.00 pp)") |>
+  pull(Value) |>
+  as.integer()
+
+# Calibrated weighted stunting prevalence (national) for use in narrative
+calibrated_stunting <- tbl_f3_national_summary |>
+  filter(Metric == "Stunting prevalence (HAZ < -2)") |>
+  pull(Value)
+
+# Calibrated weighted mean HAZ
+calibrated_mean_haz <- tbl_f3_national_summary |>
+  filter(Metric == "Mean HAZ (weighted)") |>
+  pull(Value)
+
+# Weight CV calibrated and adjustment ratio range from f3-calibration-diagnostics
+cv_calibrated_value <- tbl_f3_calibration_diagnostics |>
+  filter(Metric == "Weight CV (calibrated)") |>
+  pull(Value)
+
+adjustment_ratio_range <- tbl_f3_calibration_diagnostics |>
+  filter(Metric == "Adjustment ratio range") |>
+  pull(Value)
+
+mean_adjustment_ratio <- tbl_f3_calibration_diagnostics |>
+  filter(Metric == "Mean adjustment ratio") |>
+  pull(Value)
+
+cv_initial_value <- tbl_f3_calibration_diagnostics |>
+  filter(Metric == "Weight CV (initial)") |>
+  pull(Value)
+
+deff_value <- tbl_f3_calibration_diagnostics |>
+  filter(Metric == "Design Effect (DEFF)") |>
+  pull(Value)
+
+n_ratios_extreme_high <- tbl_f3_calibration_diagnostics |>
+  filter(Metric == "Ratios > 3.0 (extreme high)") |>
+  pull(Value)
+
+# Missingness in the ENCOVI predictor set, ordered by share of records
+tbl_b5_ordered <- tbl_b5_missing_values |>
+  arrange(desc(Pct_Missing))
+
+var_missing_max    <- tbl_b5_ordered$Variable[1]
+pct_missing_max    <- tbl_b5_ordered$Pct_Missing[1]
+var_missing_second <- tbl_b5_ordered$Variable[2]
+pct_missing_second <- tbl_b5_ordered$Pct_Missing[2]
+
+n_vars_with_missing <- nrow(tbl_b5_ordered)
+
+n_missing_education <- tbl_b5_ordered |>
+  filter(Variable == "grado_estudios_hogar") |>
+  pull(N_Missing)
+
+# Cohort restriction and quantile mapping effect
+n_excluded_dietary <- tbl_b2_exclusion_summary |>
+  filter(Metric == "Excluded: incomplete dietary record") |>
+  pull(Value)
+
+n_cohort_pre <- tbl_b2_exclusion_summary |>
+  filter(Metric == "Children 6-59 months (pre-exclusion)") |>
+  pull(Value)
+
+# Formatted here so both ends of the comparison print on the same scale: the
+# default drops a trailing zero and would render one as 10.7 and the other
+# as 11.23.
+sd_before_qm <- tbl_d4_qm_height_comparison |>
+  filter(Stage == "Before QM (predicted)") |>
+  pull(SD_Height) |>
+  sprintf(fmt = "%.2f")
+
+sd_after_qm <- tbl_d4_qm_height_comparison |>
+  filter(Stage == "After QM (calibrated)") |>
+  pull(SD_Height) |>
+  sprintf(fmt = "%.2f")
+
+n_strata_qm <- nrow(tbl_d4_qm_by_stratum)
+
+# Departmental gaps against ENSMI before the weights are calibrated
+n_dept_over_10pp <- sum(abs(tbl_e2_haz_by_department$`Diff (pp)`) > 10)
+n_dept_5_to_10pp <- sum(abs(tbl_e2_haz_by_department$`Diff (pp)`) > 5 &
+                        abs(tbl_e2_haz_by_department$`Diff (pp)`) <= 10)
+n_dept_total     <- nrow(tbl_e2_haz_by_department)
+max_dept_gap_pp  <- round(max(abs(tbl_e2_haz_by_department$`Diff (pp)`)), 1)
+
+# National deviations reported alongside the ENSMI reference
+stunting_deviation <- tbl_f3_national_summary |>
+  filter(Metric == "Stunting deviation from ENSMI") |>
+  pull(Value)
+
+haz_deviation <- tbl_f3_national_summary |>
+  filter(Metric == "HAZ deviation from ENSMI") |>
+  pull(Value)
+```
+
+
+## Data Sources
+
+Three external inputs are required: the trained GAM model with its
+transformation objects, from the two preceding steps of this module; the WHO
+LMS growth reference parameters; and the ENSMI 2014-2015 departmental stunting
+targets.
+
+```{r}
+#| label: tbl-a3-lms-overview
+#| tbl-cap: "WHO LMS reference table summary"
+
+tbl_a3_lms_overview |>
+  gt() |>
+  tab_header(
+    title = "WHO LMS Reference Parameters",
+    subtitle = "Length/height-for-age by sex and age in months"
+  ) |>
+  cols_label(
+    sexo = "Sex",
+    N_ages = "Age Points",
+    Age_range = "Age Range",
+    M_range = "Median (SD0) Height Range"
+  ) |>
+  cols_align(align = "left") |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Target Population and Exclusions
+
+### Population Identification
+
+```{r}
+#| label: tbl-b1-population-summary
+#| tbl-cap: "ENCOVI 2023 children 6-59 months target population"
+
+tbl_b1_population_summary |>
+  gt() |>
+  tab_header(
+    title = "Target Population Identification",
+    subtitle = "ENCOVI 2023 children aged 6-59 months, on the age assigned in Module 1"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Dietary Record Completeness
+
+The analytical cohort is restricted to children whose household reports a
+complete dietary record: the food consumption module supplies their
+source-specific nutrient intake and the plant-source share of that intake. Both
+quantities are required downstream by the bioavailability, inadequacy and
+nutrient-profile calculations, and the twelve intake variables are recorded
+together, so completeness is required on the full set rather than on any single
+component.
+
+The restriction is applied before weight calibration, so the departmental
+stunting prevalence targets are calibrated over the population that reaches the
+analysis. It removes `r n_excluded_dietary` of the `r n_cohort_pre` children
+aged 6-59 months.
+
+```{r}
+#| label: tbl-b2-exclusion-summary
+#| tbl-cap: "Records excluded for an incomplete dietary record"
+
+tbl_b2_exclusion_summary |>
+  gt() |>
+  tab_header(
+    title = "Dietary Record Completeness",
+    subtitle = "Cohort restricted to children with nutrient intake and plant-source share"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Predictor Harmonization and Imputation
+
+ENCOVI variables are recoded to match the coding structure used in
+[SIVESNU](05_01_prepare_sivesnu_height_data.qmd), and the normalization objects
+fitted there are applied to the continuous predictors, so both surveys enter
+the model on the same scale. Missing values are imputed via Random Forest using
+the `impute_rf_parallel()` utility function, which wraps
+`missRanger::missRanger()` with a multi-threaded `ranger` engine.
+
+```{r}
+#| label: tbl-b5-missing-values
+#| tbl-cap: "Missing values in GAM predictor variables"
+
+tbl_b5_missing_values |>
+  gt() |>
+  tab_header(
+    title = "Missing Values in Predictor Variables",
+    subtitle = "ENCOVI 2023 children 6-59 months"
+  ) |>
+  fmt_number(columns = Pct_Missing, decimals = 1, pattern = "{x}%") |>
+  fmt_number(columns = N_Missing, decimals = 0) |>
+  cols_align(align = "left", columns = Variable) |>
+  cols_align(align = "right", columns = c(N_Missing, Pct_Missing)) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Where the Missingness Sits
+`r n_vars_with_missing` predictors carry missing values in the analytical
+cohort. Two of them account for almost all of it: `r var_missing_max` at
+`r round(pct_missing_max, 1)`% of records and `r var_missing_second` at
+`r round(pct_missing_second, 1)`%, both service-provision indicators.
+`grado_estudios_hogar` is missing for `r n_missing_education` records. Random
+Forest imputation fills these values from the rest of the predictor set.
+:::
+
+
+## Height Prediction
+
+The trained GAM model is applied to generate height predictions for each
+ENCOVI child based on their socioeconomic profile.
+
+```{r}
+#| label: tbl-c2-prediction-summary
+#| tbl-cap: "Predicted height summary by age group"
+
+tbl_c2_prediction_summary |>
+  gt() |>
+  tab_header(
+    title = "Predicted Height Distribution by Age Group",
+    subtitle = "ENCOVI 2023 children 6-59 months — GAM predictions"
+  ) |>
+  cols_label(
+    age_group = "Age Group",
+    N = "N",
+    Mean_Height = "Mean (cm)",
+    SD_Height = "SD (cm)",
+    Min_Height = "Min (cm)",
+    Max_Height = "Max (cm)"
+  ) |>
+  cols_align(align = "left", columns = age_group) |>
+  cols_align(align = "right", columns = -age_group) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-c2-predicted-height-distribution
+#| fig-cap: "Predicted height distribution by age group and sex"
+#| fig-alt: >
+#|   Faceted density plot with one panel per age group, showing GAM-predicted
+#|   height in centimetres on the x-axis and density on the y-axis, with
+#|   separate overlaid curves for boys and girls. Within each panel the curves
+#|   are narrow and concentrated, illustrating that predictions capture only
+#|   the conditional mean and so compress variance relative to true population
+#|   spread, a compression corrected by the later quantile-mapping step.
+#| fig-width: 10
+#| fig-height: 7
+
+fig_c2_predicted_height_distribution |>
+  ggplot(aes(x = talla_cm_predicted, fill = sexo)) +
+  geom_density(alpha = 0.5, color = NA) +
+  facet_wrap(~ age_group, scales = "free") +
+  scale_fill_manual(
+    values = c("Hombre" = "#1B6CA8",
+               "Mujer" = "#3AAF85")
+  ) +
+  labs(
+    title = "Predicted Height Distribution by Age Group and Sex",
+    subtitle = "ENCOVI 2023 children 6-59 months — GAM transfer model",
+    x = "Predicted Height (cm)",
+    y = "Density",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4")
+  )
+```
+
+::: {.callout-note}
+## Prediction Variance
+GAM predictions capture the conditional mean of height given socioeconomic
+predictors, producing narrower distributions than expected population
+variability. This variance compression is corrected by quantile mapping in
+the next step.
+:::
+
+
+## Quantile Mapping Calibration
+
+### Stratification
+
+Children are partitioned into 18 strata (9 six-month age bands × 2 sexes)
+for quantile mapping. Each stratum receives its own reference distribution
+parameters.
+
+```{r}
+#| label: tbl-d1-strata-counts
+#| tbl-cap: "Sample size per age-sex stratum"
+
+tbl_d1_strata_counts |>
+  gt() |>
+  tab_header(
+    title = "Sample Size per Age-Sex Stratum",
+    subtitle = "ENCOVI 2023 children 6-59 months — 18 strata for quantile mapping"
+  ) |>
+  tab_spanner(label = "Hombre", columns = starts_with("Hombre")) |>
+  tab_spanner(label = "Mujer", columns = starts_with("Mujer")) |>
+  cols_label(
+    age_band = "Age Band",
+    Hombre_N = "N",
+    Hombre_N_weighted = "Weighted N",
+    Mujer_N = "N",
+    Mujer_N_weighted = "Weighted N"
+  ) |>
+  fmt_number(columns = contains("weighted"), decimals = 0) |>
+  cols_align(align = "left", columns = age_band) |>
+  cols_align(align = "right", columns = -age_band) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Guatemala-Specific Reference Distributions
+
+For each stratum, the expected height distribution is derived from WHO LMS
+parameters and ENSMI national stunting prevalence
+(`r ensmi_national_stunting`). The Guatemala-specific mean (mu) is solved
+from the equation P(height < threshold) = p_stunting, and sigma is set to
+the WHO reference SD.
+
+```{r}
+#| label: tbl-d2-reference-params
+#| tbl-cap: "Guatemala-specific reference distribution parameters by stratum"
+
+tbl_d2_reference_params |>
+  gt() |>
+  tab_header(
+    title = "Guatemala-Specific Reference Distributions",
+    subtitle = paste0(
+      "Derived from WHO LMS parameters and ENSMI 2014-2015 stunting prevalence (",
+      ensmi_national_stunting, ")"
+    )
+  ) |>
+  fmt_number(
+    columns = c(`WHO Median (M)`, `Stunting Threshold (cm)`,
+                `Guatemala mu (cm)`, `Guatemala sigma (cm)`),
+    decimals = 2
+  ) |>
+  cols_align(align = "left", columns = c(`Age Band`, Sex)) |>
+  cols_align(align = "right", columns = -c(`Age Band`, Sex)) |>
+  tab_source_note(
+    md("**mu_guatemala** = height_threshold - sigma × Φ⁻¹(p_stunting)<br>**sigma_guatemala** = M × S (WHO reference SD)")
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-important}
+## Quantile Mapping Rationale
+GAM predictions compress variance relative to the true population. Normal
+quantile mapping corrects this by transforming each predicted height
+through the source CDF and back through the Guatemala-specific inverse CDF,
+preserving rank order while expanding the distribution to match the
+expected population variability.
+:::
+
+### Quantile Mapping Application and Diagnostics
+
+```{r}
+#| label: tbl-d4-qm-height-comparison
+#| tbl-cap: "Height distribution before and after quantile mapping"
+
+tbl_d4_qm_height_comparison |>
+  gt() |>
+  tab_header(
+    title = "Height Distribution: Before vs After Quantile Mapping",
+    subtitle = "Normal QM within 6-month age bands by sex — Guatemala-specific reference"
+  ) |>
+  cols_label(
+    Stage = "Stage",
+    Mean_Height = "Mean (cm)",
+    SD_Height = "SD (cm)",
+    Median_Height = "Median (cm)",
+    Min_Height = "Min (cm)",
+    Max_Height = "Max (cm)"
+  ) |>
+  cols_align(align = "left", columns = Stage) |>
+  cols_align(align = "right", columns = -Stage) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-d4-qm-by-stratum
+#| tbl-cap: "Quantile mapping effect by age-sex stratum"
+
+tbl_d4_qm_by_stratum |>
+  gt() |>
+  tab_header(
+    title = "Quantile Mapping Effect by Stratum",
+    subtitle = "Comparison of predicted, calibrated, and reference parameters"
+  ) |>
+  cols_align(align = "left", columns = c(`Age Band`, Sex)) |>
+  cols_align(align = "right", columns = -c(`Age Band`, Sex)) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-d4-height-density-comparison
+#| fig-cap: "Height distribution before and after quantile mapping by age band"
+#| fig-alt: >
+#|   Faceted density plot with one panel per six-month age band, showing height
+#|   in centimetres on the x-axis and density on the y-axis. Each panel overlays
+#|   two curves: the narrow predicted distribution before calibration and the
+#|   wider calibrated distribution after quantile mapping. From the 12-month
+#|   band onward the calibrated curve is visibly wider than the predicted one;
+#|   in the 6-11 month band the two curves nearly coincide.
+#| fig-width: 10
+#| fig-height: 10
+
+fig_d4_height_density_comparison |>
+  ggplot(aes(x = height, fill = stage)) +
+  geom_density(alpha = 0.4, color = NA) +
+  facet_wrap(~ age_band, scales = "free", ncol = 3) +
+  scale_fill_manual(values = c("Predicted" = "lightgray", "Calibrated" = "#1B6CA8")) +
+  labs(
+    title = "Height Distribution: Before vs After Quantile Mapping",
+    subtitle = "Normal QM within 6-month age bands — Guatemala-specific reference",
+    x = "Height (cm)",
+    y = "Density",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4")
+  )
+```
+
+::: {.callout-note}
+## Quantile Mapping Effect
+Calibration moves the height distributions onto the Guatemala-specific
+reference means and widens their spread, taking the pooled SD from
+`r sd_before_qm` cm to `r sd_after_qm` cm. @tbl-d4-qm-by-stratum reports the
+calibrated mean against the reference mean for each of the `r n_strata_qm`
+strata.
+:::
+
+
+## HAZ Calculation and Stunting Classification
+
+Calibrated heights are converted to height-for-age z-scores using the WHO
+LMS formula. For length/height-for-age, L = 1 across all ages, simplifying
+to HAZ = (height − M) / (M × S), where M is the median height-for-age from
+the WHO reference and S is the coefficient of variation. Stunting is
+classified as HAZ < −2.
+
+```{r}
+#| label: tbl-e2-haz-summary
+#| tbl-cap: "HAZ distribution summary: raw vs calibrated"
+
+tbl_e2_haz_summary |>
+  gt() |>
+  tab_header(
+    title = "HAZ Distribution: Raw vs Calibrated",
+    subtitle = "Raw HAZ from GAM-predicted height; calibrated HAZ from QM-adjusted height"
+  ) |>
+  cols_label(
+    Stage = "Stage",
+    Mean_HAZ = "Mean",
+    SD_HAZ = "SD",
+    Median_HAZ = "Median",
+    Pct_Stunted = "Stunting %",
+    Range = "Range"
+  ) |>
+  cols_align(align = "left", columns = Stage) |>
+  cols_align(align = "right", columns = -Stage) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Departmental HAZ Before Weight Calibration
+
+```{r}
+#| label: tbl-e2-haz-by-department
+#| tbl-cap: "Calibrated HAZ and stunting prevalence by department"
+
+tbl_e2_haz_by_department |>
+  gt() |>
+  tab_header(
+    title = "Departmental HAZ and Stunting Prevalence (Pre-Calibration)",
+    subtitle = "Survey-weighted estimates before weight calibration — comparison with ENSMI targets"
+  ) |>
+  fmt_number(columns = c(`Mean HAZ`, `SD HAZ`), decimals = 3) |>
+  fmt_number(columns = c(`Stunting %`, `ENSMI Target %`, `Diff (pp)`), decimals = 1) |>
+  cols_align(align = "left", columns = Department) |>
+  cols_align(align = "right", columns = -Department) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(
+      columns = `Diff (pp)`,
+      rows = abs(`Diff (pp)`) > 10
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF9C4"),
+    locations = cells_body(
+      columns = `Diff (pp)`,
+      rows = abs(`Diff (pp)`) > 5 & abs(`Diff (pp)`) <= 10
+    )
+  ) |>
+  tab_footnote(
+    footnote = "Red: > 10 pp deviation. Yellow: 5-10 pp deviation. Weight calibration corrects these differences.",
+    locations = cells_column_labels(columns = `Diff (pp)`)
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-warning}
+## Pre-Calibration Deviations
+Before weight calibration, `r n_dept_over_10pp` of `r n_dept_total`
+departments sit more than 10 percentage points away from their ENSMI stunting
+target and a further `r n_dept_5_to_10pp` between 5 and 10, with the widest gap
+at `r max_dept_gap_pp` pp. The gaps run in both directions, which places them
+in the geographic distribution of the model's predictions rather than in a
+uniform level shift. The weight calibration step closes them.
+:::
+
+### HAZ Distribution Visualization
+
+```{r}
+#| label: fig-e2-haz-density
+#| fig-cap: "HAZ distribution: raw vs calibrated"
+#| fig-alt: >
+#|   Density plot of height-for-age z-score on the x-axis against density on
+#|   the y-axis, overlaying two curves: raw HAZ from GAM-predicted height and
+#|   calibrated HAZ from quantile-mapped height. A dashed vertical line marks
+#|   the stunting threshold at HAZ equal to minus 2. The calibrated curve is
+#|   wider than the compressed raw curve and its centre sits slightly higher,
+#|   so it leaves less mass below the threshold and moves closer to Guatemala's
+#|   reference prevalence.
+#| fig-width: 10
+#| fig-height: 6
+
+fig_e2_haz_density |>
+  ggplot(aes(x = haz, fill = stage)) +
+  geom_density(alpha = 0.4, color = NA) +
+  geom_vline(xintercept = -2, color = "#E07A5F", linetype = "dashed",
+             linewidth = 0.6) +
+  scale_fill_manual(
+    values = c("Raw (predicted height)" = "lightgray",
+               "Calibrated (QM height)" = "#1B6CA8")
+  ) +
+  annotate(
+    "text", x = -2.1, y = Inf,
+    label = "Stunting threshold (HAZ = -2)",
+    hjust = 1, vjust = 1.5, size = 3, color = "#E07A5F"
+  ) +
+  labs(
+    title = "HAZ Distribution: Raw vs Calibrated",
+    subtitle = "Raw from GAM-predicted height; calibrated from QM-adjusted height",
+    x = "Height-for-Age Z-score",
+    y = "Density",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4")
+  )
+```
+
+```{r}
+#| label: fig-e2-haz-by-age-sex
+#| fig-cap: "Calibrated HAZ distribution by age band and sex"
+#| fig-alt: >
+#|   Faceted density plot with one panel per six-month age band, showing
+#|   calibrated height-for-age z-score on the x-axis and density on the y-axis,
+#|   with separate overlaid curves for boys and girls and a dashed vertical
+#|   line at the stunting threshold of HAZ equal to minus 2. Across panels the
+#|   distributions for both sexes are broadly similar in location and spread,
+#|   indicating consistent calibrated HAZ across age bands and sexes.
+#| fig-width: 10
+#| fig-height: 10
+
+fig_e2_haz_by_age_sex |>
+  ggplot(aes(x = haz_calibrated, fill = sexo)) +
+  geom_density(alpha = 0.4, color = NA) +
+  geom_vline(xintercept = -2, color = "#E07A5F", linetype = "dashed",
+             linewidth = 0.5) +
+  facet_wrap(~ age_band, ncol = 3) +
+  scale_fill_manual(values = c("Hombre" = "#1B6CA8", "Mujer" = "#3AAF85")) +
+  labs(
+    title = "Calibrated HAZ by Age Band and Sex",
+    subtitle = "After Guatemala-specific quantile mapping",
+    x = "HAZ (calibrated)",
+    y = "Density",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4")
+  )
+```
+
+
+## Weight Calibration
+
+Survey weights are adjusted so that weighted stunting prevalence matches
+ENSMI 2014-2015 departmental targets exactly. This corrects residual
+discrepancies between the model-implied stunting rates and official
+estimates, while preserving total weighted population per department.
+
+### Calibration Diagnostics
+
+```{r}
+#| label: tbl-f3-calibration-diagnostics
+#| tbl-cap: "Weight calibration diagnostics"
+
+tbl_f3_calibration_diagnostics |>
+  gt() |>
+  tab_header(
+    title = "Survey Weight Calibration Diagnostics",
+    subtitle = "Calibrated to ENSMI 2014-2015 departmental stunting prevalence"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Departmental Stunting Validation
+
+```{r}
+#| label: tbl-f3-departmental-validation
+#| tbl-cap: "Stunting prevalence by department: calibrated vs ENSMI targets"
+
+tbl_f3_departmental_validation |>
+  gt() |>
+  tab_header(
+    title = "Departmental Stunting Prevalence Validation",
+    subtitle = "Calibrated weighted prevalence vs ENSMI 2014-2015 targets"
+  ) |>
+  fmt_number(columns = c(`ENSMI Target (%)`, `Calibrated (%)`), decimals = 1) |>
+  fmt_number(columns = `Diff (pp)`, decimals = 2) |>
+  fmt_number(columns = N, decimals = 0) |>
+  cols_align(align = "left", columns = Department) |>
+  cols_align(align = "right", columns = -Department) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(
+      columns = `Diff (pp)`,
+      rows = abs(`Diff (pp)`) > 1
+    )
+  ) |>
+  tab_footnote(
+    footnote = "Red: departments with > 1 pp deviation from target.",
+    locations = cells_column_labels(columns = `Diff (pp)`)
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-important}
+## What the Calibration Costs
+The `r n_departments_matched` departments reach their ENSMI stunting target
+to 0.00 pp. The mean adjustment ratio is `r mean_adjustment_ratio`, so the
+total weight is preserved, but the adjustment is not evenly distributed:
+individual ratios span `r adjustment_ratio_range`, and
+`r n_ratios_extreme_high` units sit above 3.0.
+
+The dispersion of the weights therefore rises. Their coefficient of variation
+moves from `r cv_initial_value` to `r cv_calibrated_value`, and the design
+effect stands at `r deff_value`, which means the calibrated sample carries the
+precision of one about `r round(as.numeric(deff_value), 2)` times smaller.
+Departmental alignment is obtained at that price.
+:::
+
+### National Indicators
+
+```{r}
+#| label: tbl-f3-national-summary
+#| tbl-cap: "National stunting and HAZ indicators after weight calibration"
+
+tbl_f3_national_summary |>
+  gt() |>
+  tab_header(
+    title = "National Stunting and HAZ Indicators",
+    subtitle = "ENCOVI 2023 children 6-59 months — after departmental weight calibration to ENSMI 2014-2015"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = everything(),
+      rows = Metric %in% c("Stunting prevalence (HAZ < -2)",
+                           "Mean HAZ (weighted)")
+    )
+  ) |>
+  tab_style(
+    style = cell_text(style = "italic", color = "azure4"),
+    locations = cells_body(
+      columns = everything(),
+      rows = Metric %in% c("ENSMI 2014-2015 official stunting prevalence",
+                           "ENSMI 2014-2015 official mean HAZ")
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## National Indicators
+After calibration the weighted stunting prevalence is
+`r calibrated_stunting` against the ENSMI national figure of
+`r ensmi_national_stunting`, a gap of `r stunting_deviation`. The calibration
+targets are departmental, so the national aggregate also carries the
+composition of ENCOVI's sample across departments, which need not match the
+composition behind the ENSMI national figure. The weighted mean HAZ is
+`r calibrated_mean_haz` against the official `r tbl_f3_national_summary |> filter(Metric == "ENSMI 2014-2015 official mean HAZ") |> pull(Value)`,
+a difference of `r haz_deviation`.
+:::
+
+
+## Final Validation Summary
+
+A final validation pass checks completeness of the output dataset and
+verifies that the calibration procedure achieves its targets at the
+departmental level.
+
+```{r}
+#| label: tbl-g1-final-validation
+#| tbl-cap: "Final validation summary"
+
+tbl_g1_final_validation |>
+  gt() |>
+  tab_header(
+    title = "Final Validation Summary",
+    subtitle = "Height transfer, quantile mapping, and weight adjustment"
+  ) |>
+  cols_align(align = "left", columns = Check) |>
+  cols_align(align = "right", columns = c(Value, Status)) |>
+  tab_style(
+    style = cell_text(color = "#2E7D32", weight = "bold"),
+    locations = cells_body(columns = Status, rows = Status == "PASS")
+  ) |>
+  tab_style(
+    style = cell_text(color = "#C62828", weight = "bold"),
+    locations = cells_body(columns = Status, rows = Status == "FAIL")
+  ) |>
+  tab_style(
+    style = cell_text(color = "#F57F17", weight = "bold"),
+    locations = cells_body(columns = Status, rows = Status == "WARN")
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Summary
+
+### Key Findings
+
+1. **Height prediction**: The GAM transfer model produces a height for each of
+   `r format(n_children_final, big.mark = ",")` ENCOVI 2023 children aged 6-59
+   months from their socioeconomic profile.
+
+2. **Quantile mapping**: Normal quantile mapping within `r n_strata_qm`
+   age-sex strata widens the predicted height distribution from an SD of
+   `r sd_before_qm` cm to `r sd_after_qm` cm and aligns each stratum with its
+   Guatemala-specific reference parameters.
+
+3. **HAZ calculation**: Calibrated heights give a weighted national stunting
+   prevalence of `r calibrated_stunting` and a mean HAZ of
+   `r calibrated_mean_haz`, `r stunting_deviation` and `r haz_deviation` from
+   the ENSMI 2014-2015 official figures.
+
+4. **Weight calibration**: The `r n_departments_matched` departments reach
+   their ENSMI stunting target to 0.00 pp, with the weight coefficient of
+   variation moving from `r cv_initial_value` to `r cv_calibrated_value`.
+
+::: {.callout-warning}
+## Limitations
+
+1. **Model-based heights** — Height values are predicted from socioeconomic
+   proxies rather than measured, so the estimates hold at the level of the
+   distribution and not of the individual child.
+
+2. **ENSMI temporal gap** — Calibration targets come from ENSMI 2014-2015 and
+   the ENCOVI data are from 2023, so any change in stunting between the two
+   collection periods is absorbed into the calibration.
+
+3. **Quantile mapping assumes normality** — The normal quantile mapping treats
+   height as Gaussian within each age-sex stratum, which bounds how well the
+   tails of the calibrated distribution are reproduced.
+
+4. **Weight dispersion** — Calibration raises the weight coefficient of
+   variation from `r cv_initial_value` to `r cv_calibrated_value` and leaves
+   `r n_ratios_extreme_high` units with an adjustment ratio above 3.0, which
+   widens the sampling variance of the weighted estimates.
+:::
+
+### Application
+
+This dataset — containing predicted height, calibrated HAZ, stunting
+classification, and calibrated survey weights for
+`r format(n_children_final, big.mark = ",")` children — feeds the
+[bioavailability and inadequacy calculations](05_04_calculate_bioavailability_inadequacy.qmd)
+and the
+[QPM stunting impact estimation](05_05_calculate_qpm_stunting_impact.qmd).

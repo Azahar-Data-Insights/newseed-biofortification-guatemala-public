@@ -1,0 +1,2949 @@
+---
+title: "Calculate Economic Impact of Biofortified Maize Adoption (`r params$seed_label`, `r params$subsidy_label`)"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+params:
+  # --- Seed identification & yield change factors ---
+  seed_year: "2022"
+  seed_label: "2022 Seed"
+  seed_description: "currently deployed biofortified seed variety (released 2022)"
+  seed_suffix: "s22"
+  yield_opv:   0.316
+  yield_low:   0.256
+  yield_mid:   0.018
+  yield_high: -0.138
+  # --- Subsidy identification & seed prices (Q/mz) by segment ---
+  subsidy_label: "Current subsidy"
+  subsidy_description: "current subsidy regime as of April 2026"
+  subsidy_suffix: "sub00"
+  subsidy_reduction_pct: 0
+  bio_cost_no_subsidy_per_mz: 547
+  newseed_subsidy_per_mz: 242
+  conv_cost_opv:  61
+  conv_cost_low:  305
+  conv_cost_mid:  488
+  conv_cost_high: 976
+  bio_cost_opv:  305
+  bio_cost_low:  305
+  bio_cost_mid:  305
+  bio_cost_high: 305
+---
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Setup: Load packages, configure environment, resolve parameters
+# =============================================================================
+
+# Clean environment (preserve params, the only injected object from Quarto)
+rm(list = setdiff(ls(), "params"))
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages (3+ uses across multiple chunks)
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # RDS export for web_resources artefacts
+  here,           # Robust file paths
+  survey,         # Complex survey methods (svy designs)
+  srvyr,          # Tidy survey wrappers
+  gt,             # Publication tables
+  scales,         # Advanced number formatting
+  tidyverse       # Data manipulation and visualization
+)
+
+# Resolve namespace conflicts (tidyverse loaded last, so dplyr wins)
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(
+  scipen = 999,
+  digits = 4
+)
+
+# --- Resolve parameters into local objects ----------------------------------
+
+# Seed
+seed_year        <- params$seed_year
+seed_label       <- params$seed_label
+seed_description <- params$seed_description
+seed_suffix      <- params$seed_suffix
+
+# Subsidy
+subsidy_label              <- params$subsidy_label
+subsidy_description        <- params$subsidy_description
+subsidy_suffix             <- params$subsidy_suffix
+subsidy_reduction_pct      <- params$subsidy_reduction_pct
+bio_cost_no_subsidy_per_mz <- params$bio_cost_no_subsidy_per_mz
+newseed_subsidy_per_mz     <- params$newseed_subsidy_per_mz
+
+# Composite file prefix for all output artefacts (parquet + web_resources rds)
+file_prefix <- paste0("02_04_", seed_suffix, "_", subsidy_suffix)
+
+# Helper: format yield factor as percentage string for inline reporting
+fmt_yield <- function(x) {
+  paste0(ifelse(x >= 0, "+", ""), round(x * 100, 1), "%")
+}
+
+# Yield-change tibble built explicitly by segment name, so that reordering
+# the header YAML has no effect on the pairing
+params_yield_change <- tibble(
+  segment_final = factor(
+    c("OPV/Criollo", "Low", "Mid", "High"),
+    levels = c("OPV/Criollo", "Low", "Mid", "High")
+  ),
+  yield_change_factor = c(
+    params$yield_opv,
+    params$yield_low,
+    params$yield_mid,
+    params$yield_high
+  )
+)
+
+# Seed-cost tibble built explicitly by segment name. Both conventional
+# and biofortified prices are sourced from header parameters, which the
+# orchestrator populates from subsidy_variants.yml.
+params_seed_costs <- tibble(
+  segment_final = factor(
+    c("OPV/Criollo", "Low", "Mid", "High"),
+    levels = c("OPV/Criollo", "Low", "Mid", "High")
+  ),
+  seed_cost_conventional = c(
+    params$conv_cost_opv,
+    params$conv_cost_low,
+    params$conv_cost_mid,
+    params$conv_cost_high
+  ),
+  seed_cost_biofortified = c(
+    params$bio_cost_opv,
+    params$bio_cost_low,
+    params$bio_cost_mid,
+    params$bio_cost_high
+  )
+)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Overview
+
+This script calculates the economic impact of transitioning from conventional/OPV seeds to NewSeed's biofortified maize for each farmer in the segmented population, under a specific combination of seed variant and subsidy regime.
+
+> **Seed Variant:** Yield-change parameters correspond to the **`r seed_label`** \u2014 NewSeed's `r seed_description`.
+>
+> **Subsidy Regime:** Seed prices reflect the **`r subsidy_label`** \u2014 `r subsidy_description`.
+
+## Methodology
+
+The economic impact model follows a **counterfactual approach**: for each farmer, we calculate:
+
+1. **Current economic situation**: Income from sales + value of self-consumption − input costs (under conventional/OPV seed prices applicable to the selected subsidy regime).
+2. **Projected situation with biofortified seed**: Same calculation with adjusted yields and biofortified seed prices applicable to the selected subsidy regime.
+3. **Economic impact**: Difference between projected and current income.
+4. **Subsidy benefit**: Monetary value of the subsidy received by each farmer, expressed both as an absolute value (relative to the unsubsidized commercial reference price) and as a delta relative to the current subsidy regime.
+
+### Economic Logic
+
+- **Sellers**: Benefit from increased production \u00d7 sale price.
+- **Non-sellers**: Benefit from increased self-consumption value \u00d7 purchase price.
+- **All farmers**: Face a change in seed costs that depends jointly on segment and subsidy regime.
+
+The model holds non-seed input costs constant, under the assumption that biofortified varieties are grown with the same agronomic practices.
+
+# Phase A: Setup and Parameters
+
+Load segmented farmer data and define the economic parameters provided by NewSeed for impact calculations.
+
+## A1. Load Segmented Farmer Data
+
+Import the output from Script 02_03 containing farmer characteristics and segment assignments.
+
+```{r}
+#| label: a1-load-data
+
+# =============================================================================
+# A1. Load Segmented Farmer Data
+# =============================================================================
+
+# Load segmented farmer dataset
+df_farmers <- read_parquet(
+  here("01_data", "02_processed",
+       "transfer", "02_03_farmers_segmentated.parquet")
+)
+```
+
+## A2. Define Economic Parameters by Segment
+
+Combine seed costs and yield change factors into a single segment-keyed parameter table. Both inputs are populated by the orchestrator from `seed_variants.yml` and `subsidy_variants.yml`.
+
+```{r}
+#| label: a2-economic-parameters
+
+# =============================================================================
+# A2. Build Combined Economic Parameters Table
+# =============================================================================
+
+# Combine seed costs and yield change (both built in setup chunk)
+params_economic <- params_seed_costs |>
+  left_join(params_yield_change, by = "segment_final") |>
+  mutate(
+    seed_cost_change = seed_cost_biofortified - seed_cost_conventional,
+    yield_change_pct = paste0(
+      ifelse(yield_change_factor >= 0, "+", ""),
+      round(yield_change_factor * 100, 1), "%"
+    )
+  )
+```
+
+```{r}
+#| label: tbl-a2-economic-parameters
+#| tbl-cap: "Economic Parameters for Impact Calculation"
+
+# =============================================================================
+# Display economic parameters table
+# =============================================================================
+
+tbl_a2_economic_parameters <- params_economic |>
+  select(
+    segment_final,
+    seed_cost_conventional,
+    seed_cost_biofortified,
+    seed_cost_change,
+    yield_change_factor,
+    yield_change_pct
+  )
+
+export(
+  tbl_a2_economic_parameters,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_a2_economic_parameters.rds"))
+)
+
+tbl_a2_economic_parameters |>
+  gt() |>
+  tab_header(
+    title = "Economic Parameters by Farmer Segment",
+    subtitle = paste0(
+      "Seed costs (Q/mz) and yield change factors \u2014 ",
+      seed_label, ", ", subsidy_label
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    seed_cost_conventional = "Conventional",
+    seed_cost_biofortified = "Biofortified",
+    seed_cost_change = "Change",
+    yield_change_factor = "Factor",
+    yield_change_pct = "Change"
+  ) |>
+  tab_spanner(
+    label = "Seed Cost (Q/mz)",
+    columns = c(seed_cost_conventional, seed_cost_biofortified, seed_cost_change)
+  ) |>
+  tab_spanner(
+    label = "Yield",
+    columns = c(yield_change_factor, yield_change_pct)
+  ) |>
+  fmt_number(
+    columns = c(seed_cost_conventional, seed_cost_biofortified, seed_cost_change),
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = yield_change_factor,
+    decimals = 3
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(
+      columns = seed_cost_change,
+      rows = seed_cost_change < 0
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(
+      columns = seed_cost_change,
+      rows = seed_cost_change > 0
+    )
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** New Seed refined seed prices and yield data. Green = cost reduction; Red = cost increase.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+## A3. Calculate Reference Prices
+
+Reference prices are computed from ENCOVI 2023 (MAGA-calibrated) using survey-weighted medians:
+
+1. **Sale price**: median per-quintal price across selling households, using the pre-calculated `price_per_qq` column (set upstream as `revenue / qty_sold_qq` for households flagged `is_seller == 1`).
+2. **Purchase price**: median per-quintal valuation proxy across self-consuming households, computed as `value_household / qty_household_qq`.
+3. **Shadow price**: simple average of sale and purchase prices (price-band midpoint), applied to autarkic households whose maize neither enters nor leaves the market.
+
+The purchase price represents the opportunity cost of consuming own production rather than buying maize from the market, and is used to value self-consumption for net buyers in Phases C and D.
+
+```{r}
+#| label: a3-calculate-prices
+
+# =============================================================================
+# A3. Calculate Reference Prices for Economic Valuation
+# =============================================================================
+
+# Survey design (auxiliary, scoped to this chunk)
+svy_farmers <- df_farmers |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# --- Sale price: survey-weighted median across selling households -------
+# Filtered by is_seller == 1 (the upstream flag built in 02_01 from
+# revenue > 0), which is more restrictive than qty_sold_qq > 0 and
+# excludes records with positive sold quantity but zero revenue
+# (typically barter or imputation artefacts).
+price_sale_national <- svy_farmers |>
+  filter(is_seller == 1) |>
+  summarise(
+    price_median = survey_quantile(price_per_qq, 0.5, na.rm = TRUE),
+    price_mean = survey_mean(price_per_qq, na.rm = TRUE),
+    n_observations = unweighted(dplyr::n())
+  ) |>
+  as_tibble()
+
+# --- Purchase price: survey-weighted median proxy from self-consumption -
+price_purchase_proxy <- svy_farmers |>
+  filter(qty_household_qq > 0, value_household > 0) |>
+  mutate(price_household = value_household / qty_household_qq) |>
+  summarise(
+    price_median = survey_quantile(price_household, 0.5, na.rm = TRUE),
+    price_mean = survey_mean(price_household, na.rm = TRUE),
+    n_observations = unweighted(dplyr::n())
+  ) |>
+  as_tibble()
+
+# Extract scalar values for downstream calculations
+price_sale     <- price_sale_national$price_median_q50
+price_purchase <- price_purchase_proxy$price_median_q50
+
+# Shadow price: simple average of sale and purchase prices (price band
+# midpoint). Applied to autarkic households whose maize neither enters
+# nor leaves the market, for whom no observed transaction price exists.
+price_shadow <- (price_sale + price_purchase) / 2
+```
+
+```{r}
+#| label: tbl-a3-reference-prices
+#| tbl-cap: "Reference Prices for Economic Valuation"
+
+# =============================================================================
+# Display reference prices table
+# =============================================================================
+
+tbl_a3_reference_prices <- tibble(
+  price_type = c(
+    "Sale (national median)",
+    "Purchase (self-consumption proxy)",
+    "Shadow (sale-purchase midpoint)"
+  ),
+  value_qq = c(price_sale, price_purchase, price_shadow),
+  n_observations = c(
+    price_sale_national$n_observations,
+    price_purchase_proxy$n_observations,
+    NA_integer_
+  ),
+  source = c(
+    "revenue / qty_sold_qq",
+    "value_household / qty_household_qq",
+    "(price_sale + price_purchase) / 2"
+  )
+)
+
+export(
+  tbl_a3_reference_prices,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_a3_reference_prices.rds"))
+)
+
+tbl_a3_reference_prices |>
+  gt() |>
+  tab_header(
+    title = "Reference Prices for Economic Impact Calculation",
+    subtitle = "Survey-weighted median prices (Q/qq)"
+  ) |>
+  cols_label(
+    price_type = "Price Type",
+    value_qq = "Value (Q/qq)",
+    n_observations = "N (observations)",
+    source = "Calculation"
+  ) |>
+  fmt_number(
+    columns = value_qq,
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = n_observations,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  sub_missing(
+    columns = n_observations,
+    missing_text = "\u2014"
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Sale price applies to net-seller households. Purchase price applies to net-buyer households. Shadow price applies to autarkic households (no market participation) and represents the price-band midpoint.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup
+rm(price_sale_national, price_purchase_proxy, svy_farmers,
+   tbl_a3_reference_prices)
+```
+
+## A4. Merge Parameters with Farmer Data
+
+Join economic parameters to the farmer dataset, preparing all variables needed for impact calculations.
+
+```{r}
+#| label: a4-merge-parameters
+
+# =============================================================================
+# A4. Merge Parameters with Farmer Data
+# =============================================================================
+
+df_farmers_params <- df_farmers |>
+  # Convert segment_final to character for clean join
+  mutate(segment_final = as.character(segment_final)) |>
+  # Join segment-specific parameters
+  left_join(
+    params_economic |>
+      mutate(segment_final = as.character(segment_final)) |>
+      select(segment_final, seed_cost_conventional,
+             seed_cost_biofortified, yield_change_factor),
+    by = "segment_final"
+  ) |>
+  # Restore segment_final as ordered factor
+  mutate(
+    segment_final = factor(
+      segment_final,
+      levels = c("OPV/Criollo", "Low", "Mid", "High"),
+      ordered = TRUE
+    )
+  ) |>
+  # Add reference prices as constants
+  mutate(
+    price_sale = price_sale,
+    price_purchase = price_purchase,
+    price_shadow = price_shadow
+  )
+```
+
+## A5. Subsidy Regime Reference
+
+Display the subsidy regime metadata in effect for this run, including the unsubsidized commercial reference price used downstream to quantify the absolute monetary value of the subsidy.
+
+```{r}
+#| label: tbl-a5-subsidy-reference
+#| tbl-cap: "Subsidy Regime Reference"
+
+# =============================================================================
+# A5. Subsidy Regime Reference Table
+# =============================================================================
+
+tbl_a5_subsidy_reference <- tibble(
+  field = c(
+    "Subsidy regime",
+    "Description",
+    "Reduction relative to current regime",
+    "Reference unsubsidized biofortified price",
+    "Subsidy suffix (file naming)"
+  ),
+  value = c(
+    subsidy_label,
+    subsidy_description,
+    paste0(subsidy_reduction_pct, "%"),
+    paste0(bio_cost_no_subsidy_per_mz, " Q/mz"),
+    subsidy_suffix
+  )
+)
+
+export(
+  tbl_a5_subsidy_reference,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_a5_subsidy_reference.rds"))
+)
+
+tbl_a5_subsidy_reference |>
+  gt() |>
+  tab_header(
+    title = "Subsidy Regime Reference",
+    subtitle = paste0("Configuration in effect for this run \u2014 ", subsidy_label)
+  ) |>
+  cols_label(
+    field = "Field",
+    value = "Value"
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** NewSeed refined subsidy values, April 2026.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+---
+
+# Phase B: Market Position Classification
+
+Classify each farmer household by its position in the maize market, based on observed sale and purchase volumes. The classification feeds the differential valuation of self-consumption applied in Phases C and D: net sellers value retained production at the sale price (foregone revenue), net buyers at the purchase price (avoided expenditure), and autarkic households at the shadow price (price-band midpoint, since no observed market price applies).
+
+**Classification logic.** For each household, three shares are computed against total maize volume (sold + purchased + retained for own consumption): sale share, purchase share, and retained share. A tolerance threshold `epsilon = 5%` defines functional zero, accommodating measurement error inherent in 15-day recall surveys. Mixed-quadrant households (positive sale and positive purchase) are resolved by the sign of their net market position (`qty_sold - qty_purchased`): functional sellers when positive, functional buyers when negative, autarkic when zero.
+
+**Threshold rationale.** Empirical justification in the analytical companion EDA (`EDA_market_position_classification.qmd`): the distribution of purchase shares is strongly bimodal with masses near 0% and 100%, and category counts are stable in the 1\u201310% range.
+
+## B1. Load Food Consumption Module and Compute Maize Purchase Volume
+
+Load the ENCOVI food consumption module and the unit equivalence table from `01_01`. Each food record carries two parallel quantity fields: `p13a07a` (purchased) and `p13a11a` (obtained from sources other than purchase \u2014 own production, gifts, barter). Filtering for the three maize codines (7 tortillas, 17 flour, 21 grain), applying the equivalence table to convert reported units to grams, and applying the INCAP weight-conversion factors to standardize to maize-grain equivalent yields per-household maize purchase and obtained volumes.
+
+The 15-day recall window is rescaled to a full year (\u00d7 365 / 15) to align with the campaign-year horizon. Conversion to quintales uses the standard equivalence (1 qq = 45.36 kg = 45,360 g).
+
+```{r}
+#| label: b1-load-food-module
+
+# =============================================================================
+# B1. Load Food Consumption Module and Compute Maize Purchase Volume
+# =============================================================================
+
+# Load ENCOVI food consumption module (raw, all households)
+encovi_alimentos <- read_parquet(
+  here("01_data", "02_processed",
+       "transfer", "01_01_encovi_alimentos.parquet")
+)
+
+# Load food unit equivalences (codine + medida \u2192 grams)
+equivalencias <- read_parquet(
+  here("01_data", "02_processed",
+       "transfer", "01_01_food_equivalences.parquet")
+)
+
+# --- Domain constants for maize aggregation -------------------------------
+
+# Maize codine codes in ENCOVI food module 13A
+maize_codines <- c(7L, 17L, 21L)
+
+# Quintal conversion: 1 qq = 45.36 kg = 45,360 g
+g_per_qq <- 45360
+
+# INCAP weight conversion factors (food product \u2192 maize grain equivalent)
+maize_conv <- tibble(
+  codine = c(7L, 17L, 21L),
+  conv_factor = c(0.52, 0.98, 1.00),
+  food_label = c("Tortillas de MAIZ", "Harina de MAIZ", "MAIZ (grano)")
+)
+
+# --- Filter food records to maize products only ---------------------------
+
+df_food_maize <- encovi_alimentos |>
+  filter(codine %in% maize_codines)
+
+# --- Compute purchased volume per household (qq/year) --------------------
+
+df_purchased <- df_food_maize |>
+  filter(!is.na(p13a07a) & p13a07a > 0) |>
+  left_join(
+    equivalencias,
+    by = join_by(codine, p13a07c == medida)
+  ) |>
+  left_join(
+    maize_conv |> select(codine, conv_factor),
+    by = "codine"
+  ) |>
+  mutate(
+    g_purchased_15d = gramos * p13a07a * conv_factor
+  ) |>
+  summarise(
+    g_purchased_15d = sum(g_purchased_15d, na.rm = TRUE),
+    .by = no_hogar
+  ) |>
+  mutate(
+    qty_purchased_qq = (g_purchased_15d * 365 / 15) / g_per_qq
+  ) |>
+  select(no_hogar, qty_purchased_qq)
+
+# --- Compute obtained-from-other-sources volume per household ------------
+# Reported separately for documentation purposes; not used in classification
+# since for farmer households this field largely overlaps with the
+# agricultural module's qty_household_qq.
+
+df_obtained <- df_food_maize |>
+  filter(!is.na(p13a11a) & p13a11a > 0) |>
+  left_join(
+    equivalencias,
+    by = join_by(codine, p13a11c == medida)
+  ) |>
+  left_join(
+    maize_conv |> select(codine, conv_factor),
+    by = "codine"
+  ) |>
+  mutate(
+    g_obtained_15d = gramos * p13a11a * conv_factor
+  ) |>
+  summarise(
+    g_obtained_15d = sum(g_obtained_15d, na.rm = TRUE),
+    .by = no_hogar
+  ) |>
+  mutate(
+    qty_obtained_food_qq = (g_obtained_15d * 365 / 15) / g_per_qq
+  ) |>
+  select(no_hogar, qty_obtained_food_qq)
+
+# --- Build household-level maize sources table ---------------------------
+# Hosueholds appearing in only one of the two component tables get NA on
+# the missing column after the full join. A second pass fills those NAs
+# with zero so the downstream classification operates on a clean numeric
+# column.
+
+df_maize_sources_raw <- df_purchased |>
+  full_join(df_obtained, by = "no_hogar")
+
+df_maize_sources <- df_maize_sources_raw |>
+  mutate(
+    qty_purchased_qq_clean = coalesce(qty_purchased_qq, 0),
+    qty_obtained_food_qq_clean = coalesce(qty_obtained_food_qq, 0)
+  ) |>
+  select(
+    no_hogar,
+    qty_purchased_qq = qty_purchased_qq_clean,
+    qty_obtained_food_qq = qty_obtained_food_qq_clean
+  )
+
+# Cleanup
+rm(encovi_alimentos, equivalencias, df_food_maize,
+   df_purchased, df_obtained, df_maize_sources_raw)
+```
+
+## B2. Classify Market Position
+
+Join the maize purchase volume to the farmer dataset and compute the trichotomous classification. Households absent from the food module receive `qty_purchased_qq = 0` and fall into the autarkic or net-seller category according to their `is_seller` flag.
+
+```{r}
+#| label: b2-classify-market-position
+
+# =============================================================================
+# B2. Classify Market Position
+# =============================================================================
+
+# Tolerance threshold for the strict-zero criterion
+epsilon_market <- 0.05
+
+# Step 1: Join maize sources to farmer dataset. Households absent from the
+# food module receive NA on the maize source columns; the next step
+# normalizes these to zero.
+df_farmers_with_sources <- df_farmers_params |>
+  left_join(df_maize_sources, by = "no_hogar") |>
+  mutate(
+    has_food_record = !is.na(qty_purchased_qq)
+  )
+
+# Step 2: Normalize NAs to zero on a new dataframe and compute the
+# classification inputs (shares, net position) plus the price mapping.
+df_farmers_classified <- df_farmers_with_sources |>
+  mutate(
+    qty_purchased_qq_filled = coalesce(qty_purchased_qq, 0),
+    qty_obtained_food_qq_filled = coalesce(qty_obtained_food_qq, 0)
+  ) |>
+  select(-qty_purchased_qq, -qty_obtained_food_qq) |>
+  rename(
+    qty_purchased_qq = qty_purchased_qq_filled,
+    qty_obtained_food_qq = qty_obtained_food_qq_filled
+  ) |>
+  mutate(
+    # Total household-level maize volume across all uses
+    total_maize_volume = qty_sold_qq + qty_purchased_qq + qty_household_qq,
+
+    # Shares of each component on total volume
+    sale_share = if_else(
+      total_maize_volume > 0,
+      qty_sold_qq / total_maize_volume,
+      0
+    ),
+    purchase_share = if_else(
+      total_maize_volume > 0,
+      qty_purchased_qq / total_maize_volume,
+      0
+    ),
+
+    # Net market position (sellers > 0, buyers < 0)
+    net_position_qq = qty_sold_qq - qty_purchased_qq,
+
+    # Trichotomous classification with Mixed resolved by net position sign
+    market_position = case_when(
+      sale_share > epsilon_market & purchase_share <= epsilon_market ~ "Net seller",
+      purchase_share > epsilon_market & sale_share <= epsilon_market ~ "Net buyer",
+      sale_share <= epsilon_market & purchase_share <= epsilon_market ~ "Autarkic",
+      sale_share > epsilon_market & purchase_share > epsilon_market &
+        net_position_qq > 0 ~ "Net seller",
+      sale_share > epsilon_market & purchase_share > epsilon_market &
+        net_position_qq < 0 ~ "Net buyer",
+      sale_share > epsilon_market & purchase_share > epsilon_market &
+        net_position_qq == 0 ~ "Autarkic"
+    ),
+
+    market_position = factor(
+      market_position,
+      levels = c("Net seller", "Net buyer", "Autarkic")
+    ),
+
+    # Map classification to the price applied in self-consumption valuation
+    price_self_consumption = case_when(
+      market_position == "Net seller" ~ price_sale,
+      market_position == "Net buyer"  ~ price_purchase,
+      market_position == "Autarkic"   ~ price_shadow
+    )
+  )
+
+# Cleanup
+rm(df_farmers_with_sources, df_maize_sources)
+```
+
+## B3. Distribution of Market Positions
+
+Population distribution across the three categories, computed under the survey design.
+
+```{r}
+#| label: tbl-b3-market-position-distribution
+#| tbl-cap: "Distribution of Market Positions Across the Farmer Population"
+
+# =============================================================================
+# B3. Market Position Distribution Table
+# =============================================================================
+
+# Survey design (auxiliary, scoped to this chunk)
+svy_classified <- df_farmers_classified |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+tbl_b3_market_position <- svy_classified |>
+  group_by(market_position) |>
+  summarise(
+    n_unweighted = unweighted(dplyr::n()),
+    weighted_n = survey_total(vartype = NULL),
+    median_qty_sold = survey_median(qty_sold_qq, vartype = NULL),
+    median_qty_purchased = survey_median(qty_purchased_qq, vartype = NULL),
+    median_qty_household = survey_median(qty_household_qq, vartype = NULL),
+    price_applied = first(price_self_consumption)
+  ) |>
+  ungroup() |>
+  mutate(
+    pct_weighted = weighted_n / sum(weighted_n) * 100
+  ) |>
+  select(
+    market_position, n_unweighted, weighted_n, pct_weighted,
+    median_qty_sold, median_qty_purchased, median_qty_household,
+    price_applied
+  )
+
+export(
+  tbl_b3_market_position,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_b3_market_position.rds"))
+)
+
+tbl_b3_market_position |>
+  gt() |>
+  tab_header(
+    title = "Market Position Distribution",
+    subtitle = paste0(
+      "Survey-weighted, threshold epsilon = ",
+      scales::percent(epsilon_market)
+    )
+  ) |>
+  cols_label(
+    market_position = "Market position",
+    n_unweighted = "N (raw)",
+    weighted_n = "N (weighted)",
+    pct_weighted = "% weighted",
+    median_qty_sold = "Sold",
+    median_qty_purchased = "Purchased",
+    median_qty_household = "Household",
+    price_applied = "Price applied (Q/qq)"
+  ) |>
+  tab_spanner(
+    label = "Median maize volume (qq/year)",
+    columns = c(median_qty_sold, median_qty_purchased, median_qty_household)
+  ) |>
+  fmt_number(
+    columns = c(n_unweighted, weighted_n),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = pct_weighted,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(median_qty_sold, median_qty_purchased, median_qty_household),
+    decimals = 2
+  ) |>
+  fmt_number(
+    columns = price_applied,
+    decimals = 1
+  ) |>
+  tab_source_note(
+    source_note = md(paste0(
+      "**Source:** ENCOVI 2023 modules 13A (food consumption) and 16B ",
+      "(agricultural production), MAGA-calibrated. Threshold ",
+      "epsilon = ", scales::percent(epsilon_market),
+      " of total maize volume defines functional zero for sale and ",
+      "purchase shares."
+    ))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_b3_market_position)
+```
+
+## B4. Distribution of Market Positions by Farmer Segment
+
+Cross-tabulation of market position against farmer segment, to verify that the classification does not concentrate disproportionately on any single segment.
+
+```{r}
+#| label: tbl-b4-market-position-by-segment
+#| tbl-cap: "Market Position Distribution by Farmer Segment"
+
+# =============================================================================
+# B4. Market Position by Segment Table
+# =============================================================================
+
+tbl_b4_position_by_segment <- svy_classified |>
+  group_by(segment_final, market_position) |>
+  summarise(
+    weighted_n = survey_total(vartype = NULL),
+    .groups = "drop"
+  ) |>
+  group_by(segment_final) |>
+  mutate(
+    pct_within_segment = weighted_n / sum(weighted_n) * 100
+  ) |>
+  ungroup() |>
+  select(segment_final, market_position, pct_within_segment) |>
+  pivot_wider(
+    names_from = market_position,
+    values_from = pct_within_segment,
+    values_fill = 0
+  )
+
+export(
+  tbl_b4_position_by_segment,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_b4_position_by_segment.rds"))
+)
+
+tbl_b4_position_by_segment |>
+  gt() |>
+  tab_header(
+    title = "Market Position by Farmer Segment",
+    subtitle = "% within each segment (survey-weighted)"
+  ) |>
+  cols_label(segment_final = "Segment") |>
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023, MAGA-calibrated. Rows sum to 100% (within-segment shares).")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_b4_position_by_segment, svy_classified)
+```
+
+---
+
+# Phase C: Current Economic Situation
+
+Calculate the economic baseline for each farmer under their current seed technology. This establishes the counterfactual against which biofortified adoption will be compared.
+
+**Production allocation (post-adjustment):**
+$$
+\text{Production} = \text{Qty}_{sold} + \text{Qty}_{household} + \text{Qty}_{animal}
+$$
+
+**Economic components:**
+
+| Component | Calculation | Source |
+|-----------|-------------|--------|
+| Sales revenue | `revenue` (actual reported) | ENCOVI |
+| Self-consumption value | `qty_retained \u00d7 price_self_consumption` | Quantity \u00d7 market-position-specific price (Phase B) |
+| Seed costs | `seed_cost_conventional \u00d7 land_wtcorn` | Segment parameters |
+| Non-seed costs | `exp_non_seed` | ENCOVI |
+
+**Net income formula:**
+$$
+\text{Income}_{net} = \text{Revenue} + \text{Value}_{self-consumption} - \text{Cost}_{seeds} - \text{Cost}_{non-seed}
+$$
+
+The differential valuation of self-consumption reflects the household's market position established in Phase B: net sellers value retained production at the foregone sale price, net buyers at the avoided purchase price, and autarkic households at the shadow price (price-band midpoint). Seed costs are computed from the segment-level seed prices declared in the header YAML.
+
+## C1. Calculate Current Economic Baseline
+
+Compute income, costs, and net economic position for each farmer using normalized production allocation quantities.
+
+```{r}
+#| label: c1-current-economic-situation
+
+# =============================================================================
+# C1. Calculate Current Economic Situation
+# =============================================================================
+
+df_current_economics <- df_farmers_classified |>
+  mutate(
+    # --- Revenue components ---
+    # Direct sales revenue (actual reported, in Q)
+    income_sales = revenue,
+
+    # Value of self-consumption (adjusted quantities \u00d7 market-position price).
+    # Represents the opportunity cost of own consumption: foregone sale
+    # revenue for net sellers, avoided purchase expenditure for net buyers,
+    # and the price-band midpoint for autarkic households.
+    value_household = qty_household_qq * price_self_consumption,
+    value_animal = qty_animal_seed_qq * price_self_consumption,
+    value_self_consumption = value_household + value_animal,
+
+    # Total gross value of production
+    value_gross = income_sales + value_self_consumption,
+
+    # --- Cost components ---
+    # Seed costs from the segment-specific price parameters
+    cost_seeds_current = seed_cost_conventional * land_wtcorn,
+
+    # Non-seed input costs (from ENCOVI, unchanged by adoption)
+    cost_non_seed = exp_non_seed,
+
+    # Total costs
+    cost_total_current = cost_seeds_current + cost_non_seed,
+
+    # --- Net income ---
+    income_net_current = value_gross - cost_total_current,
+
+    # --- Additional metrics ---
+    # Gain per quintal produced
+    gain_per_qq_current = if_else(
+      total_production > 0,
+      income_net_current / total_production,
+      0
+    ),
+
+    # Binary: positive net income
+    has_positive_income = as.integer(income_net_current > 0)
+  )
+```
+
+```{r}
+#| label: tbl-c1-current-economics-segment
+#| tbl-cap: "Current Economic Situation by Farmer Segment"
+
+# =============================================================================
+# Table: Current Economic Situation by Segment
+# =============================================================================
+
+# Survey design (auxiliary, scoped to this chunk)
+svy_current <- df_current_economics |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# Calculate weighted statistics by segment
+tbl_current_segment <- svy_current |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL),
+    pct_sellers = survey_mean(is_seller, vartype = NULL) * 100,
+
+    # Income components (medians)
+    income_sales = survey_median(income_sales, vartype = NULL),
+    value_self_consumption = survey_median(value_self_consumption, vartype = NULL),
+    value_gross = survey_median(value_gross, vartype = NULL),
+
+    # Cost components (medians)
+    cost_seeds = survey_median(cost_seeds_current, vartype = NULL),
+    cost_other = survey_median(cost_non_seed, vartype = NULL),
+
+    # Net income (median)
+    income_net = survey_median(income_net_current, vartype = NULL),
+
+    # Proportion with positive income
+    pct_positive = survey_mean(has_positive_income, vartype = NULL) * 100
+  ) |>
+  as_tibble()
+
+export(
+  tbl_current_segment,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_c1_current_economics_segment.rds"))
+)
+
+# Generate GT table
+tbl_current_segment |>
+  gt() |>
+  tab_header(
+    title = "Current Economic Situation by Farmer Segment",
+    subtitle = "Survey-weighted medians (Q) under current seed technology"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers (N)",
+    pct_sellers = "% Sellers",
+    income_sales = "Sales",
+    value_self_consumption = "Self-Consumption",
+    value_gross = "Gross Value",
+    cost_seeds = "Seeds",
+    cost_other = "Other Inputs",
+    income_net = "Net Income",
+    pct_positive = "% Positive"
+  ) |>
+  tab_spanner(
+    label = "Income Components (Q)",
+    columns = c(income_sales, value_self_consumption, value_gross)
+  ) |>
+  tab_spanner(
+    label = "Costs (Q)",
+    columns = c(cost_seeds, cost_other)
+  ) |>
+  fmt_number(
+    columns = n_farmers,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(income_sales, value_self_consumption, value_gross,
+                cost_seeds, cost_other, income_net),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(pct_positive, pct_sellers),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = income_net, rows = income_net > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = income_net, rows = income_net <= 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Seed costs modeled by segment per NewSeed parameters.")
+  ) |>
+  tab_footnote(
+    footnote = "Self-consumption valued at purchase price proxy (210 Q/qq)",
+    locations = cells_column_labels(columns = value_self_consumption)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects (preserve audit trail dataframes)
+rm(svy_current, tbl_current_segment)
+```
+
+```{r}
+#| label: tbl-c1-aggregate-summary
+#| tbl-cap: "Aggregate Economic Value of White Maize Production"
+
+# =============================================================================
+# Table: Aggregate Economic Summary (National)
+# =============================================================================
+
+# Calculate weighted totals
+tbl_aggregate <- df_current_economics |>
+  summarise(
+    # Population
+    total_farmers = sum(weight_calibrated),
+    total_land_mz = sum(land_wtcorn * weight_calibrated),
+    total_production_qq = sum(total_production * weight_calibrated),
+
+    # Value components
+    total_sales = sum(income_sales * weight_calibrated),
+    total_self_consumption = sum(value_self_consumption * weight_calibrated),
+    total_gross_value = sum(value_gross * weight_calibrated),
+
+    # Costs
+    total_cost_seeds = sum(cost_seeds_current * weight_calibrated),
+    total_cost_other = sum(cost_non_seed * weight_calibrated),
+    total_costs = sum(cost_total_current * weight_calibrated),
+
+    # Net
+    total_net_income = sum(income_net_current * weight_calibrated)
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  mutate(
+    category = case_when(
+      str_detect(metric, "farmers|land|production") ~ "Production Base",
+      str_detect(metric, "sales|self_consumption|gross") ~ "Gross Value",
+      str_detect(metric, "cost") ~ "Costs",
+      TRUE ~ "Net Result"
+    ),
+    metric_label = case_when(
+      metric == "total_farmers" ~ "Total Farmers",
+      metric == "total_land_mz" ~ "Total Land (mz)",
+      metric == "total_production_qq" ~ "Total Production (qq)",
+      metric == "total_sales" ~ "Revenue from Sales",
+      metric == "total_self_consumption" ~ "Value of Self-Consumption",
+      metric == "total_gross_value" ~ "Total Gross Value",
+      metric == "total_cost_seeds" ~ "Seed Costs",
+      metric == "total_cost_other" ~ "Other Input Costs",
+      metric == "total_costs" ~ "Total Costs",
+      metric == "total_net_income" ~ "Net Income (National)"
+    ),
+    # Calculate percentages for value breakdown
+    pct_of_gross = if_else(
+      category == "Gross Value" & metric != "total_gross_value",
+      value / value[metric == "total_gross_value"] * 100,
+      NA_real_
+    )
+  )
+
+export(
+  tbl_aggregate,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_c1_aggregate_summary.rds"))
+)
+
+# Generate GT table
+tbl_aggregate |>
+  select(category, metric_label, value, pct_of_gross) |>
+  gt(groupname_col = "category") |>
+  tab_header(
+    title = "Aggregate Economic Value of White Maize Production",
+    subtitle = "National totals under current seed technology (Guatemala, 2023)"
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value = "Value",
+    pct_of_gross = "% of Gross"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Farmers"),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} mz"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Production"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} qq"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = !str_detect(metric_label, "Farmers|Land|Production"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  fmt_number(
+    columns = pct_of_gross,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  sub_missing(columns = pct_of_gross, missing_text = "") |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = str_detect(metric_label, "Total|Net Income"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e3f2fd"),
+    locations = cells_body(rows = str_detect(metric_label, "Total Gross Value"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(rows = str_detect(metric_label, "Net Income"))
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Self-consumption valued at 210 Q/qq (purchase price proxy).")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.weight = "bold"
+  )
+
+# Cleanup auxiliary table object (preserve audit trail dataframes)
+rm(tbl_aggregate)
+```
+
+---
+
+# Phase D: Projected Economic Situation with Biofortified Seed
+
+Calculate the projected economic situation if farmers adopt NewSeed's biofortified maize, applying segment-specific yield changes and the biofortified seed prices that correspond to the active subsidy regime.
+
+**Allocation logic for projections (Conservative Approach):**
+
+| Component | Treatment | Rationale |
+|-----------|-----------|-----------|
+| Household consumption | **Fixed absolute** | Family food needs do not increase with production |
+| Animal feed/seed | **Fixed absolute** | Livestock needs are constant |
+| Sales | **Residual** | All surplus production goes to market |
+
+This conservative approach assumes that household and animal consumption needs remain constant regardless of production changes.
+
+## D1. Calculate Projected Production and Allocation
+
+Apply yield change factors and project how production would be allocated under biofortified seed adoption.
+
+```{r}
+#| label: d1-projected-economic-situation
+
+# =============================================================================
+# D1. Calculate Projected Economic Situation with Biofortified Seed
+# =============================================================================
+
+df_projected_economics <- df_current_economics |>
+  mutate(
+    # --- Production changes ---
+    production_biofortified = total_production * (1 + yield_change_factor),
+    production_increment = production_biofortified - total_production,
+
+    # --- Allocation logic ---
+    # 1. Self-consumption: fixed in absolute terms
+    #    Cap at available production if yield drops below current needs
+    qty_household_projected = pmin(qty_household_qq, production_biofortified),
+
+    qty_animal_projected = pmin(
+      qty_animal_seed_qq,
+      pmax(0, production_biofortified - qty_household_projected)
+    ),
+
+    qty_retained_projected = qty_household_projected + qty_animal_projected,
+
+    # 2. Sales: RESIDUAL (all surplus goes to market)
+    qty_sold_projected = pmax(0, production_biofortified - qty_retained_projected),
+
+    # --- Value components (projected) ---
+    # Sales at national sale price
+    income_sales_projected = qty_sold_projected * price_sale,
+
+    # Self-consumption at the market-position-specific price (Phase B).
+    # Same valuation rule as the current baseline; biofortified adoption
+    # is assumed not to alter the household's market position.
+    value_self_consumption_projected = qty_retained_projected * price_self_consumption,
+
+    # Gross value (sales + self-consumption)
+    value_gross_projected = income_sales_projected + value_self_consumption_projected,
+
+    # --- Cost components (projected) ---
+    # Seed costs: biofortified price under the active subsidy regime
+    cost_seeds_projected = seed_cost_biofortified * land_wtcorn,
+
+    # Non-seed costs: unchanged (same agronomic practices)
+    cost_non_seed_projected = cost_non_seed,
+
+    # Total costs
+    cost_total_projected = cost_seeds_projected + cost_non_seed_projected,
+
+    # --- Net income (projected) ---
+    income_net_projected = value_gross_projected - cost_total_projected,
+
+    # --- Additional metrics ---
+    gain_per_qq_projected = if_else(
+      production_biofortified > 0,
+      income_net_projected / production_biofortified,
+      0
+    ),
+
+    has_positive_income_projected = as.integer(income_net_projected > 0)
+  )
+```
+
+## D2. Projected Economic Summary
+
+Summary of the projected economic situation under biofortified seed adoption, comparable to the current baseline established in Phase B.
+
+```{r}
+#| label: tbl-d2-production-changes
+#| tbl-cap: "Projected Changes in Production and Costs by Segment"
+
+# =============================================================================
+# Table: Production and Cost Changes with Biofortified Adoption
+# =============================================================================
+
+# Survey design (auxiliary)
+svy_projected <- df_projected_economics |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# Calculate changes by segment
+tbl_changes <- svy_projected |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL),
+
+    # Production
+    prod_current = survey_mean(total_production, vartype = NULL),
+    prod_projected = survey_mean(production_biofortified, vartype = NULL),
+
+    # Seed costs
+    cost_seed_current = survey_mean(cost_seeds_current, vartype = NULL),
+    cost_seed_projected = survey_mean(cost_seeds_projected, vartype = NULL),
+
+    # Sales quantities
+    qty_sold_current = survey_mean(qty_sold_qq, vartype = NULL),
+    qty_sold_projected = survey_mean(qty_sold_projected, vartype = NULL)
+  ) |>
+  as_tibble() |>
+  mutate(
+    prod_change_pct = (prod_projected / prod_current - 1) * 100,
+    cost_seed_change = cost_seed_projected - cost_seed_current,
+    qty_sold_change = qty_sold_projected - qty_sold_current
+  )
+
+export(
+  tbl_changes,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_d2_production_changes.rds"))
+)
+
+# Generate GT table
+tbl_changes |>
+  select(segment_final, n_farmers,
+         prod_current, prod_projected, prod_change_pct,
+         cost_seed_current, cost_seed_projected, cost_seed_change,
+         qty_sold_current, qty_sold_projected, qty_sold_change) |>
+  gt() |>
+  tab_header(
+    title = "Projected Changes with Biofortified Seed Adoption",
+    subtitle = paste0(
+      "Production, seed costs, and sales quantity by segment \u2014 ",
+      seed_label, ", ", subsidy_label
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    prod_current = "Current",
+    prod_projected = "Projected",
+    prod_change_pct = "Change",
+    cost_seed_current = "Current",
+    cost_seed_projected = "Projected",
+    cost_seed_change = "Change",
+    qty_sold_current = "Current",
+    qty_sold_projected = "Projected",
+    qty_sold_change = "Change"
+  ) |>
+  tab_spanner(
+    label = "Production (qq/farmer)",
+    columns = c(prod_current, prod_projected, prod_change_pct)
+  ) |>
+  tab_spanner(
+    label = "Seed Cost (Q/farmer)",
+    columns = c(cost_seed_current, cost_seed_projected, cost_seed_change)
+  ) |>
+  tab_spanner(
+    label = "Quantity Sold (qq/farmer)",
+    columns = c(qty_sold_current, qty_sold_projected, qty_sold_change)
+  ) |>
+  fmt_number(
+    columns = n_farmers,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(prod_current, prod_projected, qty_sold_current,
+                qty_sold_projected, qty_sold_change),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = prod_change_pct,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(cost_seed_current, cost_seed_projected, cost_seed_change),
+    decimals = 0
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = prod_change_pct, rows = prod_change_pct > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = prod_change_pct, rows = prod_change_pct < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = cost_seed_change, rows = cost_seed_change < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = cost_seed_change, rows = cost_seed_change > 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Yield factors from New Seed yield data and market analysis; seed prices from refined seed and subsidy values.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects (preserve audit trail dataframes)
+rm(svy_projected, tbl_changes)
+```
+
+```{r}
+#| label: tbl-d2-projected-economics
+#| tbl-cap: "Projected Economic Situation by Farmer Segment"
+
+# =============================================================================
+# Table: Projected Economic Situation
+# =============================================================================
+
+# Survey design (auxiliary)
+svy_projected <- df_projected_economics |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# Calculate projected statistics by segment
+tbl_projected_segment <- svy_projected |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL),
+
+    # Income components (medians)
+    income_sales = survey_median(income_sales_projected, vartype = NULL),
+    value_self_consumption = survey_median(value_self_consumption_projected, vartype = NULL),
+    value_gross = survey_median(value_gross_projected, vartype = NULL),
+
+    # Cost components (medians)
+    cost_seeds = survey_median(cost_seeds_projected, vartype = NULL),
+    cost_other = survey_median(cost_non_seed_projected, vartype = NULL),
+
+    # Net income (median)
+    income_net = survey_median(income_net_projected, vartype = NULL),
+
+    # Proportion with positive income
+    pct_positive = survey_mean(has_positive_income_projected, vartype = NULL) * 100
+  ) |>
+  as_tibble()
+
+export(
+  tbl_projected_segment,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_d2_projected_economics.rds"))
+)
+
+# Generate GT table
+tbl_projected_segment |>
+  gt() |>
+  tab_header(
+    title = "Projected Economic Situation by Farmer Segment",
+    subtitle = paste0(
+      "Survey-weighted medians (Q) under biofortified seed technology \u2014 ",
+      seed_label, ", ", subsidy_label
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers (N)",
+    income_sales = "Sales",
+    value_self_consumption = "Self-Consumption",
+    value_gross = "Gross Value",
+    cost_seeds = "Seeds",
+    cost_other = "Other Inputs",
+    income_net = "Net Income",
+    pct_positive = "% Positive"
+  ) |>
+  tab_spanner(
+    label = "Income Components (Q)",
+    columns = c(income_sales, value_self_consumption, value_gross)
+  ) |>
+  tab_spanner(
+    label = "Costs (Q)",
+    columns = c(cost_seeds, cost_other)
+  ) |>
+  fmt_number(
+    columns = n_farmers,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(income_sales, value_self_consumption, value_gross,
+                cost_seeds, cost_other, income_net),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = pct_positive,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = income_net, rows = income_net > 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Biofortified seed price applies the active subsidy regime.")
+  ) |>
+  tab_footnote(
+    footnote = "Self-consumption valued at purchase price proxy (210 Q/qq)",
+    locations = cells_column_labels(columns = value_self_consumption)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects (preserve audit trail dataframes)
+rm(svy_projected, tbl_projected_segment)
+```
+
+```{r}
+#| label: tbl-d2-comparison
+#| tbl-cap: "Economic Comparison: Current vs Biofortified Adoption"
+
+# =============================================================================
+# Table: Side-by-side Comparison Current vs Projected
+# =============================================================================
+
+# Survey design (auxiliary)
+svy_comparison <- df_projected_economics |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# Calculate comparison metrics
+tbl_comparison <- svy_comparison |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL),
+
+    # Current situation
+    net_current = survey_median(income_net_current, vartype = NULL),
+    pct_positive_current = survey_mean(has_positive_income, vartype = NULL) * 100,
+
+    # Projected situation
+    net_projected = survey_median(income_net_projected, vartype = NULL),
+    pct_positive_projected = survey_mean(has_positive_income_projected, vartype = NULL) * 100
+  ) |>
+  as_tibble() |>
+  mutate(
+    net_change = net_projected - net_current,
+    net_change_pct = (net_projected / net_current - 1) * 100,
+    pct_positive_change = pct_positive_projected - pct_positive_current
+  )
+
+export(
+  tbl_comparison,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_d2_comparison.rds"))
+)
+
+# Generate GT table
+tbl_comparison |>
+  gt() |>
+  tab_header(
+    title = "Economic Impact: Current vs Biofortified Seed",
+    subtitle = paste0(
+      "Net income comparison by farmer segment \u2014 ",
+      seed_label, ", ", subsidy_label,
+      " (survey-weighted medians)"
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    net_current = "Current",
+    net_projected = "Projected",
+    net_change = "Change (Q)",
+    net_change_pct = "Change (%)",
+    pct_positive_current = "Current",
+    pct_positive_projected = "Projected",
+    pct_positive_change = "Change"
+  ) |>
+  tab_spanner(
+    label = "Net Income (Q)",
+    columns = c(net_current, net_projected, net_change, net_change_pct)
+  ) |>
+  tab_spanner(
+    label = "% with Positive Income",
+    columns = c(pct_positive_current, pct_positive_projected, pct_positive_change)
+  ) |>
+  fmt_number(
+    columns = n_farmers,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(net_current, net_projected, net_change),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = net_change_pct,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(pct_positive_current, pct_positive_projected, pct_positive_change),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = net_change, rows = net_change > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = net_change, rows = net_change < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = pct_positive_change, rows = pct_positive_change > 0)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = c(net_change, net_change_pct))
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Impact calculated as projected minus current situation.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects (preserve audit trail dataframes)
+rm(svy_comparison, tbl_comparison)
+```
+
+---
+
+# Phase E: Subsidy Benefit Calculation
+
+Quantify the monetary value of the seed subsidy received by each farmer under the active regime. Two complementary measures are computed:
+
+| Measure | Formula | Interpretation |
+|---|---|---|
+| `subsidy_amount_absolute` | `(bio_cost_no_subsidy_per_mz - seed_cost_biofortified) \u00d7 land_wtcorn` | Absolute monetary value of the subsidy received, relative to the unsubsidized commercial reference price (`r bio_cost_no_subsidy_per_mz` Q/mz) |
+| `subsidy_reduction_cost` | `(seed_cost_biofortified - seed_cost_biofortified_current_regime) \u00d7 land_wtcorn` | Additional out-of-pocket cost the farmer absorbs when the subsidy is reduced relative to the current regime |
+| `newseed_subsidy` | `newseed_subsidy_per_mz \u00d7 land_wtcorn` | NewSeed's per-area direct financial commitment under the active regime, scaled by area planted |
+| `producer_absorption` | `subsidy_amount_absolute - newseed_subsidy` | Share of the absolute subsidy value covered by the local seed producer (intermediary) via improved producibility. Zero under the current regime |
+| `newseed_savings_vs_current` | `(newseed_subsidy_current - newseed_subsidy_active) \u00d7 land_wtcorn` | Reduction in NewSeed's per-farmer financial commitment when moving from the current regime to the active regime |
+
+Two identities hold by construction:
+
+1. **Absolute subsidy decomposition**: `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total per-farmer subsidy value is jointly funded by NewSeed (direct subsidy) and the local seed producer (improved producibility absorption). The farmer's out-of-pocket cost is **not** part of the subsidy by definition.
+2. **NewSeed savings reallocation**: `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. When NewSeed reduces its commitment, the freed amount is reallocated between the local producer (who absorbs part via improved producibility) and the farmer (who pays the rest out of pocket).
+
+Both identities are validated row-by-row in `subsidy_decomposition_check` and `newseed_delta_check`, exported to the parquet for downstream auditing. Both are expected to be zero up to floating-point precision.
+
+All measures are exported to the parquet so that downstream consumers can choose the formulation that best fits each visualization or summary. Under the **Current subsidy** regime, `producer_absorption`, `subsidy_reduction_cost`, and `newseed_savings_vs_current` are zero by construction.
+
+## E1. Compute Subsidy Benefit Variables
+
+Construct subsidy-related variables at farmer level. The biofortified price under the current regime (305 Q/mz) and the NewSeed per-area subsidy under the current regime (242 Q/mz) are hard-coded as references; both correspond to the values set in `subsidy_variants.yml` for the `current` variant.
+
+```{r}
+#| label: e1-compute-subsidy-benefits
+
+# =============================================================================
+# E1. Compute Subsidy Benefit Variables
+# =============================================================================
+
+# Biofortified price under the current subsidy regime (Q/mz). Reference
+# for computing subsidy_reduction_cost. Uniform across segments per the
+# configuration in subsidy_variants.yml (variant: current).
+bio_cost_current_regime_per_mz <- 305
+
+# NewSeed direct subsidy under the current regime (Q/mz). Reference for
+# computing the producer-absorption share of any subsidy reduction.
+# Equals bio_cost_no_subsidy_per_mz - bio_cost_current_regime_per_mz
+# (547 - 305 = 242) per the configuration in subsidy_variants.yml.
+newseed_subsidy_current_per_mz <- 242
+
+df_subsidy_benefits <- df_projected_economics |>
+  mutate(
+    # --- Absolute subsidy value (farmer perspective) ---
+    # Difference between the unsubsidized commercial reference price and
+    # the biofortified price effectively paid under the active regime,
+    # scaled by area planted.
+    cost_seeds_bio_no_subsidy = bio_cost_no_subsidy_per_mz * land_wtcorn,
+    subsidy_amount_absolute   = cost_seeds_bio_no_subsidy - cost_seeds_projected,
+
+    # --- Relative subsidy value (farmer perspective) ---
+    # Additional cost the farmer absorbs when the active regime reduces
+    # the subsidy below the current regime. Zero under the current
+    # regime by construction.
+    cost_seeds_bio_current_regime = bio_cost_current_regime_per_mz * land_wtcorn,
+    subsidy_reduction_cost        = cost_seeds_projected - cost_seeds_bio_current_regime,
+
+    # --- NewSeed direct subsidy under the active regime (per farmer) ---
+    # Per-area financial commitment made by NewSeed under the active
+    # regime, scaled by area planted.
+    newseed_subsidy = newseed_subsidy_per_mz * land_wtcorn,
+
+    # --- Producer absorption (per farmer) ---
+    # Share of the absolute subsidy value covered by the local seed
+    # producer (intermediary) via improved producibility. Derived as
+    # the residual of the absolute-subsidy identity:
+    #   subsidy_amount_absolute = newseed_subsidy + producer_absorption.
+    # Residual derivation, so the identity closes
+    # despite the rounding applied by NewSeed when publishing the
+    # farmer-facing biofortified prices (366 and 396 Q/mz under sub50
+    # and sub75 are integer roundings of the theoretical 365.5 and
+    # 395.5 implied by a strict fifty-fifty split of the cost
+    # reduction). Zero under the current regime by construction.
+    producer_absorption = subsidy_amount_absolute - newseed_subsidy,
+
+    # --- NewSeed savings relative to the current regime (per farmer) ---
+    # Reduction in NewSeed's per-farmer financial commitment when moving
+    # from the current regime to the active regime. Zero under the
+    # current regime by construction.
+    newseed_savings_vs_current =
+      (newseed_subsidy_current_per_mz - newseed_subsidy_per_mz) *
+      land_wtcorn,
+
+    # --- Decomposition consistency checks ---
+    # Identity 1 (absolute subsidy decomposition):
+    #   subsidy_amount_absolute = newseed_subsidy + producer_absorption.
+    # Closes by construction; stored as a sanity column for downstream
+    # validation. Expected to be zero up to floating-point precision.
+    subsidy_decomposition_check = subsidy_amount_absolute -
+      (newseed_subsidy + producer_absorption),
+
+    # Identity 2 (NewSeed savings reallocation):
+    # The reduction in NewSeed's commitment relative to the current
+    # regime is reallocated between the local producer (improved
+    # producibility) and the farmer (extra out-of-pocket cost):
+    #   newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost.
+    # Expected to be zero up to floating-point precision.
+    newseed_delta_check = newseed_savings_vs_current -
+      (producer_absorption + subsidy_reduction_cost),
+
+    # --- Identifier columns (constant across rows) ---
+    subsidy_scenario      = subsidy_label,
+    subsidy_suffix        = subsidy_suffix,
+    subsidy_reduction_pct = subsidy_reduction_pct
+  )
+```
+
+## E2. Subsidy Benefit Summary by Segment
+
+Survey-weighted summary of subsidy benefits across segments, including national totals.
+
+```{r}
+#| label: tbl-e2-subsidy-benefits-segment
+#| tbl-cap: "Subsidy Benefit by Farmer Segment"
+
+# =============================================================================
+# Table: Subsidy Benefit by Segment (survey-weighted)
+# =============================================================================
+
+# Survey design (auxiliary)
+svy_subsidy <- df_subsidy_benefits |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# Calculate subsidy statistics by segment.
+# survey_quantile() returns columns suffixed with _qNN; rename after
+# as_tibble() to obtain stable, explicit column names.
+tbl_subsidy_segment <- svy_subsidy |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL),
+
+    # Absolute subsidy value (Q/farmer)
+    abs_median = survey_median(subsidy_amount_absolute, vartype = NULL),
+    abs_quants = survey_quantile(
+      subsidy_amount_absolute,
+      quantiles = c(0.25, 0.75),
+      vartype = NULL
+    ),
+
+    # Reduction cost relative to current regime (Q/farmer)
+    red_median = survey_median(subsidy_reduction_cost, vartype = NULL),
+    red_quants = survey_quantile(
+      subsidy_reduction_cost,
+      quantiles = c(0.25, 0.75),
+      vartype = NULL
+    )
+  ) |>
+  as_tibble() |>
+  rename(
+    abs_p25 = abs_quants_q25,
+    abs_p75 = abs_quants_q75,
+    red_p25 = red_quants_q25,
+    red_p75 = red_quants_q75
+  ) |>
+  select(
+    segment_final, n_farmers,
+    abs_p25, abs_median, abs_p75,
+    red_p25, red_median, red_p75
+  )
+
+export(
+  tbl_subsidy_segment,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_e2_subsidy_benefits_segment.rds"))
+)
+
+# Generate GT table
+tbl_subsidy_segment |>
+  gt() |>
+  tab_header(
+    title = "Subsidy Benefit by Farmer Segment",
+    subtitle = paste0(
+      "Survey-weighted statistics (Q/farmer) \u2014 ",
+      seed_label, ", ", subsidy_label
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers     = "Farmers (N)",
+    abs_p25       = "P25",
+    abs_median    = "Median",
+    abs_p75       = "P75",
+    red_p25       = "P25",
+    red_median    = "Median",
+    red_p75       = "P75"
+  ) |>
+  tab_spanner(
+    label = "Absolute subsidy value (Q)",
+    columns = c(abs_p25, abs_median, abs_p75)
+  ) |>
+  tab_spanner(
+    label = "Reduction cost vs current (Q)",
+    columns = c(red_p25, red_median, red_p75)
+  ) |>
+  fmt_number(
+    columns = n_farmers,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(abs_median, abs_p25, abs_p75,
+                red_median, red_p25, red_p75),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_source_note(
+    source_note = md(
+      paste0(
+        "**Absolute value:** subsidy received relative to the unsubsidized reference price (",
+        bio_cost_no_subsidy_per_mz,
+        " Q/mz). **Reduction cost:** additional cost the farmer absorbs vs the current regime."
+      )
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects (preserve audit trail dataframes)
+rm(svy_subsidy, tbl_subsidy_segment)
+```
+
+```{r}
+#| label: tbl-e2-subsidy-national-totals
+#| tbl-cap: "National Subsidy Totals"
+
+# =============================================================================
+# Table: National Subsidy Totals (population-weighted aggregates)
+# =============================================================================
+
+# Calculate national totals using survey weights
+tbl_subsidy_national <- df_subsidy_benefits |>
+  summarise(
+    total_farmers          = sum(weight_calibrated),
+    total_land_mz          = sum(land_wtcorn * weight_calibrated),
+    total_subsidy_absolute = sum(subsidy_amount_absolute * weight_calibrated),
+    total_reduction_cost   = sum(subsidy_reduction_cost   * weight_calibrated),
+    total_seed_cost_paid   = sum(cost_seeds_projected     * weight_calibrated)
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  mutate(
+    metric_label = case_when(
+      metric == "total_farmers"          ~ "Total Farmers",
+      metric == "total_land_mz"          ~ "Total Land (mz)",
+      metric == "total_subsidy_absolute" ~ "Subsidy Value (Absolute)",
+      metric == "total_reduction_cost"   ~ "Reduction Cost vs Current Regime",
+      metric == "total_seed_cost_paid"   ~ "Total Seed Cost Paid by Farmers"
+    )
+  )
+
+export(
+  tbl_subsidy_national,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_e2_subsidy_national_totals.rds"))
+)
+
+tbl_subsidy_national |>
+  select(metric_label, value) |>
+  gt() |>
+  tab_header(
+    title = "National Subsidy Totals",
+    subtitle = paste0(
+      "Population-weighted aggregates \u2014 ",
+      seed_label, ", ", subsidy_label
+    )
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value        = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Farmers"),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} mz"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = !str_detect(metric_label, "^Total Farmers$|Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  tab_source_note(
+    source_note = md(
+      paste0(
+        "**Reference unsubsidized biofortified price:** ",
+        bio_cost_no_subsidy_per_mz,
+        " Q/mz. **Reference current-regime biofortified price:** ",
+        bio_cost_current_regime_per_mz,
+        " Q/mz."
+      )
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary table object (preserve audit trail dataframes)
+rm(tbl_subsidy_national)
+```
+
+## E3. Subsidy Cost Decomposition
+
+Decompose the absolute subsidy value received by the farmer into the two actors that fund it (NewSeed and the local seed producer), and report separately the farmer's extra out-of-pocket cost relative to the current regime, together with NewSeed's savings.
+
+```{r}
+#| label: tbl-e3-subsidy-decomposition
+#| tbl-cap: "Subsidy Cost Decomposition by Actor"
+
+# =============================================================================
+# Table: Subsidy Cost Decomposition (population-weighted aggregates)
+# =============================================================================
+
+tbl_subsidy_decomp <- df_subsidy_benefits |>
+  summarise(
+    total_land_mz         = sum(land_wtcorn               * weight_calibrated),
+    total_subsidy_value   = sum(subsidy_amount_absolute   * weight_calibrated),
+    total_newseed         = sum(newseed_subsidy           * weight_calibrated),
+    total_producer        = sum(producer_absorption       * weight_calibrated),
+    total_farmer_extra    = sum(subsidy_reduction_cost    * weight_calibrated),
+    total_newseed_savings = sum(newseed_savings_vs_current * weight_calibrated)
+  ) |>
+  mutate(
+    # Shares of the absolute subsidy value (sum to 100% by construction:
+    # subsidy_amount_absolute = newseed_subsidy + producer_absorption).
+    pct_newseed  = if_else(total_subsidy_value > 0,
+                           total_newseed  / total_subsidy_value * 100, 0),
+    pct_producer = if_else(total_subsidy_value > 0,
+                           total_producer / total_subsidy_value * 100, 0)
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  mutate(
+    metric_label = case_when(
+      metric == "total_land_mz"         ~ "Total Land (mz)",
+      metric == "total_subsidy_value"   ~ "Total Subsidy Value (absolute)",
+      metric == "total_newseed"         ~ "  NewSeed direct subsidy",
+      metric == "total_producer"        ~ "  Local seed producer absorption",
+      metric == "pct_newseed"           ~ "  NewSeed share of subsidy",
+      metric == "pct_producer"          ~ "  Producer share of subsidy",
+      metric == "total_farmer_extra"    ~ "Farmer extra cost vs current",
+      metric == "total_newseed_savings" ~ "NewSeed Savings vs Current Regime"
+    )
+  )
+
+export(
+  tbl_subsidy_decomp,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_e3_subsidy_decomposition.rds"))
+)
+
+tbl_subsidy_decomp |>
+  select(metric_label, value) |>
+  gt() |>
+  tab_header(
+    title = "Subsidy Cost Decomposition by Actor",
+    subtitle = paste0(
+      "Population-weighted aggregates \u2014 ",
+      seed_label, ", ", subsidy_label
+    )
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value        = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} mz"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "share"),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = !str_detect(metric_label, "Land|share"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      rows = str_detect(metric_label, "^Total|^NewSeed Savings|^Farmer extra")
+    )
+  ) |>
+  tab_source_note(
+    source_note = md(
+      "**Total Subsidy Value** is jointly funded by NewSeed (direct subsidy) and the local seed producer (improved producibility absorption); both shares sum to 100%. **Farmer extra cost** and **NewSeed Savings vs Current Regime** are reported separately: the farmer's out-of-pocket cost is not part of the subsidy by definition, and NewSeed's savings equal the producer absorption plus the farmer extra cost. All three are zero under the current regime by construction."
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary table object (preserve audit trail dataframes)
+rm(tbl_subsidy_decomp)
+```
+
+---
+
+# Phase F: Economic Impact Calculation
+
+Consolidate and summarize the economic impact of biofortified seed adoption. This phase calculates the difference between projected and current situations at individual farmer level, then aggregates for reporting.
+
+**Impact metrics:**
+
+| Metric | Formula | Interpretation |
+|--------|---------|----------------|
+| Income increment | `income_net_projected − income_net_current` | Direct monetary benefit/loss |
+| Production increment | `production_biofortified − total_production` | Physical output change |
+| Sales increment | `qty_sold_projected − qty_sold_qq` | Marketable surplus change |
+| Cost increment | `cost_total_projected − cost_total_current` | Change in total costs |
+
+**Classification:**
+- **Winners**: Farmers with positive income increment.
+- **Losers**: Farmers with negative income increment.
+- **Neutral**: Farmers with minimal change (\u00b150 Q threshold).
+
+## F1. Calculate Individual Impact Metrics
+
+Compute impact metrics for each farmer to enable detailed analysis of who benefits and who loses (in monetary terms) from biofortified adoption under the active subsidy regime.
+
+```{r}
+#| label: f1-calculate-impact-metrics
+
+# =============================================================================
+# F1. Calculate Individual Economic Impact Metrics
+# =============================================================================
+
+df_economic_impact <- df_subsidy_benefits |>
+  mutate(
+    # --- Income impact ---
+    income_increment = income_net_projected - income_net_current,
+    income_increment_pct = if_else(
+      income_net_current != 0,
+      (income_net_projected / income_net_current - 1) * 100,
+      NA_real_
+    ),
+
+    # --- Production impact ---
+    production_increment_pct = if_else(
+      total_production > 0,
+      (production_biofortified / total_production - 1) * 100,
+      0
+    ),
+
+    # --- Sales impact ---
+    sales_qty_increment = qty_sold_projected - qty_sold_qq,
+    sales_value_increment = income_sales_projected - income_sales,
+
+    # --- Cost impact ---
+    cost_seeds_increment = cost_seeds_projected - cost_seeds_current,
+    cost_total_increment = cost_total_projected - cost_total_current,
+
+    # --- Classification ---
+    impact_category = case_when(
+      income_increment > 50 ~ "Winner",
+      income_increment < -50 ~ "Loser",
+      TRUE ~ "Neutral"
+    ),
+
+    # --- Benefit source decomposition ---
+    # How much of the income change comes from each source?
+    benefit_from_sales = sales_value_increment,
+    benefit_from_self_consumption = value_self_consumption_projected - value_self_consumption,
+    benefit_from_seed_savings = -cost_seeds_increment,  # Negative cost = positive benefit
+
+    # Verify decomposition (should equal income_increment approximately)
+    benefit_check = benefit_from_sales + benefit_from_self_consumption + benefit_from_seed_savings
+  )
+```
+
+## F2. Impact Summary Tables
+
+Consolidate impact metrics for reporting and presentation.
+
+```{r}
+#| label: tbl-f2-impact-distribution
+#| tbl-cap: "Economic Impact Distribution by Farmer Segment"
+
+# =============================================================================
+# Table: Impact Distribution (Winners/Losers/Neutral)
+# =============================================================================
+
+# Survey design (auxiliary)
+svy_impact <- df_economic_impact |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# Calculate distribution by segment
+tbl_impact_dist <- svy_impact |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL),
+
+    # Impact categories
+    pct_winners = survey_mean(impact_category == "Winner", vartype = NULL) * 100,
+    pct_losers = survey_mean(impact_category == "Loser", vartype = NULL) * 100,
+    pct_neutral = survey_mean(impact_category == "Neutral", vartype = NULL) * 100,
+
+    # Income increment stats
+    mean_increment = survey_mean(income_increment, vartype = NULL),
+    median_increment = survey_median(income_increment, vartype = NULL)
+  ) |>
+  as_tibble()
+
+export(
+  tbl_impact_dist,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_f2_impact_distribution.rds"))
+)
+
+# Generate GT table
+tbl_impact_dist |>
+  gt() |>
+  tab_header(
+    title = "Economic Impact Distribution by Farmer Segment",
+    subtitle = paste0(
+      "Classification based on net income change \u2014 ",
+      seed_label, ", ", subsidy_label, " (\u00b150 Q threshold)"
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    pct_winners = "Winners",
+    pct_losers = "Losers",
+    pct_neutral = "Neutral",
+    mean_increment = "Mean",
+    median_increment = "Median"
+  ) |>
+  tab_spanner(
+    label = "Impact Category (%)",
+    columns = c(pct_winners, pct_losers, pct_neutral)
+  ) |>
+  tab_spanner(
+    label = "Income Increment (Q)",
+    columns = c(mean_increment, median_increment)
+  ) |>
+  fmt_number(
+    columns = n_farmers,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(pct_winners, pct_losers, pct_neutral),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(mean_increment, median_increment),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = pct_winners)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = pct_losers)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = mean_increment, rows = mean_increment > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = mean_increment, rows = mean_increment < 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Winners:** Income increment > 50 Q. **Losers:** Income increment < -50 Q. **Neutral:** Within \u00b150 Q.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects (preserve audit trail dataframes)
+rm(svy_impact, tbl_impact_dist)
+```
+
+```{r}
+#| label: tbl-f2-benefit-decomposition
+#| tbl-cap: "Decomposition of Economic Benefit by Source"
+
+# =============================================================================
+# Table: Benefit Source Decomposition
+# =============================================================================
+
+# Survey design (auxiliary)
+svy_impact <- df_economic_impact |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+
+# Calculate benefit decomposition
+tbl_decomposition <- svy_impact |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = NULL),
+
+    # Benefit sources
+    from_sales = survey_mean(benefit_from_sales, vartype = NULL),
+    from_self_consumption = survey_mean(benefit_from_self_consumption, vartype = NULL),
+    from_seed_savings = survey_mean(benefit_from_seed_savings, vartype = NULL),
+
+    # Total
+    total_benefit = survey_mean(income_increment, vartype = NULL)
+  ) |>
+  as_tibble()
+
+export(
+  tbl_decomposition,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_f2_benefit_decomposition.rds"))
+)
+
+# Generate GT table
+tbl_decomposition |>
+  gt() |>
+  tab_header(
+    title = "Decomposition of Economic Benefit by Source",
+    subtitle = paste0(
+      "Survey-weighted mean contribution to income change \u2014 ",
+      seed_label, ", ", subsidy_label, " (Q/farmer)"
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    from_sales = "Sales Change",
+    from_self_consumption = "Self-Consumption",
+    from_seed_savings = "Seed Savings",
+    total_benefit = "Total Benefit"
+  ) |>
+  tab_spanner(
+    label = "Benefit Source (Q)",
+    columns = c(from_sales, from_self_consumption, from_seed_savings)
+  ) |>
+  fmt_number(
+    columns = n_farmers,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(from_sales, from_self_consumption, from_seed_savings, total_benefit),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = from_sales, rows = from_sales > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = from_sales, rows = from_sales < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = from_seed_savings, rows = from_seed_savings > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = from_seed_savings, rows = from_seed_savings < 0)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = total_benefit)
+  ) |>
+  tab_source_note(
+    source_note = md("**Sales Change:** \u0394(qty_sold \u00d7 price_sale). **Seed Savings:** −(cost_bio − cost_conv). **Self-Consumption:** \u0394(qty_retained \u00d7 price_self_consumption); minimal change since household needs are fixed.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects (preserve audit trail dataframes)
+rm(svy_impact, tbl_decomposition)
+```
+
+```{r}
+#| label: tbl-f2-national-summary
+#| tbl-cap: "National Economic Impact Summary"
+
+# =============================================================================
+# Table: National Impact Summary
+# =============================================================================
+
+# Calculate national totals
+tbl_national <- df_economic_impact |>
+  summarise(
+    # Population
+    total_farmers = sum(weight_calibrated),
+
+    # Impact categories
+    n_winners = sum(weight_calibrated[impact_category == "Winner"]),
+    n_losers = sum(weight_calibrated[impact_category == "Loser"]),
+    n_neutral = sum(weight_calibrated[impact_category == "Neutral"]),
+
+    # Production
+    current_production = sum(total_production * weight_calibrated),
+    projected_production = sum(production_biofortified * weight_calibrated),
+    production_change = sum(production_increment * weight_calibrated),
+
+    # Income
+    current_net_income = sum(income_net_current * weight_calibrated),
+    projected_net_income = sum(income_net_projected * weight_calibrated),
+    total_income_impact = sum(income_increment * weight_calibrated),
+
+    # Costs
+    current_seed_costs = sum(cost_seeds_current * weight_calibrated),
+    projected_seed_costs = sum(cost_seeds_projected * weight_calibrated),
+    seed_cost_change = sum(cost_seeds_increment * weight_calibrated)
+  ) |>
+  pivot_longer(everything(), names_to = "metric", values_to = "value") |>
+  mutate(
+    category = case_when(
+      str_detect(metric, "farmers|winners|losers|neutral") ~ "Population",
+      str_detect(metric, "production") ~ "Production",
+      str_detect(metric, "income") ~ "Income",
+      str_detect(metric, "cost") ~ "Costs"
+    ),
+    metric_label = case_when(
+      metric == "total_farmers" ~ "Total Farmers",
+      metric == "n_winners" ~ "Winners (>50 Q gain)",
+      metric == "n_losers" ~ "Losers (>50 Q loss)",
+      metric == "n_neutral" ~ "Neutral (\u00b150 Q)",
+      metric == "current_production" ~ "Current Production",
+      metric == "projected_production" ~ "Projected Production",
+      metric == "production_change" ~ "Production Change",
+      metric == "current_net_income" ~ "Current Net Income",
+      metric == "projected_net_income" ~ "Projected Net Income",
+      metric == "total_income_impact" ~ "Total Income Impact",
+      metric == "current_seed_costs" ~ "Current Seed Costs",
+      metric == "projected_seed_costs" ~ "Projected Seed Costs",
+      metric == "seed_cost_change" ~ "Seed Cost Change"
+    ),
+    # Order within category
+    order = case_when(
+      metric == "total_farmers" ~ 1,
+      metric == "n_winners" ~ 2,
+      metric == "n_losers" ~ 3,
+      metric == "n_neutral" ~ 4,
+      metric == "current_production" ~ 1,
+      metric == "projected_production" ~ 2,
+      metric == "production_change" ~ 3,
+      metric == "current_net_income" ~ 1,
+      metric == "projected_net_income" ~ 2,
+      metric == "total_income_impact" ~ 3,
+      metric == "current_seed_costs" ~ 1,
+      metric == "projected_seed_costs" ~ 2,
+      metric == "seed_cost_change" ~ 3
+    )
+  ) |>
+  arrange(factor(category, levels = c("Population", "Production", "Income", "Costs")), order)
+
+export(
+  tbl_national,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_f2_national_summary.rds"))
+)
+
+# Generate GT table
+tbl_national |>
+  select(category, metric_label, value) |>
+  gt(groupname_col = "category") |>
+  tab_header(
+    title = "National Economic Impact Summary",
+    subtitle = paste0(
+      "Population-weighted aggregates \u2014 ",
+      seed_label, ", ", subsidy_label
+    )
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(category, "Population"),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(category, "Production"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} qq"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(category, "Income|Costs"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = str_detect(metric_label, "Total|Change|Impact"))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.weight = "bold"
+  )
+
+# Cleanup auxiliary table object (preserve audit trail dataframes)
+rm(tbl_national)
+```
+
+---
+
+# Phase G: Distribution Analysis
+
+Examine the distribution of economic impacts across the farmer population to understand variability and identify edge cases.
+
+## G1. Income Increment Distribution
+
+Compute distributional statistics of the per-farmer income increment by segment.
+
+```{r}
+#| label: g1-distribution-stats
+
+# =============================================================================
+# G1. Distribution Statistics by Segment
+# =============================================================================
+
+distribution_stats <- df_economic_impact |>
+  summarise(
+    n = n(),
+
+    # Central tendency
+    mean = mean(income_increment),
+    median = median(income_increment),
+    sd = sd(income_increment),
+
+    # Percentiles
+    p05 = quantile(income_increment, 0.05),
+    p25 = quantile(income_increment, 0.25),
+    p75 = quantile(income_increment, 0.75),
+    p95 = quantile(income_increment, 0.95),
+    iqr = p75 - p25,
+
+    # Extremes
+    min = min(income_increment),
+    max = max(income_increment),
+
+    # Outlier counts (beyond 1.5\u00d7IQR)
+    n_outliers_low = sum(income_increment < (p25 - 1.5 * iqr)),
+    n_outliers_high = sum(income_increment > (p75 + 1.5 * iqr)),
+
+    .by = segment_final
+  )
+```
+
+```{r}
+#| label: tbl-g1-distribution-summary
+#| tbl-cap: "Income Increment Distribution by Segment"
+
+# =============================================================================
+# Table: Distribution Summary
+# =============================================================================
+
+tbl_g1_distribution_summary <- distribution_stats |>
+  select(segment_final, n, mean, median, sd, p05, p25, p75, p95, min, max)
+
+export(
+  tbl_g1_distribution_summary,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_g1_distribution_summary.rds"))
+)
+
+tbl_g1_distribution_summary |>
+  gt() |>
+  tab_header(
+    title = "Income Increment Distribution by Segment",
+    subtitle = paste0(
+      "Statistical summary of economic impact \u2014 ",
+      seed_label, ", ", subsidy_label, " (Q/farmer)"
+    )
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n = "N",
+    mean = "Mean",
+    median = "Median",
+    sd = "Std Dev",
+    p05 = "P5",
+    p25 = "P25",
+    p75 = "P75",
+    p95 = "P95",
+    min = "Min",
+    max = "Max"
+  ) |>
+  tab_spanner(
+    label = "Central Tendency",
+    columns = c(mean, median)
+  ) |>
+  tab_spanner(
+    label = "Percentiles",
+    columns = c(p05, p25, p75, p95)
+  ) |>
+  tab_spanner(
+    label = "Extremes",
+    columns = c(min, max)
+  ) |>
+  fmt_number(
+    columns = c(n),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(mean, median, sd, p05, p25, p75, p95, min, max),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = median, rows = median > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = median, rows = median < 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**P5/P95:** 5th and 95th percentiles. Large spread indicates high variability in outcomes.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary table object (preserve audit trail dataframes)
+rm(tbl_g1_distribution_summary)
+```
+
+## G2. Edge Cases and Limitations
+
+Identify and document edge cases that may affect interpretation of results.
+
+```{r}
+#| label: tbl-g2-edge-cases
+#| tbl-cap: "Edge Cases and Limitations"
+
+# =============================================================================
+# Table: Edge Cases Summary
+# =============================================================================
+
+# Count edge cases
+edge_cases <- tibble(
+  case = c(
+    "Zero production farmers",
+    "Production-limited self-consumption",
+    "Extreme positive impact (>10,000 Q)",
+    "Extreme negative impact (<-10,000 Q)",
+    "Income sign change: negative \u2192 positive",
+    "Income sign change: positive \u2192 negative"
+  ),
+  count = c(
+    sum(df_economic_impact$total_production == 0),
+    sum(df_economic_impact$production_biofortified <
+          (df_economic_impact$qty_household_qq +
+             df_economic_impact$qty_animal_seed_qq),
+        na.rm = TRUE),
+    sum(df_economic_impact$income_increment > 10000),
+    sum(df_economic_impact$income_increment < -10000),
+    sum(df_economic_impact$income_net_current < 0 &
+          df_economic_impact$income_net_projected >= 0),
+    sum(df_economic_impact$income_net_current >= 0 &
+          df_economic_impact$income_net_projected < 0)
+  ),
+  weighted_n = c(
+    sum(df_economic_impact$weight_calibrated[df_economic_impact$total_production == 0]),
+    sum(df_economic_impact$weight_calibrated[df_economic_impact$production_biofortified < (df_economic_impact$qty_household_qq + df_economic_impact$qty_animal_seed_qq)], na.rm = TRUE),
+    sum(df_economic_impact$weight_calibrated[df_economic_impact$income_increment > 10000]),
+    sum(df_economic_impact$weight_calibrated[df_economic_impact$income_increment < -10000]),
+    sum(df_economic_impact$weight_calibrated[df_economic_impact$income_net_current < 0 & df_economic_impact$income_net_projected >= 0]),
+    sum(df_economic_impact$weight_calibrated[df_economic_impact$income_net_current >= 0 & df_economic_impact$income_net_projected < 0])
+  ),
+  implication = c(
+    "Excluded from impact calculation (no production to change)",
+    "Self-consumption capped at available production (High segment)",
+    "Large-scale farmers with high production gains",
+    "Large-scale farmers with high production losses or costs",
+    "Farmers transitioning to profitability with biofortified",
+    "Farmers losing profitability (primarily High segment)"
+  )
+) |>
+  mutate(
+    pct_of_total = weighted_n / sum(df_economic_impact$weight_calibrated) * 100
+  )
+
+export(
+  edge_cases,
+  here("01_data", "02_processed",
+       "web_resources", paste0(file_prefix, "_tbl_g2_edge_cases.rds"))
+)
+
+edge_cases |>
+  gt() |>
+  tab_header(
+    title = "Edge Cases and Limitations",
+    subtitle = "Identification of unusual cases for interpretation"
+  ) |>
+  cols_label(
+    case = "Edge Case",
+    count = "Records",
+    weighted_n = "Farmers (N)",
+    pct_of_total = "% of Total",
+    implication = "Implication"
+  ) |>
+  fmt_number(
+    columns = c(count, weighted_n),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = pct_of_total,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fff3e0"),
+    locations = cells_body(rows = pct_of_total > 1)
+  ) |>
+  tab_source_note(
+    source_note = md("**Note:** Edge cases with >1% of population highlighted. These may warrant additional scrutiny.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+---
+
+# Phase H: Save Output
+
+Export the final economic impact dataset for use in subsequent analyses and dashboard integration.
+
+```{r}
+#| label: h1-export-parquet
+
+# =============================================================================
+# H1. Export Final Economic Impact Dataset
+# =============================================================================
+
+# Select and order variables for export
+df_export <- df_economic_impact |>
+  select(
+    # === Identifiers ===
+    no_hogar, farmer_id, copy_id,
+
+    # === Geographic ===
+    departamento, region,
+
+    # === Weights ===
+    weight_calibrated,
+
+    # === Segment assignment ===
+    segment_final,
+
+    # === Farm characteristics ===
+    land_wtcorn, total_production, yield_wtcorn_qq,
+    farmer_age, farmer_male, farmer_ed,
+
+    # === Current allocation (normalized in Script 02_01) ===
+    qty_sold_qq, qty_household_qq, qty_animal_seed_qq,
+
+    # === Market position classification (Phase B) ===
+    qty_purchased_qq, qty_obtained_food_qq, has_food_record,
+    sale_share, purchase_share, net_position_qq,
+    market_position, price_self_consumption,
+
+    # === Current economics ===
+    revenue, income_sales, value_self_consumption, value_gross,
+    cost_seeds_current, cost_non_seed, cost_total_current,
+    income_net_current, has_positive_income,
+    is_seller,
+
+    # === Projected allocation ===
+    production_biofortified, production_increment,
+    qty_sold_projected, qty_household_projected, qty_animal_projected,
+    qty_retained_projected,
+
+    # === Projected economics ===
+    income_sales_projected, value_self_consumption_projected, value_gross_projected,
+    cost_seeds_projected, cost_non_seed_projected, cost_total_projected,
+    income_net_projected, has_positive_income_projected,
+
+    # === Subsidy variables ===
+    subsidy_scenario, subsidy_suffix, subsidy_reduction_pct,
+    cost_seeds_bio_no_subsidy, subsidy_amount_absolute,
+    cost_seeds_bio_current_regime, subsidy_reduction_cost,
+    newseed_subsidy, producer_absorption, newseed_savings_vs_current,
+    subsidy_decomposition_check, newseed_delta_check,
+
+    # === Impact metrics ===
+    income_increment, income_increment_pct,
+    production_increment_pct,
+    sales_qty_increment, sales_value_increment,
+    cost_seeds_increment, cost_total_increment,
+    impact_category,
+
+    # === Benefit decomposition ===
+    benefit_from_sales, benefit_from_self_consumption, benefit_from_seed_savings,
+
+    # === Parameters used ===
+    yield_change_factor, seed_cost_conventional, seed_cost_biofortified,
+    price_sale, price_purchase, price_shadow
+  )
+
+# Export to parquet
+write_parquet(
+  df_export,
+  here("01_data", "02_processed",
+       "transfer", paste0(file_prefix, "_farmers_economic_impact.parquet"))
+)
+```
+
+# Notes
+
+## Processing Summary
+
+This script calculates the economic impact of biofortified maize adoption for Guatemalan white maize farmers under a specific combination of seed variant and subsidy regime. Starting from segmented farmer data (Script 02_03), it projects changes in production, allocation, income, and costs under a biofortified seed adoption scenario, and quantifies the monetary value of the seed subsidy received by each farmer. The active configuration for this run is **`r seed_label`** with **`r subsidy_label`**.
+
+## Methodology
+
+### Projection Allocation Logic
+
+**Conservative approach** preserving individual farmer patterns:
+
+- **Self-consumption**: Fixed absolute (family needs do not increase with production).
+- **Animal feed/seed**: Fixed absolute (livestock needs constant).
+- **Sales**: Residual after consumption and losses.
+
+### Market Position Classification (Phase B)
+
+Each farmer household is classified as net seller, net buyer, or autarkic based on observed sale and purchase volumes of maize. The classification draws on the ENCOVI 2023 food consumption module (13A), where the per-record fields `p13a07a` (purchased) and `p13a11a` (obtained from sources other than purchase) allow reconstruction of the annual maize purchase volume per household. Tortillas, flour, and grain are standardized to maize grain equivalent using the INCAP weight conversion factors (0.52, 0.98, 1.00).
+
+A tolerance threshold of `epsilon = 5%` of total maize volume defines functional zero for sale and purchase shares, accommodating measurement error inherent in 15-day recall surveys. Mixed-quadrant households (positive sale and positive purchase) are resolved by the sign of their net market position (`qty_sold − qty_purchased`): functional sellers when net is positive, functional buyers when negative, autarkic when zero.
+
+The classification produces three categories that map to three valuation rules: net sellers value retained production at the foregone sale price, net buyers at the avoided purchase price, and autarkic households at the shadow price. Self-consumption (household and animal/seed combined) is valued at the market-position-specific price `price_self_consumption` rather than uniformly at the purchase price. The same valuation rule applies to both the current baseline (Phase C) and the projected biofortified scenario (Phase D), under the assumption that adoption does not alter the household's market position.
+
+### Price References (Phase A)
+
+Prices are computed from ENCOVI 2023 (MAGA-calibrated) and propagate through the script as scalars. The shadow price is derived as the simple average of sale and purchase prices.
+
+| Price | Source | Calculation |
+|-------|--------|-------------|
+| Sale price | ENCOVI median (sellers only) | `revenue / qty_sold_qq` |
+| Purchase price | Household valuation proxy | `value_household / qty_household_qq` |
+| Shadow price | Sale\u2013purchase midpoint | `(price_sale + price_purchase) / 2` |
+
+The sale price applies to net-seller households, the purchase price to net-buyer households, and the shadow price to autarkic households (no market participation).
+
+### Seed Costs and Yield Change Factors
+
+Seed prices (Q/mz) and yield change factors are populated from `seed_variants.yml` and `subsidy_variants.yml` via the orchestrator. The configuration in effect for this run is documented in tables A2 and A5.
+
+### Subsidy Benefit Quantification
+
+The monetary value of the subsidy is exported from three complementary perspectives:
+
+- **Absolute value (farmer perspective, `subsidy_amount_absolute`)**: difference between the unsubsidized commercial reference price (`r bio_cost_no_subsidy_per_mz` Q/mz) and the biofortified price effectively paid under the active regime, scaled by area planted. Captures the total subsidy benefit irrespective of regime.
+- **Relative value (farmer perspective, `subsidy_reduction_cost`)**: additional out-of-pocket cost the farmer absorbs under the active regime relative to the current regime (305 Q/mz biofortified). Captures the marginal cost of subsidy reduction for the farmer. Zero under the current regime by construction.
+- **NewSeed perspective (`newseed_subsidy`, `newseed_savings_vs_current`)**: per-farmer financial commitment by NewSeed under the active regime, and the corresponding savings relative to the current regime. NewSeed savings under the current regime are zero by construction.
+- **Local seed producer perspective (`producer_absorption`)**: share of the absolute subsidy value covered by the intermediary seed producer through improved producibility. Derived as the residual of the absolute-subsidy identity. Zero under the current regime by construction.
+
+Two identities hold by construction and are validated row-by-row:
+
+1. **Absolute subsidy decomposition**: `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total subsidy received by the farmer is jointly funded by NewSeed and the local producer; the farmer's out-of-pocket cost is not part of the subsidy.
+2. **NewSeed savings reallocation**: `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. The amount NewSeed stops contributing under the active regime is reallocated between the producer (improved producibility) and the farmer (extra out-of-pocket cost).
+
+The columns `subsidy_decomposition_check` and `newseed_delta_check` carry the residuals of the two identities (expected to be zero up to floating-point precision) for downstream auditing.
+
+The published farmer-facing biofortified prices (366 Q/mz under sub50, 396 Q/mz under sub75) are integer roundings of the theoretical 365.5 and 395.5 implied by a strict fifty-fifty split of the cost reduction. The implementation respects the published prices verbatim and derives `producer_absorption` as the residual, so both identities close on the prices farmers face.
+
+All measures are exported so downstream consumers can choose the formulation that best fits each visualization or summary.
+
+## Limitations
+
+1. **Price assumptions**: Uniform national prices applied; regional price variation not modeled.
+
+2. **Zero production farmers**: Farmers with zero production are excluded from impact calculations (no production to change).
+
+3. **Production-limited self-consumption**: Some farmers (primarily High segment) may have projected production below current consumption needs; self-consumption is capped at available production in these cases.
+
+4. **Fixed consumption assumption**: The model assumes household and animal consumption needs are fixed in absolute terms. In reality, some farmers might adjust consumption patterns based on production levels.
+
+5. **Seed variant assumption**: This script uses yield parameters for the `r seed_label` variant. Yield change factors are assumed uniform within each farmer segment. Actual field performance may vary by agroecological zone.
+
+6. **Subsidy regime assumption**: Seed prices reflect the **`r subsidy_label`** configuration. The reference unsubsidized biofortified price (`r bio_cost_no_subsidy_per_mz` Q/mz) is anchored to the refined commercial reference and may evolve with market conditions.
+
+7. **Food module coverage**: A small fraction of farmer households are absent from the ENCOVI food consumption module. For these cases the purchase volume is set to zero and the classification falls back on the `is_seller` flag (net seller if the household reports sales revenue, autarkic otherwise).
+
+8. **Source-of-obtained ambiguity**: The `p13a11a` field aggregates own production, gifts, and barter into a single category. For farmer households this is dominated by own production, but the conflation should be acknowledged when interpreting the obtained-volume column.
+
+9. **Recall annualization**: The 15-day food recall window is rescaled by a factor of 365 / 15 to align with the campaign-year horizon. The rescaling is uniform across households and does not affect classification (share-based criteria are scale-invariant), but does affect absolute purchase-volume comparisons.
+
+## Terminology
+
+The segment label `OPV/Criollo` identifies farmers planting open-pollinated or
+saved seed. Published outputs refer to this group as **non-hybrid**; the
+two terms denote the same segment.

@@ -1,0 +1,718 @@
+---
+title: "Prepare Nutrient Transfer Modeling Data"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script prepares the ENCOVI 2023 data for building nutrient transfer models that will predict nutrient intake profiles in SIVESNU 2018 children. The workflow includes:
+
+1. Load individual-level nutrient intake data from Module 1
+2. Select relevant predictor variables (demographic, socioeconomic, geographic, household)
+3. Evaluate predictor correlations to identify multicollinearity issues
+4. Identify and remove near-zero variance variables
+5. Apply Yeo-Johnson transformations to normalize continuous predictors
+6. Save prepared dataset and transformation objects for modeling scripts
+
+**Purpose**: Transfer models predict nutrient intake (iron, zinc, protein, amino acids, plant percentage and energy) in SIVESNU children based on demographic/socioeconomic profiles, enabling integration of nutrient data with anthropometric measurements.
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  car,                # Box-Cox/Yeo-Johnson analysis
+  gt,                 # Table formatting and presentation
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to keep namespace clean):
+#   missRanger    - missRanger() via impute_rf_parallel() for RF-based imputation
+#   ggcorrplot    - ggcorrplot() for correlation matrix visualization
+#   bestNormalize - yeojohnson() for variable normalization
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+ensure_output_dir(here("01_data", "02_processed", "models"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Variable Selection
+
+## A1. Load Nutrient Intake Data
+
+```{r}
+#| label: a1-load-data
+
+# Load individual nutrient intake data from Module 1
+df_raw <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_04_individual_nutritional_intake_complete.parquet")
+)
+```
+
+## A2. Select Predictor Variables
+
+Select relevant predictor variables and impute missing values for modeling.
+
+```{r}
+#| label: a2-select-variables
+
+# Select predictor variables and outcome nutrients
+df_selected <- df_raw |>
+  select(
+    # Survey design
+    upm, factor,
+    # Personal characteristics
+    parentesco, sexo, edad,
+    # Geographic characteristics
+    departamento, area,
+    # Household characteristics
+    miembros_hogar, grado_estudios_hogar, propiedad,
+    # Housing characteristics
+    tipo_vivienda, material_paredes, material_techo, material_piso, 
+    n_cuartos, n_dormitorios, cocina, tipo_sanitario,
+    # Basic services
+    fuente_agua, recoleccion_basura,
+    # Household assets
+    electricidad, televisor, telefonia_fija, telefonia_celular, computadora,
+    # Outcome nutrients (maize vs non-maize)
+    fe_individuo_dia_maiz, fe_individuo_dia_no_maiz,
+    zn_individuo_dia_maiz, zn_individuo_dia_no_maiz,
+    prot_individuo_dia_maiz, prot_individuo_dia_no_maiz,
+    prot_apro_individuo_dia_maiz, prot_apro_individuo_dia_no_maiz,
+    lys_individuo_dia_maiz, lys_individuo_dia_no_maiz,
+    trp_individuo_dia_maiz, trp_individuo_dia_no_maiz,
+    kcal_individuo_dia_maiz, kcal_individuo_dia_no_maiz,
+    porcentaje_vegetales
+  )
+```
+
+---
+
+# Phase B: Missing Value Treatment
+
+## B1. Diagnose Missing Values
+
+Model training requires a complete predictor matrix. The pipeline applies a Random Forest-based multivariate imputation procedure, which:
+
+- Preserves correlations between variables
+- Handles mixed data types (categorical + continuous)
+- Draws each imputed value from the predictive relationships in the data
+- Provides out-of-bag error estimates for imputation quality
+
+Implementation uses the `impute_rf_parallel()` utility function, which wraps `missRanger` with a multi-threaded `ranger` engine and returns imputed values alongside out-of-bag error estimates (OOBE for continuous variables, PFC for categorical).
+
+```{r}
+#| label: tbl-b1-diagnose-missing
+#| tbl-cap: "Missing value summary for predictor variables"
+
+# Calculate missing value statistics
+missing_summary <- df_selected |>
+  select(-c(upm, factor, starts_with("fe_"), starts_with("zn_"), 
+            starts_with("prot_"), starts_with("lys_"), starts_with("trp_"),
+            starts_with("kcal_"), porcentaje_vegetales)) |>
+  summarise(across(everything(), 
+                   list(n_missing = ~sum(is.na(.)),
+                        pct_missing = ~mean(is.na(.)) * 100))) |>
+  pivot_longer(everything(), 
+               names_to = c("variable", ".value"),
+               names_pattern = "(.+)_(n_missing|pct_missing)") |>
+  filter(n_missing > 0) |>
+  arrange(desc(pct_missing))
+
+# Export data for web resources
+export(
+  missing_summary,
+  here("01_data", "02_processed", "web_resources", "03_01_tbl_b1_diagnose_missing.rds")
+)
+
+# Format as GT table
+missing_summary |>
+  gt() |>
+  tab_header(
+    title = "Missing Values in Predictor Variables",
+    subtitle = "Variables requiring imputation before modeling"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_missing = "N Missing",
+    pct_missing = "% Missing"
+  ) |>
+  fmt_number(
+    columns = n_missing,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = pct_missing,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Clean auxiliary objects
+rm(missing_summary)
+```
+
+## B2. Random Forest Imputation
+
+```{r}
+#| label: tbl-b2-impute-missing
+#| tbl-cap: "Random Forest imputation quality metrics"
+
+# Separate predictors from outcomes for imputation
+predictors_to_impute <- df_selected |>
+  select(
+    parentesco, sexo, edad, departamento, area,
+    miembros_hogar, grado_estudios_hogar, propiedad,
+    tipo_vivienda, material_paredes, material_techo, material_piso,
+    n_cuartos, n_dormitorios, cocina, tipo_sanitario,
+    fuente_agua, recoleccion_basura, electricidad,
+    televisor, telefonia_fija, telefonia_celular, computadora
+  ) |>
+  # Convert ordered factors to regular factors for ranger compatibility
+  mutate(departamento = factor(departamento, ordered = FALSE)) |>
+  # Convert to data frame
+  as.data.frame()
+
+# --- Run Random Forest imputation ---
+set.seed(789)  # Azahar standard seed for reproducibility
+
+imputed_result <- impute_rf_parallel(
+  data = predictors_to_impute,
+  maxiter = 10,
+  ntree = 100,
+  verbose = FALSE
+)
+
+# Extract imputed data
+predictors_imputed <- imputed_result$ximp
+
+# Create quality metrics summary table
+# Report each metric only when a variable of that type required imputation
+n_continuous <- imputed_result$n_continuous
+n_categorical <- imputed_result$n_categorical
+
+imputation_quality <- tibble(
+  metric = c(
+    "OOBE (Continuous Variables)",
+    "PFC (Categorical Variables)",
+    "Number of Iterations",
+    "Trees per Iteration"
+  ),
+  value = c(
+    if (n_continuous > 0) imputed_result$OOBerror["OOBE"] else NA_real_,
+    if (n_categorical > 0) imputed_result$OOBerror["PFC"] else NA_real_,
+    10,
+    100
+  ),
+  interpretation = c(
+    if (n_continuous > 0) {
+      if_else(imputed_result$OOBerror["OOBE"] < 0.5, "Acceptable", "Review required")
+    } else {
+      "No continuous variables required imputation"
+    },
+    if (n_categorical > 0) {
+      if_else(imputed_result$OOBerror["PFC"] < 0.2, "Acceptable", "Review required")
+    } else {
+      "No categorical variables required imputation"
+    },
+    "Fixed parameter",
+    "Fixed parameter"
+  )
+)
+
+# Export data for web resources
+export(
+  imputation_quality,
+  here("01_data", "02_processed", "web_resources", "03_01_tbl_b2_impute_missing.rds")
+)
+
+imputation_quality |>
+  gt() |>
+  tab_header(
+    title = "Missing Value Imputation Quality Assessment",
+    subtitle = "Out-of-bag error estimates from Random Forest imputation"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value",
+    interpretation = "Quality Assessment"
+  ) |>
+  fmt_number(
+    columns = value,
+    decimals = 4
+  ) |>
+  sub_missing(
+    columns = value,
+    missing_text = "N/A"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Acceptable"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Review required"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D1ECF1"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "No continuous variables required imputation"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D1ECF1"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "No categorical variables required imputation"
+    )
+  ) |>
+  tab_footnote(
+    footnote = "OOBE: out-of-bag error across continuous variables, the square root of the variance-weighted mean of per-variable unexplained variance. Values < 0.5 indicate acceptable imputation quality. N/A when no continuous variables had missing values.",
+    locations = cells_body(columns = metric, rows = 1)
+  ) |>
+  tab_footnote(
+    footnote = "PFC: Proportion of Falsely Classified entries. Values < 0.2 indicate acceptable imputation quality for categorical variables. N/A when no categorical variables had missing values.",
+    locations = cells_body(columns = metric, rows = 2)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Clean auxiliary objects from quality summary (keep predictors_imputed
+# and imputed_result alive; they are consumed by B2b below).
+rm(imputation_quality, n_continuous, n_categorical)
+```
+
+## B2b. Completion of Residual Missing Values
+
+The Random Forest imputation engine can leave a residual `NaN` for a small subset of rows when the out-of-bag prediction collapses inside a terminal node with zero within-leaf variance. This affects continuous discrete-scale predictors.
+
+Downstream analyses (correlation, near-zero variance, modeling) operate on a complete predictor matrix, so residual missing values are completed with a variable-specific rule:
+
+- **Numeric / integer variables**: median of the observed values, which preserves the support of discrete-scale ordinal variables (e.g. years of schooling take values such as 1, 1.5, 2, 2.5, ...).
+- **Factor variables**: mode of the observed values.
+
+The count of values completed by each rule is reported in the table below.
+
+```{r}
+#| label: tbl-b2b-completion-summary
+#| tbl-cap: "Residual missing value completion after Random Forest imputation"
+
+# --- Identify residual missing values ---
+residual_summary <- predictors_imputed |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_completed") |>
+  filter(n_completed > 0) |>
+  mutate(
+    rule = vapply(
+      variable,
+      function(v) {
+        x <- predictors_imputed[[v]]
+        if (is.numeric(x)) "Median" else "Mode"
+      },
+      character(1)
+    )
+  ) |>
+  arrange(desc(n_completed))
+
+# --- Apply completion rules ---
+mode_value <- function(x) {
+  observed <- x[!is.na(x)]
+  tab <- table(observed)
+  names(tab)[which.max(tab)]
+}
+
+predictors_complete <- predictors_imputed |>
+  mutate(across(
+    where(is.numeric),
+    ~ if_else(is.na(.), median(., na.rm = TRUE), .)
+  )) |>
+  mutate(across(
+    where(is.factor),
+    ~ {
+      mv <- mode_value(.)
+      replace(., is.na(.), mv)
+    }
+  ))
+
+# --- Build summary with post-completion integrity row -----------------------
+n_residual_after <- sum(is.na(predictors_complete))
+
+completion_report <- residual_summary |>
+  bind_rows(
+    tibble(
+      variable    = "— Residual NAs after completion —",
+      n_completed = n_residual_after,
+      rule        = if_else(n_residual_after == 0L,
+                            "Integrity check: passed",
+                            "Integrity check: review required")
+    )
+  )
+
+# --- Export summary for web resources ---
+export(
+  completion_report,
+  here("01_data", "02_processed", "web_resources", "03_01_tbl_b2b_completion_summary.rds")
+)
+
+# --- Present summary as GT table ---
+completion_report |>
+  gt() |>
+  tab_header(
+    title = "Residual Missing Value Completion",
+    subtitle = "Values completed by variable-specific rule after RF imputation"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_completed = "N Completed",
+    rule = "Completion Rule"
+  ) |>
+  fmt_number(
+    columns = n_completed,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: passed"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: review required"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Combine complete predictors with outcomes and survey design
+df <- df_selected |>
+  select(upm, factor, starts_with("fe_"), starts_with("zn_"), 
+         starts_with("prot_"), starts_with("lys_"), starts_with("trp_"),
+         starts_with("kcal_"), porcentaje_vegetales) |>
+  bind_cols(predictors_complete)
+
+# Clean auxiliary objects
+rm(
+  predictors_to_impute, imputed_result,
+  predictors_imputed, predictors_complete,
+  residual_summary, completion_report, n_residual_after
+)
+```
+
+---
+
+# Phase C: Variable Quality Assessment
+
+## C1. Evaluate Predictor Correlation
+
+Assess correlation between predictor variables to identify potential multicollinearity issues.
+
+```{r}
+#| label: fig-c1-correlation-analysis
+#| fig-cap: "Correlation matrix of predictor variables"
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+  
+# Calculate correlation matrix for all predictors
+cor_matrix <- df |>
+  mutate(factor = as.integer(factor)) |>
+  uncount(factor) |>
+  transmute(across(
+    c(
+      parentesco, sexo, edad, departamento, area, miembros_hogar,
+      grado_estudios_hogar, propiedad, tipo_vivienda, material_paredes,
+      material_techo, material_piso, n_cuartos, n_dormitorios, cocina,
+      tipo_sanitario, fuente_agua, recoleccion_basura, electricidad,
+      televisor, telefonia_fija, telefonia_celular, computadora
+    ),
+    as.numeric
+  )) |>
+  cor() |>
+  round(1)
+
+# Export data for web resources
+export(
+  cor_matrix,
+  here("01_data", "02_processed", "web_resources", "03_01_fig_c1_correlation_analysis.rds")
+)
+
+cor_matrix |>
+  ggcorrplot::ggcorrplot(
+    hc.order = TRUE,
+    colors = c("#E46726", "white", "#6D9EC1"),
+    type = "lower",
+    lab = TRUE
+  )
+
+# Cleanup auxiliary objects
+rm(cor_matrix)
+```
+
+**Decision**: Remove `n_dormitorios` (number of bedrooms) due to high correlation with `n_cuartos` (number of rooms). The two variables carry redundant information (r > 0.8), and the models retain `n_cuartos`.
+
+## C2. Identify Near-Zero Variance Predictors
+
+Evaluate variables with near-zero variance that provide minimal information for modeling. Variables with extremely unbalanced distributions or very low variability should be removed to improve model stability.
+
+```{r}
+#| label: tbl-c2-near-zero-variance
+#| tbl-cap: "Near-zero variance analysis for predictor variables"
+
+# Analyze variance for all predictors (exclude survey design and outcomes)
+nzv_data <- df |>
+  select(-c(upm, factor, starts_with("fe_"), starts_with("zn_"),
+            starts_with("prot_"), starts_with("lys_"), starts_with("trp_"),
+            starts_with("kcal_"), porcentaje_vegetales))
+
+# Export data for web resources
+export(
+  nzv_data,
+  here("01_data", "02_processed", "web_resources", "03_01_tbl_c2_near_zero_variance.rds")
+)
+
+nzv_data |>
+  analyze_variance()
+
+# Cleanup auxiliary objects
+rm(nzv_data)
+```
+
+**Decision**: Remove `cocina` (kitchen type) and `telefonia_fija` (landline telephone) due to near-zero variance. Both variables show extremely unbalanced distributions (one category dominates >95% of observations), providing minimal predictive information while potentially causing model instability.
+
+---
+
+# Phase D: Variable Transformations
+
+Evaluate normality of continuous predictors and apply Yeo-Johnson transformation where needed. The transformation handles both positive and negative values.
+
+**Variables to evaluate:**
+- `miembros_hogar` (household members)
+- `n_cuartos` (number of rooms)
+
+## D1. Evaluate Yeo-Johnson
+
+```{r}
+#| label: fig-d1-evaluate-yj-miembros-hogar
+#| fig-cap: "Yeo-Johnson transformation profile for household members"
+
+# Export data for web resources
+export(
+  tibble(miembros_hogar = subset(df$miembros_hogar, !is.na(df$miembros_hogar))),
+  here("01_data", "02_processed", "web_resources", "03_01_fig_d1_evaluate_yj_miembros_hogar.rds")
+)
+
+# Evaluate optimal lambda for Yeo-Johnson transformation
+boxCox(
+  lm(subset(df$miembros_hogar, !is.na(df$miembros_hogar)) ~ 1),
+  main = "Household Members - Transformation Profile",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-d1-evaluate-yj-n-cuartos
+#| fig-cap: "Yeo-Johnson transformation profile for number of rooms"
+
+# Export data for web resources
+export(
+  tibble(n_cuartos = subset(df$n_cuartos, !is.na(df$n_cuartos))),
+  here("01_data", "02_processed", "web_resources", "03_01_fig_d1_evaluate_yj_n_cuartos.rds")
+)
+
+# Evaluate optimal lambda for Yeo-Johnson transformation
+boxCox(
+  lm(subset(df$n_cuartos, !is.na(df$n_cuartos)) ~ 1),
+  main = "Number of Rooms - Transformation Profile",
+  family = "yjPower"
+)
+```
+
+**Decision**: Both variables show optimal lambda values near 0 (indicating logarithmic-type transformation needed). Yeo-Johnson transformation automatically handles this, improving normality for modeling. 
+
+## D2. Apply Yeo-Johnson Transformations
+
+```{r}
+#| label: d2-apply-yj-transformation
+
+# Create Yeo-Johnson transformation objects
+yj_miembros_hogar <- bestNormalize::yeojohnson(df$miembros_hogar)
+yj_n_cuartos <- bestNormalize::yeojohnson(df$n_cuartos)
+```
+
+Verify transformation effectiveness by re-evaluating normality of transformed variables.
+
+```{r}
+#| label: fig-d2-verify-yj-miembros-hogar
+#| fig-cap: "Transformation profile for household members (post-transformation)"
+
+# Export data for web resources
+export(
+  tibble(miembros_hogar_yj = predict(yj_miembros_hogar)),
+  here("01_data", "02_processed", "web_resources", "03_01_fig_d2_verify_yj_miembros_hogar.rds")
+)
+
+# Verify transformation improved normality
+boxCox(
+  lm(predict(yj_miembros_hogar) ~ 1),
+  main = "Household Members - Post-Transformation",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-d2-verify-yj-n-cuartos
+#| fig-cap: "Transformation profile for number of rooms (post-transformation)"
+
+# Export data for web resources
+export(
+  tibble(n_cuartos_yj = predict(yj_n_cuartos)),
+  here("01_data", "02_processed", "web_resources", "03_01_fig_d2_verify_yj_n_cuartos.rds")
+)
+
+# Verify transformation improved normality
+boxCox(
+  lm(predict(yj_n_cuartos) ~ 1),
+  main = "Number of Rooms - Post-Transformation",
+  family = "yjPower"
+)
+```
+
+**Conclusion**: Post-transformation profiles show lambda ≈ 1.
+
+---
+
+# Phase E: Final Dataset and Export
+
+## E1. Apply All Transformations
+
+Apply all identified transformations (remove high-correlation variables, remove near-zero variance variables, apply Yeo-Johnson normalization) to create the final modeling-ready dataset.
+
+```{r}
+#| label: e1-create-final-dataset
+
+# Apply all transformations to create final modeling dataset
+df_modeling_ready <- df |>
+  # Remove high-correlation variable
+  select(-n_dormitorios) |>
+  # Remove near-zero variance variables
+  select(-c(cocina, telefonia_fija)) |>
+  # Apply Yeo-Johnson transformations to continuous variables
+  mutate(
+    miembros_hogar = predict(yj_miembros_hogar),
+    n_cuartos = predict(yj_n_cuartos)
+  )
+```
+
+## E2. Save Outputs
+
+Save the prepared dataset and transformation objects for use in subsequent modeling scripts.
+
+```{r}
+#| label: e2-save-outputs
+
+# Save Yeo-Johnson transformation objects for SIVESNU application
+export(
+  list(
+    yj_miembros_hogar = yj_miembros_hogar,
+    yj_n_cuartos = yj_n_cuartos
+  ),
+  here("01_data", "02_processed", 
+       "models", "03_01_yj_transforms.rds")
+)
+
+# Save modeling-ready dataset
+write_parquet(
+  df_modeling_ready,
+  here("01_data", "02_processed", 
+       "transfer", "03_01_modeling_ready_data.parquet")
+)
+
+# Clean auxiliary objects
+rm(yj_miembros_hogar, yj_n_cuartos)
+```
+
+# Notes
+
+## Variable Selection Decisions
+
+**Removed due to high correlation:**
+- `n_dormitorios` (bedrooms): Correlation r > 0.8 with `n_cuartos` (rooms), indicating redundancy
+
+**Removed due to near-zero variance:**
+- `cocina` (kitchen type): frequency ratio and percent unique reported in the C2 table
+- `telefonia_fija` (landline phone): frequency ratio and percent unique reported in the C2 table
+
+## Missing Value Imputation
+
+Random Forest imputation preserves variable correlations and handles mixed
+data types. Out-of-bag quality metrics are reported per run in the B2
+diagnostic table, with acceptability thresholds of 0.5 for OOBE (continuous
+variables) and 0.2 for PFC (categorical variables).
+
+## Yeo-Johnson Transformations
+
+Applied to normalize continuous predictors:
+- `miembros_hogar`: Pre-transformation λ ≈ 0 (log-type), post-transformation λ ≈ 1 (normalized)
+- `n_cuartos`: Pre-transformation λ ≈ 0 (log-type), post-transformation λ ≈ 1 (normalized)
+
+Transformation objects saved for consistent application to SIVESNU data during transfer modeling.

@@ -1,0 +1,581 @@
+---
+title: "Likely Adopters Model Application"
+subtitle: "Module 2: Economic Impact"
+format:
+  html:
+    toc-depth: 4
+---
+
+## Why Apply the Likely Adopters Model?
+
+The Likely Adopters model calibrated when [determining its parameters](02_05_determine_likely_adopters_model.qmd) encapsulates the structural relationship between farmer characteristics and adoption priority. Applying that model to a specific seed-by-subsidy combination produces a per-farmer dataset that ranks every farmer by expected adoption priority and assigns a continuous conversion curve governing how much of their white-maize land they would commit to biofortified seed at any national production coverage level.
+
+This per-farmer dataset is the entry point for the M06 scenario engine, which evaluates the cohort of adopters at any chosen national production coverage and aggregates economic and nutrient outcomes accordingly. The application stage is therefore the bridge between farmer-level scoring and population-level scenario evaluation.
+
+The figures presented here correspond to the **baseline scenario** combining the 2022 biofortified seed variety with the current subsidy regime. The calibrated model configuration is invariant across seed-by-subsidy combinations: the structural relationships between farmer characteristics and adoption priority depend on the joint distribution of farmer attributes, not on the magnitude of the projected economic benefit. The application stage runs the same calibrated configuration against each combination, producing a per-combination scored dataset.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by
+# framework 02_06 under the baseline variant: seed S22, subsidy sub00).
+
+tbl_b4_base_score_by_segment <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_tbl_b4_base_score_by_segment.rds"),
+  trust = TRUE
+)
+
+tbl_c3_risk_by_segment <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_tbl_c3_risk_by_segment.rds"),
+  trust = TRUE
+)
+
+fig_d3_continuous_curves <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_fig_d3_continuous_curves.rds"),
+  trust = TRUE
+)
+
+tbl_e1_cohort_medians <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_tbl_e1_cohort_medians.rds"),
+  trust = TRUE
+)
+
+fig_e2_correlation_matrix <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_fig_e2_correlation_matrix.rds"),
+  trust = TRUE
+)
+
+tbl_e3_specification <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_tbl_e3_specification.rds"),
+  trust = TRUE
+)
+
+tbl_e4_geographic <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_tbl_e4_geographic.rds"),
+  trust = TRUE
+)
+
+tbl_e5_score_by_dept <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_06_s22_sub00_tbl_e5_score_by_dept.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Segment color palette consistent with 05_03, 05_04 and 05_05
+segment_colors <- c(
+  "OPV/Criollo" = "#81C784",
+  "Low"         = "#2E7D32",
+  "Mid"         = "#FDD835",
+  "High"        = "#C62828"
+)
+
+# Profile color palette for continuous-adoption curves (S small, M medium,
+# L large), following the same green-amber-red severity gradient used in
+# the cohort tables.
+profile_colors <- c(
+  "S" = "#2E7D32",
+  "M" = "#E89923",
+  "L" = "#C0392B"
+)
+
+# Adoption category color palette for cohort tables (consistent with
+# tbl-b4-base-score-by-segment shading).
+category_colors <- c(
+  "Low"         = "#C8E6C9",
+  "OPV/Criollo" = "#DCEDC8",
+  "Mid"         = "#FFF9C4",
+  "High"        = "#FFCDD2"
+)
+```
+
+
+## Final Score Formulation
+
+The final adoption score of farmer `i` is the base composite score net of the risk-aversion penalty:
+
+$$
+\text{adoption\_score}(i) = \text{score}_{\text{base}}(i) - w_R \cdot \text{penalty}_R(i)
+$$
+
+where `w_R` is the calibrated risk weight and `penalty_R(i)` is the logistic risk-aversion penalty defined in Phase C. The base score `score_base(i)` is the weighted linear combination of the five component scores defined in Phase B.
+
+The application proceeds in four sequential stages:
+
+1. **Base composite score (Phase B)** — applies the five scoring components defined by the calibrated configuration: segment priority, economic benefit, improvement potential, scale potential, and farmer profile.
+2. **Risk-aversion penalty (Phase C)** — computes an additive penalty reflecting structural reluctance based on four drivers (baseline yield, income-increment ratio, land entry size, projected income loss), combined through a logistic transformation.
+3. **Ranking and continuous adoption (Phase D)** — ranks farmers by the final score, derives each farmer's entry production coverage point `p_entry` into the ranking, and prepares the per-farmer variables consumed by the M06 scenario engine through profile-specific sigmoid curves.
+4. **Cohort and validation diagnostics (Phase E)** — reports the most informative downstream-facing diagnostics: cohort profile at five production coverage points, component score correlation matrix, calibrated specification summary, geographic distribution of priority adopters, and score distribution by department.
+
+Phase A loads the per-farmer inputs — the [economic impact data](02_04_calculate_economic_impact.qmd), the [segmentation data](02_03_farmer_segmentation.qmd), and the [calibrated model configuration](02_05_determine_likely_adopters_model.qmd) — joins them on the household and farmer identifier, and derives the per-farmer entry-size profile assignment (small, medium, large) that governs the scale-potential scoring component and the structural risk driver.
+
+
+## Phase B: Base Composite Score
+
+The base composite score is the weighted linear combination of five components, each scored on a `[0, 100]` scale:
+
+- **Segment Priority** — cardinal points per segment under the calibrated segment-priority scheme.
+- **Economic Benefit** — percentile-based score over `income_increment`, mapping farmers with higher projected economic gain to higher scores.
+- **Improvement Potential** — percentile-based score over `exp_total_per_mz_annual` (inverse direction: lower per-area input expenditure indicates higher potential for productivity gains).
+- **Scale Potential** — percentile-based score over `land_entry_size` (the per-farmer land commitment at the moment of entry into the ranking, equal to `land_wtcorn × entry_coef` where `entry_coef` depends on profile).
+- **Farmer Profile (Age)** — three-axis parameterisation over `farmer_age` governed by `peak_center`, `peak_width`, and a profile shape, capturing the empirical observation that adoption propensity peaks in the productive-age range and declines towards both extremes.
+
+The component weights are read from the calibrated model configuration. The full specification of all five components — variables, weights, and heuristic parameters — is reported in Phase E3 below.
+
+
+### Base Score Distribution by Segment
+
+The base score distribution is read against the calibrated segment-priority ordering, before the risk-aversion correction is applied. The selected segment scheme assigns Low = 100, High = 85, Mid = 70 and OPV/Criollo = 45, so the expected ordering is **Low > High > Mid > OPV/Criollo**, with OPV/Criollo the non-hybrid segment.
+
+The segment component carries a weight of 0.6 out of 1, which is why the composite base score follows the same ordering: mean scores of 88.9, 66.9, 65.2 and 56.0 respectively. The non-hybrid segment scoring last on adoption priority is consistent with the calibration anchors: these farmers hold the largest share of land and the largest yield increase, and the market composition data place their entry late in the coverage path.
+
+```{r}
+#| label: tbl-b4-base-score-by-segment
+#| tbl-cap: "Base Composite Score Distribution by Segment"
+
+tbl_b4_base_score_by_segment |>
+  gt() |>
+  tab_header(
+    title    = "Base composite score distribution by segment",
+    subtitle = "Pre-risk score. Expected ordering: Low > High > Mid > OPV/Criollo"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers     = "N",
+    score_mean    = "Mean",
+    score_sd      = "SD",
+    score_p25     = "P25",
+    score_median  = "Median",
+    score_p75     = "P75"
+  ) |>
+  fmt_number(
+    columns  = c(score_mean, score_sd, score_p25, score_median, score_p75),
+    decimals = 1
+  ) |>
+  tab_style(
+    style    = cell_fill(color = category_colors[["Low"]]),
+    locations = cells_body(rows = segment_final == "Low")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = category_colors[["OPV/Criollo"]]),
+    locations = cells_body(rows = segment_final == "OPV/Criollo")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = category_colors[["Mid"]]),
+    locations = cells_body(rows = segment_final == "Mid")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = category_colors[["High"]]),
+    locations = cells_body(rows = segment_final == "High")
+  ) |>
+  tab_options(
+    table.font.size            = px(12),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Phase C: Risk-Aversion Penalty
+
+The risk-aversion penalty discounts the base composite score of each farmer by an explicit measure of vulnerability to crop loss. Four drivers contribute to the penalty:
+
+- `driver_yield` — captures the per-farmer variability of expected yield against the departmental reference.
+- `driver_ratio` — captures the marginal weight of the projected income increment relative to a baseline income proxy.
+- `driver_land` — captures the per-farmer land commitment (with smaller plots interpreted as carrying greater relative risk from a single-season loss).
+- `driver_loss` — captures the structural disincentive associated with a projected negative income increment.
+
+The four drivers are linearly combined with the calibrated coefficients `alpha_yield`, `alpha_ratio`, `alpha_land` (sharing the unit weight budget set during calibration) and the structural coefficient `alpha_loss = 1.0`. The combined driver is transformed through a logistic function with slope `β` bounded in `[0, 100]`, and the penalty is subtracted from the base score weighted by the calibrated `w_R`:
+
+$$
+\text{penalty}_R(i) = \frac{100}{1 + \exp\bigl(-\beta \cdot z_{\text{combo}}(i)\bigr)}
+\quad,\quad
+\text{adoption\_score}(i) = \text{score}_{\text{base}}(i) - w_R \cdot \text{penalty}_R(i)
+$$
+
+The driver representation is selected from the calibrated variant held in the model configuration: either departmental z-scores (variant Z) or absolute values normalised through a P1–P99 weighted scaling (variant A). Only the calibrated variant is computed at application time, keeping the per-farmer dataset compact.
+
+::: {.callout-note}
+### Structural Loss Coefficient
+The coefficient `alpha_loss = 1.0` is held fixed by design across all configurations: it reflects the structural role of the projected-loss driver as a deterministic disincentive rather than a calibrated component. The remaining three coefficients share a unit weight budget calibrated against the empirical anchor set.
+:::
+
+
+### Risk Penalty Distribution by Segment
+
+The penalty distribution is read against the qualitative behaviour the calibrated risk model is built to produce: a higher penalty among High-segment farmers, who commit more land and can face a negative income increment, than among Low-segment farmers. The means run 62.0 for High, 47.6 for OPV/Criollo, 44.3 for Mid and 40.0 for Low, which follows that ordering.
+
+```{r}
+#| label: tbl-c3-risk-by-segment
+#| tbl-cap: "Risk Penalty Distribution by Segment"
+
+tbl_c3_risk_by_segment |>
+  gt() |>
+  tab_header(
+    title    = "Risk penalty distribution by segment (2022 seed)",
+    subtitle = "Logistic penalty under the calibrated driver variant and risk weight"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers     = "N",
+    pen_mean      = "Mean",
+    pen_sd        = "SD",
+    pen_p25       = "P25",
+    pen_median    = "Median",
+    pen_p75       = "P75"
+  ) |>
+  fmt_number(
+    columns  = c(pen_mean, pen_sd, pen_p25, pen_median, pen_p75),
+    decimals = 1
+  ) |>
+  tab_options(
+    table.font.size            = px(12),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Phase D: Ranking and Continuous Adoption
+
+This phase ranks farmers by the final adoption score, derives each farmer's entry production coverage point into the ranking, and prepares the per-farmer variables consumed by the M06 scenario engine.
+
+**Entry production coverage point.** Farmers are sorted by `adoption_score` descending. The basal weight of each farmer is the product of total production and survey-calibrated weight; the cumulative basal weight divided by the universe total defines the entry production coverage point `p_entry` of each farmer, interpreted as the national production coverage level at which the farmer joins the ranking. By construction, `p_entry` ranges from 0 (top-ranked farmer) to just below 1 (last-ranked farmer with positive basal weight).
+
+**Adoption category.** A presentation label is assigned for dashboard and report use based on the final score: **A: Priority** (score ≥ 80), **B: High Potential** (60 ≤ score < 80), **C: Moderate** (40 ≤ score < 60), **D: Low** (20 ≤ score < 40), and **E: Not Recommended** (score < 20). The category is a display label only; downstream economic computations operate on the continuous score, not on the category.
+
+**Continuous adoption curve.** The per-farmer conversion ratio at national production coverage `p` follows a profile-specific sigmoid anchored at the farmer's entry point:
+
+$$
+r_i(p) = \text{sigmoid\_curve}(p,\; p_{\text{entry},i},\; \text{floor}_{\text{profile}_i},\; k_{\text{profile}_i})
+$$
+
+where `floor_profile` is the conversion ratio achieved at the moment of entry and `k_profile` governs the rate at which the ratio approaches 1 as `p` advances. The figure below displays the curve shape for each profile under the calibrated parameters, evaluated for a representative entry point at `p_entry = 0`.
+
+```{r}
+#| label: fig-d3-continuous-curves
+#| fig-cap: "Calibrated continuous-adoption curves by profile"
+#| fig-alt: >
+#|   Line chart with national production coverage (percent) on the x-axis and
+#|   the per-farmer conversion ratio on the y-axis, evaluated from a reference
+#|   entry point of zero. Three curves, one per behavioural profile, show
+#|   different adoption paces: profile S rises almost immediately to near-full
+#|   conversion, profile M follows a sigmoid that saturates around mid-range
+#|   coverage, and profile L accumulates gradually and reaches saturation only
+#|   at high coverage.
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot(fig_d3_continuous_curves, aes(x = p * 100, y = r, color = profile)) +
+  geom_line(linewidth = 1.1) +
+  scale_color_manual(values = profile_colors) +
+  labs(
+    title    = "Calibrated continuous-adoption curves by profile (2022 seed)",
+    subtitle = "Reference entry point p_entry = 0; floor and steepness from model configuration",
+    x        = "National production coverage (%)",
+    y        = "Conversion ratio r_i(p)",
+    color    = "Profile"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12),
+    plot.subtitle   = element_text(size = 10, color = "#7B8B99"),
+    legend.position = "bottom"
+  )
+```
+
+::: {.callout-note}
+### Profile Differentiation in Adoption Pace
+The three profile curves reflect the qualitative behavior calibrated against the empirical land trajectory: profile S (small) approaches near-full conversion almost immediately upon entry, profile M (medium) follows a sigmoid that saturates around mid-range production coverage levels, and profile L (large) accumulates gradually and reaches saturation only at high national production coverage. The shapes are entirely determined by the calibrated parameters; no per-farmer free parameters are introduced at the application stage.
+:::
+
+
+## Phase E: Cohort and Validation Diagnostics
+
+This phase reports the most informative downstream-facing diagnostics. The cohort profile at five representative production coverage points provides a direct view of how the scoring engine populates the adopting cohort as national production coverage advances; the component correlation matrix verifies non-redundancy of the five scoring components; the calibrated specification summary reproduces the parameter set actually applied; and the geographic and per-department distributions characterise the spatial spread of priority adopters.
+
+
+### Cohort Profile at Five Production Coverage Points
+
+For each national production coverage level `p`, the cohort is defined as the set of farmers whose entry production coverage is at or below `p`. Each cohort member contributes a per-farmer conversion ratio `r_i(p)` evaluated through the calibrated continuous-adoption curve; biofortified land and biofortified production are scaled by `r_i(p)`. Income variables (current, projected, and increment) are reported as survey-weighted medians with interquartile range across the cohort, weighted by `weight_calibrated × r_i(p)`. All monetary values are in Guatemalan Quetzales (Q).
+
+```{r}
+#| label: tbl-e1-cohort-medians
+#| tbl-cap: "Cohort Characteristics at Five Production Coverage Points (Medians)"
+
+tbl_e1_cohort_medians |>
+  mutate(
+    segment_label        = factor(segment,
+                                  levels = c("OPV/Criollo", "Low", "Mid", "High",
+                                             "Overall")),
+    metric_total         = formatC(n_farmers, big.mark = ",", format = "d"),
+    metric_pct_land      = sprintf("%.2f%%", pct_land),
+    metric_land          = land_display,
+    metric_production    = production_display,
+    metric_inc           = income_increment_display,
+    metric_net_current   = income_net_current_display,
+    metric_net_projected = income_net_projected_display,
+    p_label              = paste0(formatC(p_point * 100, format = "d"), "%")
+  ) |>
+  select(p_point, p_label, segment_label,
+         metric_total, metric_pct_land,
+         metric_land, metric_production,
+         metric_inc, metric_net_current, metric_net_projected) |>
+  pivot_longer(
+    cols      = starts_with("metric_"),
+    names_to  = "metric_key",
+    values_to = "metric_value"
+  ) |>
+  mutate(
+    metric_label = recode(metric_key,
+      metric_total         = "Total Farmers",
+      metric_pct_land      = "% Land",
+      metric_land          = "Land (mz) [Median, IQR]",
+      metric_production    = "Production (qq) [Median, IQR]",
+      metric_inc           = "Net income increment (Q) [Median, IQR]",
+      metric_net_current   = "Net income — current (Q) [Median, IQR]",
+      metric_net_projected = "Net income — projected (Q) [Median, IQR]"
+    ),
+    metric_label = factor(metric_label, levels = c(
+      "Total Farmers",
+      "% Land",
+      "Land (mz) [Median, IQR]",
+      "Production (qq) [Median, IQR]",
+      "Net income — current (Q) [Median, IQR]",
+      "Net income — projected (Q) [Median, IQR]",
+      "Net income increment (Q) [Median, IQR]"
+    ))
+  ) |>
+  select(p_point, p_label, segment_label, metric_label, metric_value) |>
+  pivot_wider(
+    names_from  = segment_label,
+    values_from = metric_value
+  ) |>
+  arrange(p_point, metric_label) |>
+  select(p_label, metric_label, `OPV/Criollo`, Low, Mid, High, Overall) |>
+  gt(groupname_col = "p_label") |>
+  tab_header(
+    title    = "Cohort characteristics at five production coverage points (2022 seed)",
+    subtitle = "Survey-weighted medians [P25, P75] of the adopter cohort, disaggregated by segment. All monetary values in Quetzales (Q)."
+  ) |>
+  cols_label(
+    metric_label  = "",
+    `OPV/Criollo` = "OPV/Criollo",
+    Low           = "Low",
+    Mid           = "Mid",
+    High          = "High",
+    Overall       = "Overall"
+  ) |>
+  tab_style(
+    style    = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style    = cell_text(weight = "bold", style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_style(
+    style    = list(cell_text(weight = "bold"),
+                    cell_fill(color = "#F5F5F5")),
+    locations = cells_body(columns = Overall)
+  ) |>
+  tab_options(
+    table.font.size            = px(11),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size    = px(11)
+  )
+```
+
+
+### Component Score Correlation Matrix
+
+The five component scores should capture distinct dimensions of farmer characteristics. The correlation matrix verifies component independence: low pairwise correlations indicate non-redundant signals, while high correlations would suggest that two components carry overlapping information and the composite weighting is double-counting.
+
+```{r}
+#| label: fig-e2-correlation-matrix
+#| fig-cap: "Correlation Matrix of Component Scores"
+#| fig-alt: >
+#|   Correlation heatmap of the five scoring components arranged on both axes,
+#|   with each tile labelled by its Pearson correlation and shaded on a
+#|   diverging scale from red for negative through white at zero to green for
+#|   positive. Apart from the diagonal, off-diagonal tiles are pale with
+#|   near-zero values, indicating the components carry largely non-redundant,
+#|   independent signals.
+#| fig-width: 6
+#| fig-height: 5
+
+ggplot(fig_e2_correlation_matrix, aes(x = var1, y = var2, fill = cor)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", cor)), color = "black", size = 4) +
+  scale_fill_gradient2(
+    low      = "#C62828",
+    mid      = "white",
+    high     = "#2E7D32",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Correlation"
+  ) +
+  labs(
+    title    = "Component score correlation matrix (2022 seed)",
+    subtitle = "Pearson correlation across the five scoring components",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title  = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid  = element_blank()
+  )
+```
+
+
+### Calibrated Model Specification
+
+The applied model specification is summarised below, reading directly from the model configuration artefact produced by 05_05. This table is the auditable counterpart of the determination summary produced at calibration time.
+
+```{r}
+#| label: tbl-e3-specification
+#| tbl-cap: "Applied Likely Adopters Model Specification"
+
+tbl_e3_specification |>
+  gt(groupname_col = "block") |>
+  tab_header(
+    title    = "Applied Likely Adopters model specification (2022 seed)",
+    subtitle = "Parameters read from the calibration artefact produced by 05_05"
+  ) |>
+  cols_label(
+    parameter = "Parameter",
+    value     = "Value"
+  ) |>
+  tab_style(
+    style    = cell_text(weight = "bold", style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_options(
+    table.font.size            = px(11),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Geographic Distribution of Priority Adopters
+
+The geographic distribution reports the share of priority adopters (categories A and B) by department, weighted by `weight_calibrated`. The expanded farmer counts use survey weights to represent the national population.
+
+```{r}
+#| label: tbl-e4-geographic
+#| tbl-cap: "Geographic Distribution of Priority Adopters (Categories A and B)"
+
+tbl_e4_geographic |>
+  gt() |>
+  tab_header(
+    title    = "Geographic distribution of priority adopters (2022 seed)",
+    subtitle = "Survey-weighted counts of farmers in categories A and B"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_total      = "Total farmers (weighted)",
+    n_priority   = "Priority farmers (weighted)",
+    pct_priority = "% Priority within dept.",
+    pct_national = "% Share of national priority"
+  ) |>
+  fmt_number(columns = c(n_total, n_priority),
+             decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = c(pct_priority, pct_national), decimals = 2) |>
+  tab_options(
+    table.font.size            = px(11),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Score Distribution by Department
+
+The departmental score distribution reports the survey-weighted distribution of the final adoption score across departments. The percentile summary surfaces geographic heterogeneity in adoption potential beyond what the priority-category summary alone reveals.
+
+```{r}
+#| label: tbl-e5-score-by-dept
+#| tbl-cap: "Final Adoption Score Distribution by Department"
+
+tbl_e5_score_by_dept |>
+  gt() |>
+  tab_header(
+    title    = "Final adoption score distribution by department (2022 seed)",
+    subtitle = "Survey-weighted distribution of the final adoption score"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers    = "Farmers (weighted)",
+    score_mean   = "Mean",
+    score_p25    = "P25",
+    score_median = "Median",
+    score_p75    = "P75"
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = c(score_mean, score_p25, score_median, score_p75),
+             decimals = 1) |>
+  tab_options(
+    table.font.size            = px(11),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Summary
+
+### From Per-Farmer Score to Scenario Engine
+
+The application stage converts the calibrated Likely Adopters configuration into a per-farmer dataset that the M06 scenario engine consumes directly. Three artefacts are produced and propagated downstream:
+
+1. **Per-farmer adoption score** — final value combining the base composite score with the risk-aversion penalty, used to rank farmers from most to least likely adopter.
+2. **Entry production coverage point** — cumulative basal weight divided by the universe total, defining at which national production coverage each farmer joins the ranking.
+3. **Profile assignment and conversion curve parameters** — small, medium, or large profile per farmer, each with its calibrated floor and steepness governing the per-farmer conversion ratio at any chosen national production coverage level.
+
+### Invariance Across Seed-by-Subsidy Combinations
+
+The calibrated model configuration is structurally invariant across the nine seed-by-subsidy combinations produced by the [economic impact calculation](02_04_calculate_economic_impact.qmd). The application script runs the same calibrated configuration against each combination, producing a per-combination scored dataset that preserves the relative ranking of farmers while reflecting the magnitude of the projected economic benefit in the underlying `income_increment` variable.
+
+### What the Diagnostics Show
+
+The diagnostics in the final section report the applied model against its expected qualitative behaviour. The base score ordering recovers the calibrated segment scheme, Low > High > Mid > OPV/Criollo. The risk penalty is highest in the High segment, at a mean of 62.0 against 40.0 in Low, which matches the structural reluctance the driver is built to represent. The component score correlations stay modest enough to keep the five components non-redundant. The cohort profile at five production coverage points reproduces the anchor pattern of the Semilla Nueva market composition matrix used during calibration: at 10% national coverage the cohort is drawn mostly from the Low and High segments, and the non-hybrid segment enters later, reaching 87.1% of biofortified land only at full coverage.

@@ -1,0 +1,1243 @@
+---
+title: "Height Transfer Model"
+subtitle: "Module 5: Meta-analysis"
+---
+
+## Why a Height Transfer Model?
+
+The Meta-analysis (Gunaratna) pathway requires predicted height for ENCOVI
+2023 children to calculate individual-level impacts of biofortified maize on
+stunting. Since ENCOVI does not include anthropometric measurements, we train
+a predictive model on SIVESNU 2018 — which contains direct height data — and
+apply it across surveys using the shared set of socioeconomic predictors
+identified when
+[preparing the SIVESNU height data](05_01_prepare_sivesnu_height_data.qmd).
+
+We use a Generalized Additive Model (GAM) because the age-height relationship
+in children under 5 is inherently non-linear: growth velocity is highest in
+infancy and decelerates progressively. GAMs capture this curvilinear growth
+trajectory through smooth terms while retaining parametric estimation for
+categorical predictors. The Gaussian family is appropriate because height
+conditional on age and covariates is approximately normally distributed.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  mgcv,               # Required for gam() method dispatch (geom_smooth, gratia::draw)
+  gratia,             # GAM partial effects visualization (fig-e2)
+  ggpubr,             # ggarrange for 2x2 diagnostic grid (fig-e1)
+  patchwork,          # Combining plots (fig-a3, fig-c3)
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file (single source of truth)
+source(here("..", "02_code", "00_functions", "00_functions.R"))
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Web resources for visualizations (exported by framework 05_02)
+tbl_a1_data_overview <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_a1_data_overview.rds"),
+  trust = TRUE
+)
+
+tbl_a2_predictor_types <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_a2_predictor_types.rds"),
+  trust = TRUE
+)
+
+fig_a3_outcome_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_fig_a3_outcome_distribution.rds"),
+  trust = TRUE
+)
+
+tbl_b1_modeling_data_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_b1_modeling_data_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b3_smooth_terms <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_b3_smooth_terms.rds"),
+  trust = TRUE
+)
+
+tbl_b3_parametric_terms <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_b3_parametric_terms.rds"),
+  trust = TRUE
+)
+
+tbl_b3_overall_fit <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_b3_overall_fit.rds"),
+  trust = TRUE
+)
+
+tbl_c2_cv_overall <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_c2_cv_overall.rds"),
+  trust = TRUE
+)
+
+tbl_c2_cv_by_fold <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_c2_cv_by_fold.rds"),
+  trust = TRUE
+)
+
+fig_c3_cv_observed_vs_predicted <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_fig_c3_cv_observed_vs_predicted.rds"),
+  trust = TRUE
+)
+
+tbl_d1_cv_by_age <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_d1_cv_by_age.rds"),
+  trust = TRUE
+)
+
+fig_d1_residuals_by_age <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_fig_d1_residuals_by_age.rds"),
+  trust = TRUE
+)
+
+tbl_d2_cv_by_department <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_d2_cv_by_department.rds"),
+  trust = TRUE
+)
+
+tbl_d3_stunting_classification <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_d3_stunting_classification.rds"),
+  trust = TRUE
+)
+
+fig_e1_residual_diagnostics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_fig_e1_residual_diagnostics.rds"),
+  trust = TRUE
+)
+
+tbl_e3_concurvity <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_tbl_e3_concurvity.rds"),
+  trust = TRUE
+)
+
+fig_e4_observed_vs_fitted <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_02_fig_e4_observed_vs_fitted.rds"),
+  trust = TRUE
+)
+
+# GAM model object (required by fig-e2 for gratia::draw() and by fig-e4
+# subtitle for R² / deviance explained)
+gam_objects <- import(
+  here("..", "01_data", "02_processed", "models",
+       "05_02_height_transfer_model.rds"),
+  trust = TRUE
+)
+gam_height <- gam_objects$gam_height
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# CV performance metrics for fig-c3 subtitle (from tbl-c2)
+cv_rmse <- tbl_c2_cv_overall |> pull(RMSE)
+cv_r2   <- tbl_c2_cv_overall |> pull(R2)
+
+# Full-model fit metrics for fig-e4 subtitle (from gam_height summary)
+gam_summary    <- summary(gam_height)
+full_r2        <- gam_summary$r.sq
+full_dev_expl  <- gam_summary$dev.expl
+
+# Counts used in narrative (Boruta-selected predictors)
+n_predictors <- tbl_a1_data_overview |>
+  filter(Item == "Boruta-selected predictors") |>
+  pull(Value) |>
+  as.integer()
+
+n_observations <- tbl_a1_data_overview |>
+  filter(Item == "Observations") |>
+  pull(Value) |>
+  parse_number()
+
+n_expanded <- tbl_b1_modeling_data_summary |>
+  filter(Metric == "Expanded observations (post-uncount)") |>
+  pull(Value)
+
+# Stunting prevalence from tbl-a1 (already formatted as e.g. "42.2%")
+stunting_prevalence <- tbl_a1_data_overview |>
+  filter(Item == "Stunting prevalence (HAZ < -2)") |>
+  pull(Value)
+
+# Height range from tbl-a1 (already formatted as e.g. "60.5 - 112.1")
+height_range <- tbl_a1_data_overview |>
+  filter(Item == "Height range (cm)") |>
+  pull(Value)
+
+# Departments the table flags: RMSE above one SD from the departmental mean
+dept_flagged <- tbl_d2_cv_by_department |>
+  filter(RMSE > mean(RMSE) + sd(RMSE)) |>
+  arrange(desc(RMSE))
+
+n_departments  <- nrow(tbl_d2_cv_by_department)
+n_dept_flagged <- nrow(dept_flagged)
+dept_flagged_list <- paste(dept_flagged$departamento, collapse = ", ")
+
+# Residual asymmetry between stunted and non-stunted children (observed minus
+# predicted, so a negative value is an overprediction of height)
+resid_stunted <- tbl_d3_stunting_classification |>
+  filter(Metric == "Mean residual - stunted children (cm)") |>
+  pull(Value)
+
+resid_not_stunted <- tbl_d3_stunting_classification |>
+  filter(Metric == "Mean residual - non-stunted children (cm)") |>
+  pull(Value)
+
+mae_stunted <- tbl_d3_stunting_classification |>
+  filter(Metric == "MAE - stunted children (cm)") |>
+  pull(Value)
+
+mae_not_stunted <- tbl_d3_stunting_classification |>
+  filter(Metric == "MAE - non-stunted children (cm)") |>
+  pull(Value)
+
+# Highest pairwise concurvity among the smooth terms
+max_concurvity <- max(tbl_e3_concurvity$Concurvity)
+```
+
+
+## Input Data
+
+The modeling-ready dataset from the
+[previous step](05_01_prepare_sivesnu_height_data.qmd) contains
+`r format(n_observations, big.mark = ",")` SIVESNU 2018 children aged 6-59
+months with `r n_predictors` Boruta-selected predictors and the outcome
+variable (`talla_cm`).
+
+```{r}
+#| label: tbl-a1-data-overview
+#| tbl-cap: "Input data overview"
+
+tbl_a1_data_overview |>
+  mutate(
+    Value = str_replace_all(
+      Value,
+      "[0-9]+\\.[0-9]+",
+      \(x) formatC(as.numeric(x), digits = 1, format = "f")
+    )
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Input Data Summary",
+    subtitle = "SIVESNU 2018 modeling-ready dataset"
+  ) |>
+  cols_align(align = "left", columns = Item) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### GAM Specification
+
+Each predictor receives a model term appropriate to its data type. Continuous
+predictors with expected non-linear effects use smooth terms (`s()`), while
+binary and unordered categorical predictors enter as parametric (linear)
+terms. Department enters through a penalized random-effect term, which lets
+the estimation shrink the geographic contribution according to the support the
+data provide for it.
+
+```{r}
+#| label: tbl-a2-predictor-types
+#| tbl-cap: "Predictor variable types and roles in the GAM"
+
+tbl_a2_predictor_types |>
+  gt() |>
+  tab_header(
+    title = "Predictor Variables and GAM Specification",
+    subtitle = paste0(n_predictors,
+                      " Boruta-selected predictors with assigned model terms")
+  ) |>
+  cols_label(
+    Variable = "Variable",
+    Class = "R Class",
+    Unique = "Unique Values",
+    GAM_Term = "GAM Term"
+  ) |>
+  cols_align(align = "left") |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = str_starts(GAM_Term, "s\\("))
+  ) |>
+  tab_footnote(
+    footnote = "Blue rows: smooth (non-linear) terms. White rows: parametric (linear) terms.",
+    locations = cells_column_labels(columns = GAM_Term)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Outcome Distribution
+
+```{r}
+#| label: fig-a3-outcome-distribution
+#| fig-cap: "Distribution of height (talla_cm) in the training population"
+#| fig-alt: >
+#|   Two panels side by side. Left panel is a histogram of child height in
+#|   centimetres, showing a broad, roughly bell-shaped spread with a slight
+#|   left skew that reflects Guatemala's high stunting prevalence. Right panel
+#|   is a scatter plot of height on the y-axis against age in months on the
+#|   x-axis, overlaid with a dashed GAM smooth curve that rises steeply up to
+#|   about 24 months and then flattens, confirming the non-linear,
+#|   decelerating growth trajectory the smooth terms are designed to capture.
+#| fig-width: 10
+#| fig-height: 6
+
+# Height distribution
+p_hist <- fig_a3_outcome_distribution |>
+  ggplot(aes(x = talla_cm)) +
+  geom_histogram(
+    bins = 40,
+    fill = "lightgray",
+    color = "azure4",
+    alpha = 0.5
+  ) +
+  labs(
+    title = "Height Distribution",
+    subtitle = paste0("SIVESNU 2018 children aged 6-59 months (N = ",
+                      format(n_observations, big.mark = ","), ")"),
+    x = "Height (cm)",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+# Height vs Age non-linear relation
+p_age <- fig_a3_outcome_distribution |>
+  ggplot(aes(x = edad_mes, y = talla_cm)) +
+  geom_point(alpha = 0.3, color = "#1B6CA8", size = 1) +
+  geom_smooth(
+    method = "gam",
+    formula = y ~ s(x),
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Height vs. Age",
+    subtitle = "Non-linear growth curve captured by GAM smooth",
+    x = "Age (months)",
+    y = "Height (cm)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+p_hist + p_age
+```
+
+The height distribution spans `r height_range` cm with a slight left skew,
+consistent with a stunting prevalence of `r stunting_prevalence` in this
+population. The age-height scatterplot shows the non-linear growth trajectory,
+with rapid gains in the first two years easing into a more gradual increase
+after 24 months, which is the pattern the GAM smooth terms are specified to
+capture.
+
+
+## GAM Model Training
+
+The training pipeline first expands the SIVESNU dataset by survey weights
+(`pesonino`) to incorporate the sampling design, then collapses rare factor
+levels (n < 10) into existing categories to prevent empty-level issues in
+cross-validation folds. Ordered factors are converted to numeric for smooth
+term estimation, and an age group variable is added for stratified
+cross-validation.
+
+```{r}
+#| label: tbl-b1-modeling-data-summary
+#| tbl-cap: "Modeling data dimensions after preparation"
+
+tbl_b1_modeling_data_summary |>
+  gt() |>
+  tab_header(
+    title = "Modeling Data Summary",
+    subtitle = "After type preparation for mgcv"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+The model is then trained with **REML** (Restricted Maximum Likelihood) smooth
+parameter estimation.
+
+### Smooth Term Significance
+
+The approximate F-tests are significant for all three smooth terms. The
+effective degrees of freedom (EDF) reported alongside them say how much
+curvature each one takes up.
+
+```{r}
+#| label: tbl-b3-smooth-terms
+#| tbl-cap: "GAM smooth term significance"
+
+tbl_b3_smooth_terms |>
+  mutate(
+    significant = if_else(p_value < 0.05, "*", ""),
+    p_value_fmt = case_when(
+      p_value < 0.001 ~ "< 0.001",
+      TRUE ~ as.character(round(p_value, 4))
+    )
+  ) |>
+  select(Term, edf, ref_df, f_statistic, p_value_fmt, significant) |>
+  gt() |>
+  tab_header(
+    title = "Smooth Term Significance",
+    subtitle = "Approximate F-tests for non-linear effects"
+  ) |>
+  cols_label(
+    Term = "Smooth Term",
+    edf = "EDF",
+    ref_df = "Ref. df",
+    f_statistic = "F",
+    p_value_fmt = "p-value",
+    significant = ""
+  ) |>
+  fmt_number(columns = c(edf, ref_df, f_statistic), decimals = 2) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = significant == "*")
+  ) |>
+  tab_footnote(
+    footnote = "EDF = effective degrees of freedom. EDF close to 1 indicates near-linear relationship.",
+    locations = cells_column_labels(columns = edf)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {#imp-grado-estudios-definition .callout-note}
+## Smooth Term Interpretation
+The age smooth takes 4.24 effective degrees of freedom, which is the
+non-linear growth curve. The `grado_estudios_hogar` smooth takes 2.01,
+a mild curvature in the education-height relationship. This variable encodes
+the household's parental educational attainment as the mean of the head of
+household and their spouse or partner on a six-point ordinal scale mapped to
+numeric values (1 = Ninguno/Desconocido, 2 = Solo sabe leer, 4 = Primaria,
+7 = Secundaria, 10 = Superior/universitaria). The mean over the conjugal unit
+is the summary used, and other household members do not enter it. The
+department term takes 0.98 of its single available degree of freedom, so the
+penalty leaves it close to unshrunk.
+:::
+
+### Parametric Coefficients
+
+```{r}
+#| label: tbl-b3-parametric-terms
+#| tbl-cap: "GAM parametric term coefficients"
+
+tbl_b3_parametric_terms |>
+  mutate(
+    significant = if_else(p_value < 0.05, "*", ""),
+    p_value_fmt = case_when(
+      p_value < 0.001 ~ "< 0.001",
+      TRUE ~ as.character(round(p_value, 4))
+    )
+  ) |>
+  select(Term, estimate, se, t_value, p_value_fmt, significant) |>
+  gt() |>
+  tab_header(
+    title = "Parametric Term Coefficients",
+    subtitle = "Linear effects of categorical predictors"
+  ) |>
+  cols_label(
+    Term = "Term",
+    estimate = "Estimate",
+    se = "SE",
+    t_value = "t",
+    p_value_fmt = "p-value",
+    significant = ""
+  ) |>
+  fmt_number(columns = c(estimate, se, t_value), decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = significant == "*")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Overall Model Fit
+
+```{r}
+#| label: tbl-b3-overall-fit
+#| tbl-cap: "Overall model fit statistics"
+
+tbl_b3_overall_fit |>
+  gt() |>
+  tab_header(
+    title = "Overall Model Fit",
+    subtitle = "GAM with Gaussian family and REML estimation"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric %in% c("Deviance explained",
+                                                  "Adjusted R-squared"))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Model Fit
+The GAM accounts for `r round(full_dev_expl * 100, 1)`% of deviance
+(Adj. R² = `r round(full_r2, 3)`) on the training data. Age carries most of
+this, as expected for child height. Beyond it, the parametric block contributes
+significant coefficients for child sex, water source, television ownership,
+mobile phone access, area of residence, floor and wall materials, and refuse
+collection.
+:::
+
+
+## Cross-Validation
+
+### 10-Fold Stratified CV
+
+We evaluate out-of-sample prediction performance using stratified 10-fold
+cross-validation. Stratification by age group gives each fold a representative
+spread along the growth curve.
+
+```{r}
+#| label: tbl-c2-cv-overall
+#| tbl-cap: "10-fold cross-validation performance"
+
+tbl_c2_cv_overall |>
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value") |>
+  mutate(
+    Metric = case_when(
+      Metric == "RMSE" ~ "Root Mean Squared Error (cm)",
+      Metric == "MAE" ~ "Mean Absolute Error (cm)",
+      Metric == "R2" ~ "R-squared (out-of-sample)",
+      Metric == "Mean_Bias" ~ "Mean Bias (cm)",
+      Metric == "SD_Residual" ~ "SD of Residuals (cm)",
+      Metric == "Pct_within_5cm" ~ "Predictions within +/- 5 cm (%)",
+      Metric == "Pct_within_3cm" ~ "Predictions within +/- 3 cm (%)"
+    ),
+    Value = round(Value, 3)
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Cross-Validation Performance Summary",
+    subtitle = "10-fold stratified CV (stratified by age group)"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = str_detect(Metric, "R-squared|RMSE"))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-c2-cv-by-fold
+#| tbl-cap: "Performance by CV fold"
+
+tbl_c2_cv_by_fold |>
+  gt() |>
+  tab_header(
+    title = "Performance by Cross-Validation Fold",
+    subtitle = "Stability assessment across folds"
+  ) |>
+  cols_label(
+    fold_id = "Fold",
+    N = "N",
+    RMSE = "RMSE (cm)",
+    MAE = "MAE (cm)",
+    R2 = "R²",
+    Mean_Bias = "Bias (cm)"
+  ) |>
+  fmt_number(columns = c(RMSE, MAE, Mean_Bias), decimals = 2) |>
+  fmt_number(columns = R2, decimals = 3) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Cross-Validation Results
+Out-of-sample performance stays close to the in-sample fit:
+RMSE = `r round(cv_rmse, 2)` cm, R² = `r round(cv_r2, 3)`, with a mean bias of
+`r round(tbl_c2_cv_overall$Mean_Bias, 2)` cm. Across the ten folds RMSE ranges
+from `r round(min(tbl_c2_cv_by_fold$RMSE), 2)` to
+`r round(max(tbl_c2_cv_by_fold$RMSE), 2)` cm and R² from
+`r round(min(tbl_c2_cv_by_fold$R2), 3)` to
+`r round(max(tbl_c2_cv_by_fold$R2), 3)`, so the fit does not hinge on which
+subset is held out. `r round(tbl_c2_cv_overall$Pct_within_5cm, 1)`% of
+predictions fall within ±5 cm and
+`r round(tbl_c2_cv_overall$Pct_within_3cm, 1)`% within ±3 cm of observed
+height.
+:::
+
+### CV Diagnostic Plots
+
+```{r}
+#| label: fig-c3-cv-observed-vs-predicted
+#| fig-cap: "Cross-validation: observed vs predicted height"
+#| fig-alt: >
+#|   Two panels side by side. Left panel is a scatter plot of predicted height
+#|   on the y-axis against observed height on the x-axis, with a dashed
+#|   one-to-one reference line; points cluster tightly along this line,
+#|   indicating close agreement out of sample. Right panel plots residuals
+#|   against predicted height with a dashed line at zero and a loess smooth
+#|   that stays close to flat and horizontal, showing no systematic bias
+#|   across the range of predicted heights.
+#| fig-width: 10
+#| fig-height: 6
+
+# Prediction vs observed
+p_scatter <- fig_c3_cv_observed_vs_predicted |>
+  ggplot(aes(x = talla_cm, y = predicted)) +
+  geom_point(alpha = 0.3, color = "#1B6CA8", size = 1.2) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "#3AAF85",
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Observed vs Predicted Height (CV)",
+    subtitle = paste0("RMSE = ", round(cv_rmse, 2), " cm, R² = ",
+                      round(cv_r2, 3)),
+    x = "Observed Height (cm)",
+    y = "Predicted Height (cm)"
+  ) +
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+# Residuals
+p_residual <- fig_c3_cv_observed_vs_predicted |>
+  ggplot(aes(x = predicted, y = residual)) +
+  geom_point(alpha = 0.3, color = "#1B6CA8", size = 1.2) +
+  geom_hline(
+    yintercept = 0,
+    color = "azure4",
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  geom_smooth(
+    method = "loess",
+    se = TRUE,
+    color = "#3AAF85",
+    linewidth = 0.6,
+    alpha = 0.2,
+    formula = 'y ~ x'
+  ) +
+  labs(
+    title = "Residuals vs Predicted",
+    subtitle = "Loess smooth for systematic bias detection",
+    x = "Predicted Height (cm)",
+    y = "Residual (cm)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+p_scatter + p_residual
+```
+
+
+## Performance by Subgroup
+
+### By Age Group
+
+```{r}
+#| label: tbl-d1-cv-by-age
+#| tbl-cap: "Cross-validation performance by age group"
+
+tbl_d1_cv_by_age |>
+  gt() |>
+  tab_header(
+    title = "Prediction Performance by Age Group",
+    subtitle = "10-fold CV results stratified by age"
+  ) |>
+  cols_label(
+    age_group = "Age Group",
+    N = "N",
+    Mean_Height = "Mean Height (cm)",
+    RMSE = "RMSE (cm)",
+    MAE = "MAE (cm)",
+    R2 = "R²",
+    Mean_Bias = "Bias (cm)",
+    Pct_within_3cm = "Within ±3 cm (%)"
+  ) |>
+  fmt_number(columns = c(Mean_Height, RMSE, MAE, Mean_Bias), decimals = 2) |>
+  fmt_number(columns = R2, decimals = 3) |>
+  fmt_number(columns = Pct_within_3cm, decimals = 1) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-d1-residuals-by-age
+#| fig-cap: "Residual distribution by age group"
+#| fig-alt: >
+#|   Box plots of prediction residuals (observed minus predicted height) for
+#|   five age groups from 6-11 months to 48-59 months along the x-axis, with a
+#|   dashed reference line at zero. Every box is centred close to zero,
+#|   indicating little bias, but the boxes and whiskers widen from the
+#|   youngest to the oldest group, showing that residual spread and prediction
+#|   error grow as children age.
+#| fig-width: 10
+#| fig-height: 5
+
+fig_d1_residuals_by_age |>
+  ggplot(aes(x = age_group, y = residual, fill = age_group)) +
+  geom_boxplot(alpha = 0.5, outlier.alpha = 0.3, outlier.size = 1,
+               color = "azure4") +
+  geom_hline(
+    yintercept = 0,
+    color = "#3AAF85",
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "6-11m"  = "#B3D9E8",
+      "12-23m" = "#80BFD4",
+      "24-35m" = "#4DA6C0",
+      "36-47m" = "#2688A8",
+      "48-59m" = "#1B6CA8"
+    )
+  ) +
+  labs(
+    title = "Prediction Residuals by Age Group",
+    subtitle = "Boxplots of (observed - predicted) height",
+    x = "Age Group",
+    y = "Residual (cm)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    legend.position = "none"
+  )
+```
+
+::: {.callout-note}
+## Age-Dependent Accuracy
+RMSE rises from 3.25 cm in the 6-11 month group to 4.69 cm in the 48-59 month
+group, as shown in @tbl-d1-cv-by-age, which follows the wider spread of height
+at older ages. Within-group R² values sit between 0.28 and 0.49 because age,
+the leading predictor, varies little inside each group, leaving the
+socioeconomic variables and child sex to account for the rest.
+:::
+
+### By Department
+
+```{r}
+#| label: tbl-d2-cv-by-department
+#| tbl-cap: "Cross-validation performance by department"
+
+tbl_d2_cv_by_department |>
+  gt() |>
+  tab_header(
+    title = "Prediction Performance by Department",
+    subtitle = "10-fold CV results by geographic unit"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    N = "N",
+    RMSE = "RMSE (cm)",
+    MAE = "MAE (cm)",
+    Mean_Bias = "Bias (cm)"
+  ) |>
+  fmt_number(columns = c(RMSE, MAE, Mean_Bias), decimals = 2) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = RMSE, rows = RMSE > mean(RMSE) + sd(RMSE))
+  ) |>
+  tab_footnote(
+    footnote = "Red cells: departments with RMSE > mean + 1 SD.",
+    locations = cells_column_labels(columns = RMSE)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-warning}
+## Departmental Variation
+`r n_dept_flagged` of `r n_departments` departments exceed the mean RMSE by
+more than one standard deviation and are flagged in red in
+@tbl-d2-cv-by-department: `r dept_flagged_list`. Two patterns sit behind the
+flag. Sacatepéquez, Santa Rosa and Sololá hold 4 to 12 children each, so their
+RMSE is estimated on very few cases. Escuintla and Zacapa hold 76 and 30 and
+carry a mean bias above 1.7 cm, an underprediction of height that the national
+figures absorb. Predictions for these five departments carry higher
+uncertainty.
+:::
+
+### Stunting Classification Quality
+
+```{r}
+#| label: tbl-d3-stunting-classification
+#| tbl-cap: "Stunting classification accuracy from predicted heights (CV)"
+
+tbl_d3_stunting_classification |>
+  gt() |>
+  tab_header(
+    title = "Prediction Quality by Stunting Status",
+    subtitle = "Differential accuracy for stunted vs non-stunted children"
+  ) |>
+  cols_label(Metric = "Metric", Value = "Value") |>
+  fmt_number(columns = Value, decimals = 2) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-important}
+## Shrinkage Toward the Conditional Mean
+Absolute accuracy is comparable for both groups: MAE is
+`r round(mae_stunted, 2)` cm for stunted children against
+`r round(mae_not_stunted, 2)` cm for the rest. The residuals are not
+symmetric, though. Observed minus predicted height averages
+`r round(resid_stunted, 2)` cm for stunted children and
+`r round(resid_not_stunted, 2)` cm for the others, so the model predicts
+stunted children taller than they are and non-stunted children shorter.
+
+This is the shrinkage a conditional-mean estimator produces when the outcome
+carries variation the predictors do not reach: the fitted values compress
+toward the centre and the tails of the height distribution lose mass. Applying
+these predictions directly would understate stunting prevalence. The
+distribution is restored by the quantile mapping and the weight calibration in
+[transferring height to ENCOVI](05_03_transfer_height_to_encovi.qmd), which is
+where the population-level figures are produced.
+:::
+
+
+## Model Diagnostics
+
+### Residual Analysis
+
+```{r}
+#| label: fig-e1-residual-diagnostics
+#| fig-cap: "GAM residual diagnostic plots"
+#| fig-alt: >
+#|   Four-panel diagnostic grid. Top left plots deviance residuals against
+#|   fitted values with a loess curve that stays flat, showing no systematic
+#|   curvature. Top right is a Q-Q plot of standardised residuals following the
+#|   diagonal reference line closely, with only minor departures at the tails.
+#|   Bottom left is a scale-location plot of the square root of standardised
+#|   residuals against fitted values with a flat smooth, indicating roughly
+#|   constant variance. Bottom right is a histogram of standardised residuals
+#|   that closely tracks the overlaid standard normal curve.
+#| fig-width: 10
+#| fig-height: 8
+
+# Plot 1: Residuals vs Fitted (Linearity)
+plot_resid_fitted <- fig_e1_residual_diagnostics |>
+  ggplot(aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.3, size = 1, color = "#1B6CA8") +
+  geom_smooth(
+    formula = 'y ~ x',
+    se = FALSE,
+    method = "loess",
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Residuals vs Fitted",
+    subtitle = "Reference line should be flat and horizontal",
+    x = "Fitted Values",
+    y = "Deviance Residuals"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+# Plot 2: Q-Q Plot of Residuals (Normality)
+plot_qq <- fig_e1_residual_diagnostics |>
+  ggplot(aes(x = theoretical_q, y = std_residuals)) +
+  geom_point(alpha = 0.3, size = 1, color = "#1B6CA8") +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Q-Q Plot of Residuals",
+    subtitle = "Points should follow the diagonal reference line",
+    x = "Theoretical Quantiles",
+    y = "Standardized Residuals"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+# Plot 3: Scale-Location (Homoscedasticity)
+plot_scale_loc <- fig_e1_residual_diagnostics |>
+  ggplot(aes(x = fitted, y = sqrt_abs_std)) +
+  geom_point(alpha = 0.3, size = 1, color = "#1B6CA8") +
+  geom_smooth(
+    formula = 'y ~ x',
+    se = FALSE,
+    method = "loess",
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Homogeneity of Variance",
+    subtitle = "Reference line should be flat and horizontal",
+    x = "Fitted Values",
+    y = expression(sqrt("Standardized Residuals"))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+# Plot 4: Histogram of Residuals (Distribution)
+plot_hist_resid <- fig_e1_residual_diagnostics |>
+  ggplot(aes(x = std_residuals)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 40,
+    fill = "lightgray",
+    color = "azure4",
+    alpha = 0.5
+  ) +
+  stat_function(
+    fun = dnorm,
+    args = list(mean = 0, sd = 1),
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Distribution of Residuals",
+    subtitle = "Dashed line = standard normal reference",
+    x = "Standardized Residuals",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+
+# Combine into 2x2 grid
+ggarrange(
+  plot_resid_fitted,
+  plot_qq,
+  plot_scale_loc,
+  plot_hist_resid,
+  ncol = 2, nrow = 2
+)
+```
+
+::: {.callout-note}
+## Diagnostic Assessment
+The four panels read as follows: residuals against fitted values show no
+systematic curvature, the Q-Q plot follows the diagonal with minor departures
+at the tails, the scale-location plot is approximately flat, and the residual
+histogram tracks the standard normal reference.
+:::
+
+### Smooth Term Partial Effects
+
+```{r}
+#| label: fig-e2-smooth-effects
+#| fig-cap: "Partial effects of smooth terms"
+#| fig-alt: >
+#|   Panels showing the estimated partial effect of each smooth term on height,
+#|   each with a fitted curve, a shaded confidence band, partial residual
+#|   points and a data rug. The age panel shows a steep positive slope from 6
+#|   to about 24 months that flattens progressively through 59 months, the
+#|   characteristic decelerating growth curve. The parental education panel
+#|   shows a weak positive gradient. The department random-effect panel is a
+#|   Q-Q plot whose points fall near the diagonal, indicating approximately
+#|   normal department-level variation.
+#| fig-width: 10
+#| fig-height: 8
+
+draw(gam_height, residuals = TRUE, rug = TRUE) &
+  theme_minimal() &
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 9),
+    plot.caption = element_text(color = "azure4", size = 8.5),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(color = "azure4", size = 10)
+  ) &
+  scale_colour_manual(values = c("#1B6CA8"), guide = "none") &
+  scale_fill_manual(values = c("#1B6CA8"), guide = "none")
+```
+
+The age partial effect shows the decelerating growth curve: a steep positive
+slope from 6 to around 24 months that flattens through 59 months. The parental
+education smooth shows a weak positive gradient. The department panel is a Q-Q
+plot of the random-effect term against the normal distribution.
+
+### Concurvity Assessment
+
+```{r}
+#| label: tbl-e3-concurvity
+#| tbl-cap: "Concurvity assessment for smooth terms"
+
+tbl_e3_concurvity |>
+  gt() |>
+  tab_header(
+    title = "Pairwise Concurvity (values > 0.3)",
+    subtitle = "GAM analogue of multicollinearity between smooth terms"
+  ) |>
+  cols_label(
+    Term = "Term",
+    Against = "Against",
+    Concurvity = "Concurvity"
+  ) |>
+  fmt_number(columns = Concurvity, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = Concurvity, rows = Concurvity > 0.8)
+  ) |>
+  tab_footnote(
+    footnote = "Values > 0.8 (red) indicate high concurvity requiring attention.",
+    locations = cells_column_labels(columns = Concurvity)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Concurvity
+The highest pairwise concurvity is `r round(max_concurvity, 3)`, between the
+department term and the parametric block, below the 0.8 value at which the
+table flags a term. Geographic location and socioeconomic indicators are
+correlated in Guatemala, so some overlap between the two is expected. No term
+is removed on concurvity grounds.
+:::
+
+### Observed vs Fitted (Full Model)
+
+```{r}
+#| label: fig-e4-observed-vs-fitted
+#| fig-cap: "Observed vs fitted height (full model, not CV)"
+#| fig-alt: >
+#|   Scatter plot of fitted height on the y-axis against observed height on the
+#|   x-axis for the full training model, with a dashed one-to-one reference
+#|   line and equal axis scaling. Points fall tightly along the diagonal across
+#|   the full height range, in line with the adjusted R-squared and deviance
+#|   explained reported in the subtitle.
+#| fig-width: 7
+#| fig-height: 6
+
+fig_e4_observed_vs_fitted |>
+  ggplot(aes(x = talla_cm, y = fitted)) +
+  geom_point(alpha = 0.3, color = "#1B6CA8", size = 1.2) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "#3AAF85",
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Observed vs Fitted Height (Full Model)",
+    subtitle = paste0(
+      "Adj. R² = ", round(full_r2, 3),
+      ", Deviance explained = ",
+      round(full_dev_expl * 100, 1), "%"
+    ),
+    x = "Observed Height (cm)",
+    y = "Fitted Height (cm)"
+  ) +
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4")
+  )
+```
+
+
+## Summary
+
+### Key Findings
+
+1. **Model fit**: The GAM accounts for `r round(full_dev_expl * 100, 1)`% of
+   deviance (Adj. R² = `r round(full_r2, 3)`) with three significant smooth
+   terms and parametric predictors covering demographic, geographic and
+   household-asset dimensions.
+
+2. **Out-of-sample accuracy**: Cross-validation gives
+   RMSE = `r round(cv_rmse, 2)` cm and R² = `r round(cv_r2, 3)`, with a mean
+   bias of `r round(tbl_c2_cv_overall$Mean_Bias, 2)` cm and fold-level RMSE
+   between `r round(min(tbl_c2_cv_by_fold$RMSE), 2)` and
+   `r round(max(tbl_c2_cv_by_fold$RMSE), 2)` cm.
+
+3. **Age dominance**: The age smooth carries the non-linear growth curve,
+   while sex and the socioeconomic predictors add discriminating information
+   on top of it.
+
+4. **Shrinkage toward the conditional mean**: Height is overpredicted by
+   `r abs(round(resid_stunted, 2))` cm on average for stunted children and
+   underpredicted by `r round(resid_not_stunted, 2)` cm for the rest. The
+   quantile mapping applied downstream restores the spread of the
+   distribution.
+
+::: {.callout-warning}
+## Limitations
+
+1. **Training sample size** — `r format(n_observations, big.mark = ",")`
+   original observations, `r format(n_expanded, big.mark = ",")` after
+   expansion by survey weights, is a modest base for a GAM with
+   `r n_predictors` predictors and three smooth terms.
+
+2. **Age-dependent accuracy** — RMSE rises from 3.25 cm in the 6-11 month
+   group to 4.69 cm in the 48-59 month group, following the greater spread of
+   height at older ages.
+
+3. **Departmental coverage** — `r n_dept_flagged` departments carry an RMSE
+   more than one standard deviation above the departmental mean, in two cases
+   with a mean bias above 1.7 cm.
+
+4. **Cross-survey transfer assumption** — The model assumes that the
+   height-socioeconomic relationship in SIVESNU 2018, a health centre sample,
+   holds in ENCOVI 2023, a household survey. The sampling frame difference is
+   addressed by the calibration in
+   [transferring height to ENCOVI](05_03_transfer_height_to_encovi.qmd).
+:::
+
+### Application
+
+The trained GAM is applied in
+[transferring height to ENCOVI](05_03_transfer_height_to_encovi.qmd) to predict
+height for ENCOVI 2023 children from their socioeconomic profiles. Those
+predictions are calibrated and converted into individual height-for-age
+z-scores through the WHO LMS reference tables, which is what the Meta-analysis
+(Gunaratna) pathway needs to estimate the change in stunting under
+biofortified maize adoption.

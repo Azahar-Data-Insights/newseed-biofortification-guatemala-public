@@ -1,0 +1,1010 @@
+---
+title: "Likely Adopters Model Calibration"
+subtitle: "Module 2: Economic Impact"
+format:
+  html:
+    toc-depth: 4
+---
+
+## Why Calibrate a Likely Adopters Model?
+
+The economic impact of biofortified maize depends on **which** farmers adopt, not only on **how much** each adopter benefits. Without a model of the adoption process, every farmer would have to be treated as equally likely to adopt, against the empirical evidence that Semilla Nueva's market composition at every observed production coverage level is concentrated in specific farmer profiles.
+
+The Likely Adopters model assigns each farmer a composite score reflecting their expected priority for adoption, and a continuous adoption ratio reflecting the fraction of their white-maize land that they would commit to biofortified seed at any given national production coverage level. The model is **calibrated** rather than fit: its structural parameters are tuned to reproduce five empirical anchors provided by Semilla Nueva (per-segment cohort composition at production coverage levels 5%, 10%, 20%, 30%) plus one structural anchor (population composition at 100% production coverage).
+
+This module documents the determination of the model parameters: variable selection (Phase A–C), construction of the calibration anchor set (Phase D), and sequential sensitivity sweeps over the architectural components of the scoring engine (Phase E), the risk-aversion penalty (Phase F), and the continuous-adoption curve (Phase G). The final consolidated configuration is summarised in the integrated evaluation section and consumed downstream when [applying the model](02_06_apply_likely_adopters_model.qmd).
+
+The figures presented here correspond to the **baseline scenario** combining the 2022 biofortified seed variety with the current subsidy regime. The structural parameters identified depend on the joint distribution of farmer characteristics, not on the magnitude of the projected economic benefit; a single calibration on the baseline therefore produces the model configuration applicable across all seed × subsidy combinations evaluated downstream.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by
+# framework 02_05; baseline configuration s22 + sub00).
+
+tbl_b2_correlation_filter <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_b2_correlation_filter.rds"),
+  trust = TRUE
+)
+
+tbl_b3_nzv_analysis <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_b3_nzv_analysis.rds"),
+  trust = TRUE
+)
+
+tbl_b4_selection_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_b4_selection_summary.rds"),
+  trust = TRUE
+)
+
+fig_c3_boruta_importance <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_fig_c3_boruta_importance.rds"),
+  trust = TRUE
+)
+
+tbl_c4_boruta_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_c4_boruta_summary.rds"),
+  trust = TRUE
+)
+
+tbl_c5_correlation_direction <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_c5_correlation_direction.rds"),
+  trust = TRUE
+)
+
+tbl_e2_1_econ_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_e2_1_econ_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_e2_2_impr_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_e2_2_impr_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_e2_3_scale_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_e2_3_scale_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_e2_4_age_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_e2_4_age_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_e2_5_best_heuristics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_e2_5_best_heuristics.rds"),
+  trust = TRUE
+)
+
+tbl_e3_segment_schemes <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_e3_segment_schemes.rds"),
+  trust = TRUE
+)
+
+tbl_e4_weight_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_e4_weight_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_f3_risk_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_f3_risk_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_g2_floor_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_g2_floor_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_g3_steepness_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_g3_steepness_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_g4_cutoffs_sweep <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_g4_cutoffs_sweep.rds"),
+  trust = TRUE
+)
+
+tbl_h2_integrated_mad <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_h2_integrated_mad.rds"),
+  trust = TRUE
+)
+
+fig_h3_trajectory_vs_anchors <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_fig_h3_trajectory_vs_anchors.rds"),
+  trust = TRUE
+)
+
+tbl_h5_final_config <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_05_tbl_h5_final_config.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Segment color palette consistent with 05_03 and 05_04
+segment_colors <- c(
+  "OPV/Criollo" = "#81C784",
+  "Low"         = "#2E7D32",
+  "Mid"         = "#FDD835",
+  "High"        = "#C62828"
+)
+
+# Boruta decision color palette (Confirmed / Tentative / Rejected)
+boruta_colors <- c(
+  "Confirmed" = "#2E7D32",
+  "Tentative" = "#F9A825",
+  "Rejected"  = "#C62828"
+)
+
+# Shadow maximum threshold for the Boruta importance plot, derived
+# from the distribution of importance values in the exported dataframe.
+# The framework exports only confirmed/tentative/rejected variables
+# (shadow variables filtered out), so the threshold is reconstructed
+# from the boundary between the lowest Confirmed median and the highest
+# Rejected median. With no rejected variable the boundary is unidentified
+# and the reference line is omitted.
+median_imp_by_variable <- fig_c3_boruta_importance |>
+  summarise(
+    median_imp = median(importance, na.rm = TRUE),
+    .by = c(variable, decision)
+  )
+
+imp_rejected  <- median_imp_by_variable$median_imp[median_imp_by_variable$decision == "Rejected"]
+imp_confirmed <- median_imp_by_variable$median_imp[median_imp_by_variable$decision == "Confirmed"]
+
+shadow_max_median <- if (length(imp_rejected) > 0 && length(imp_confirmed) > 0) {
+  (max(imp_rejected) + min(imp_confirmed)) / 2
+} else {
+  NA_real_
+}
+
+min_confirmed_importance <- if (length(imp_confirmed) > 0) min(imp_confirmed) else NA_real_
+
+# Boruta decision counts derived from the summary table
+n_confirmed <- sum(tbl_c4_boruta_summary$decision == "Confirmed")
+n_tentative <- sum(tbl_c4_boruta_summary$decision == "Tentative")
+n_rejected  <- sum(tbl_c4_boruta_summary$decision == "Rejected")
+
+# Correlation and NZV filter counts derived from the selection summary
+n_initial_numeric   <- tbl_b4_selection_summary$n_variables[1]
+n_post_correlation  <- tbl_b4_selection_summary$n_variables[2]
+n_final_candidates  <- tbl_b4_selection_summary$n_variables[3]
+n_high_correlation  <- tbl_b4_selection_summary$removed[2]
+n_nzv_removed       <- tbl_b4_selection_summary$removed[3]
+```
+
+
+## Phase A — B — C: Variable Selection
+
+The selection pipeline operates on the joined economic impact and segmentation dataset for the baseline configuration. Three complementary filters reduce the candidate set to a small group of predictors with demonstrated statistical association with adoption priority:
+
+1. **Correlation filter** — discards numeric variables with a correlation above 0.80 against another retained variable.
+2. **Near-zero variance filter** — discards variables with frequency ratio above 19 and percent unique below 10%, indicating insufficient variation to support prediction.
+3. **Boruta feature selection** — applies the Boruta algorithm (Random Forest importance against shadow-permuted variables) to identify variables with statistically significant association with an adoption priority proxy.
+
+The adoption priority proxy is a five-level ordinal score derived from segment positioning and projected income increment, reflecting Semilla Nueva's strategic targeting logic.
+
+
+### Correlation Filter
+
+Highly correlated variables provide redundant information; the algorithm retains one and discards the other based on mean absolute correlation against the rest of the candidate set.
+
+```{r}
+#| label: tbl-b2-correlation-filter
+#| tbl-cap: "Variables Removed Due to High Correlation (r > 0.80)"
+
+tbl_b2_correlation_filter |>
+  gt() |>
+  tab_header(
+    title = "Variables Removed: High Correlation Filter",
+    subtitle = paste0(n_high_correlation, " of ", n_initial_numeric,
+                      " numeric variables removed (cutoff r = 0.80)")
+  ) |>
+  cols_label(
+    variable_removed = "Variable Removed",
+    reason           = "Reason"
+  ) |>
+  tab_source_note(
+    source_note = "Selection via caret::findCorrelation (removes variable with highest mean absolute correlation)."
+  ) |>
+  tab_options(
+    table.font.size            = px(12),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Near-Zero Variance Analysis
+
+The framework reports the variance diagnostic for the variables that survive the correlation filter. Variables with extremely concentrated distributions provide little signal regardless of statistical importance and are removed before Boruta evaluation.
+
+```{r}
+#| label: tbl-b3-nzv-analysis
+#| tbl-cap: "Near-Zero Variance Analysis for Post-Correlation Variables"
+
+tbl_b3_nzv_analysis
+```
+
+
+### Variable Selection Summary
+
+```{r}
+#| label: tbl-b4-selection-summary
+#| tbl-cap: "Variable Selection Pipeline Summary"
+
+tbl_b4_selection_summary |>
+  gt() |>
+  tab_header(
+    title    = "Variable Selection Pipeline",
+    subtitle = "From initial candidates to Boruta input"
+  ) |>
+  cols_label(
+    stage       = "Stage",
+    n_variables = "Variables",
+    removed     = "Removed"
+  ) |>
+  sub_missing(missing_text = "—") |>
+  cols_align(align = "center", columns = c(n_variables, removed)) |>
+  tab_style(
+    style    = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = stage == "Final candidates for Boruta")
+  ) |>
+  tab_options(
+    table.font.size            = px(12),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Adoption Priority Proxy
+
+The proxy outcome reflects Semilla Nueva's strategic targeting priorities: it captures the logic of which farmers should be prioritised for outreach, on a five-level ordinal scale:
+
+- **Level 5** — Low segment with positive income increment: high improvement potential among farmers using mid-level hybrid seeds.
+- **Level 4** — Non-hybrid segment with positive income increment: largest yield increases, conditional on a technology transition.
+- **Level 3** — Mid segment with positive income increment: marginal gains within an established commercial system.
+- **Level 2** — Any segment with non-positive income increment: limited economic incentive.
+- **Level 1** — High segment: negative yield impact under the biofortified seed configuration.
+
+
+### Boruta Feature Selection
+
+Boruta applies Random Forest importance to a model predicting `adoption_priority` from the candidate variables. At each iteration, each candidate is compared against a "shadow" version (its values randomly permuted across observations). A variable is **Confirmed** if its importance significantly exceeds the maximum shadow importance, **Tentative** if the evidence is inconclusive after `maxRuns = 150` iterations, and **Rejected** if its importance falls below the shadow ceiling.
+
+```{r}
+#| label: fig-c3-boruta-importance
+#| fig-cap: "Boruta variable importance for adoption priority prediction"
+#| fig-alt: >
+#|   Horizontal boxplot chart of Boruta importance scores, one box per
+#|   candidate variable on the y-axis, ordered by median importance, against
+#|   importance on the x-axis. Boxes are colored by decision. Every candidate
+#|   is confirmed, so the chart shows a single colour and no reference line:
+#|   the whole set clears the shadow maximum, with the lowest median importance
+#|   above 6. Importance spans roughly an order of magnitude between the
+#|   weakest and the strongest predictor.
+#| fig-height: 14
+#| fig-width: 10
+
+# Reorder variable factor by median importance for plot ordering
+df_boruta_plot <- fig_c3_boruta_importance |>
+  mutate(
+    decision = factor(decision, levels = c("Confirmed", "Tentative", "Rejected")),
+    variable = fct_reorder(variable, importance, .fun = median, na.rm = TRUE)
+  )
+
+ggplot(df_boruta_plot, aes(x = importance, y = variable, fill = decision)) +
+  geom_boxplot(alpha = 0.4, outlier.size = 0.5) +
+  # Only drawn when a rejected variable bounds the shadow ceiling from below
+  {if (is.finite(shadow_max_median))
+     geom_vline(xintercept = shadow_max_median, linetype = "dashed",
+                color = "grey40")} +
+  scale_fill_manual(values = boruta_colors) +
+  labs(
+    title    = "Boruta Variable Importance for Adoption Priority",
+    subtitle = if (is.finite(shadow_max_median)) {
+      "All candidate variables. Dashed line = shadow maximum threshold"
+    } else {
+      "All candidate variables. Every candidate cleared the shadow maximum"
+    },
+    x        = "Importance",
+    y        = NULL,
+    fill     = "Decision"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position    = "bottom",
+    axis.text.y        = element_text(size = 8),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+```{r}
+#| label: tbl-c4-boruta-summary
+#| tbl-cap: "Boruta Feature Selection Results"
+
+tbl_c4_boruta_summary |>
+  gt() |>
+  tab_header(
+    title    = "Boruta Feature Selection Results",
+    subtitle = paste0("Proxy outcome: adoption_priority (5-level ordinal). ",
+                      n_confirmed, " confirmed, ",
+                      n_tentative, " tentative, ",
+                      n_rejected,  " rejected")
+  ) |>
+  cols_label(
+    variable  = "Variable",
+    decision  = "Decision",
+    medianImp = "Median Imp.",
+    meanImp   = "Mean Imp.",
+    maxImp    = "Max Imp."
+  ) |>
+  fmt_number(columns = c(medianImp, meanImp, maxImp), decimals = 2) |>
+  tab_style(
+    style    = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = decision == "Confirmed")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFF8E1"),
+    locations = cells_body(rows = decision == "Tentative")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(rows = decision == "Rejected")
+  ) |>
+  tab_source_note(
+    source_note = "Boruta algorithm with maxRuns = 150, ranger importance source. Importance compared against shadow (permuted) variables."
+  ) |>
+  tab_options(
+    table.font.size            = px(12),
+    heading.title.font.size    = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+### Confirmed Variables Inform the Scoring Architecture
+Boruta confirms all `r n_confirmed` candidates, with none tentative and none rejected. The step therefore does not discard variables here; what it provides is the importance ordering, which spans roughly an order of magnitude between the weakest confirmed predictor and the strongest. The scoring components — segment, economic benefit, improvement potential, scale, age, and the risk-aversion drivers — are built on that ordering, and each subsequent sweep operates on a parametric family of heuristics over these predictors.
+:::
+
+
+### Correlation Direction
+
+The direction of association of each top-importance variable with the adoption priority proxy determines whether the scoring component should map "higher values → higher priority" or the inverse. Variables with Spearman correlation magnitude below 0.10 do not contribute usable directional signal and are flagged for review.
+
+```{r}
+#| label: tbl-c5-correlation-direction
+#| tbl-cap: "Correlation of Top Variables with Adoption Priority"
+
+tbl_c5_correlation_direction |>
+  gt() |>
+  tab_header(
+    title    = "Variable Correlation with Adoption Priority",
+    subtitle = "Spearman correlation (variables with Boruta importance ≥ 10)"
+  ) |>
+  cols_label(
+    variable     = "Variable",
+    cor_spearman = "ρ (Spearman)",
+    medianImp    = "Boruta Imp.",
+    direction    = "Direction"
+  ) |>
+  fmt_number(columns = c(cor_spearman, medianImp), decimals = 2) |>
+  tab_style(
+    style    = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = cor_spearman > 0.1)
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(rows = cor_spearman < -0.1)
+  ) |>
+  tab_source_note(
+    source_note = "Positive: higher values → higher adoption priority. Negative: higher values → lower priority."
+  ) |>
+  tab_options(
+    table.font.size           = px(12),
+    heading.title.font.size   = px(14)
+  )
+```
+
+
+## Phase D: Calibration Anchors
+
+The Likely Adopters model is calibrated against a structured anchor set rather than fit to an outcome variable: the model parameters are tuned to reproduce, as closely as possible, the empirical adoption composition observed under the Semilla Nueva programme at multiple production coverage levels. The calibration anchors are of two kinds.
+
+**Empirical anchors (Semilla Nueva market composition).** The Semilla Nueva market composition matrix reports the per-segment share of purchasing farmers at four production coverage levels: 5%, 10%, 20%, and 30%. The values at 5% and 10% correspond to the directly observed production coverage range of the 2022–2025 commercial period; the values at 20% and 30% are extrapolated from the same observational base using Gompertz sigmoid fits per segment. The revised matrix used here satisfies two structural requirements: per-segment cohort size is monotonically non-decreasing across production coverage levels, and no per-segment cohort size at any intermediate production coverage exceeds the corresponding population total at full production coverage.
+
+A complementary land-size trajectory reports the average land planted in biofortified maize among purchasing farmers at the same four production coverage levels, interpreted as a P5–P95 trimmed-mean property of the adopting cohort, consistent with the trimming convention applied throughout the framework. Source values are reported in hectares and converted to manzanas using the conversion `1 ha = 1.4308 mz`.
+
+**Calibration anchor set.** The table below collates the five anchors used throughout this script: four empirical points from Semilla Nueva (`Empirical`) plus the structural anchor at full production coverage (`Structural`).
+
+| Anchor type | p | w_p | % OPV | % Low | % Mid | % High | Land overall (ha) | Land overall (mz) |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Empirical (Semilla Nueva)     |   5% | 1.0 | 17.8 | 59.6 | 12.6 | 10.0 | 0.44 | 0.6296 |
+| Empirical (Semilla Nueva)     |  10% | 1.0 | 22.6 | 32.0 | 20.0 | 25.4 | 0.35 | 0.5008 |
+| Empirical (Semilla Nueva)     |  20% | 1.0 | 41.6 | 17.0 | 15.7 | 25.7 | 0.53 | 0.7583 |
+| Empirical (Semilla Nueva)     |  30% | 1.0 | 56.4 | 12.0 | 12.5 | 19.1 | 0.92 | 1.3163 |
+| Structural (population) | 100% | 0.5 | --- | --- | --- | --- | --- | --- |
+
+The empirical row composition values are per-segment shares (%) of the purchasing-farmer cohort at each production coverage level (source: Semilla Nueva ex-ante segment composition estimate, April 2026). The land columns report the overall trimmed-mean land per farmer in the adopting cohort. The structural row at p = 100% is recovered from the segmented dataset itself: per-segment shares equal the population composition under survey-calibrated weights, and the land value equals the P5–P95 weighted trimmed mean of `land_wtcorn` across the universe.
+
+**Structural anchor (population at full production coverage).** The composition at full production coverage equals the population composition by definition: at p = 1.0 every farmer in the segmented dataset has fully converted to biofortified maize. This anchor is recovered directly from the calibrated dataset using survey-calibrated weights and provides a natural asymptotic constraint that anchors the trajectory beyond the empirical range of Semilla Nueva observations.
+
+**A-priori weights.** The four empirical anchors carry the direct empirical signal about adoption dynamics under the biofortification programme and are weighted equally with `w_emp = 1.0`. The population anchor at p = 1.0 represents the asymptotic composition of the universe; it is weighted at half the empirical anchors with `w_str = 0.5`, reflecting its auxiliary role.
+
+**Calibration distance.** The MAD evaluation operates on relative deviations: each cell at each anchor contributes the absolute model-anchor error divided by the anchor value plus a small offset, so that all anchor cells contribute proportionally regardless of their absolute magnitude. Three composite distances are reported in every sweep: `MAD farmers` aggregates the deviations across per-segment cohort counts, `MAD land` aggregates the deviations across the overall land trajectory, and `MAD global` combines both on a common dimensionless basis. All sweeps in Phases E–G rank configurations on `MAD global` ascending: lower values indicate closer agreement with the anchor set.
+
+**Formal definition.** Let $\mathcal{S} = \{\text{OPV}, \text{Low}, \text{Mid}, \text{High}\}$ denote the segment set ($|\mathcal{S}| = 4$) and $\mathcal{P} = \{0.05, 0.10, 0.20, 0.30, 1.00\}$ the anchor production coverage grid. The two component distances and the global distance are defined as
+
+$$
+\text{MAD}_{\text{farmers}} \;=\; \sum_{p \in \mathcal{P}} w_p \sum_{s \in \mathcal{S}}
+\frac{\bigl| N^{\text{model}}_{s,p} - N^{\text{anchor}}_{s,p} \bigr|}
+     {N^{\text{anchor}}_{s,p} + \varepsilon_{\text{count}}}
+$$
+
+$$
+\text{MAD}_{\text{land}} \;=\; \sum_{p \in \mathcal{P}} w_p
+\frac{\bigl| \bar{L}^{\text{bio,model}}(p) - \bar{L}^{\text{bio,anchor}}(p) \bigr|}
+     {\bar{L}^{\text{bio,anchor}}(p) + \varepsilon_{\text{land}}}
+$$
+
+$$
+\text{MAD}_{\text{global}} \;=\; \frac{\text{MAD}_{\text{farmers}}}{|\mathcal{S}|} \;+\; \text{MAD}_{\text{land}}
+$$
+
+where $w_p$ are the a-priori anchor weights ($w_p = 1.0$ for the four empirical anchors, $w_p = 0.5$ for the structural anchor at $p = 1.0$), $\varepsilon_{\text{count}} = 1$ and $\varepsilon_{\text{land}} = 0.01$ are the small offsets that prevent division-by-zero on cohort cells that are vanishingly small at low production coverage, and $|\mathcal{S}| = 4$ normalises the farmer component to a per-segment scale before composing with the land component on a common dimensionless basis.
+
+The implementation aligns the modelled trajectory grid and the anchor grid through an explicit integer key (production coverage multiplied by 1000 and rounded), eliminating dependence on floating-point equality between the two grids.
+
+The five-anchor set is held fixed across every sweep in this script; what changes is the model configuration whose calibration distance is evaluated against it. The visualisation of the integrated model trajectory against these anchors appears in Phase H3.
+
+
+## Phase E: Scoring Sensitivity Sweeps
+
+The scoring engine assigns each farmer a composite score from five components: a categorical **segment** score over the four segments (Low, OPV/Criollo, Mid, High); a continuous **economic-benefit** score over projected income increment; a continuous **improvement-potential** score over current per-area input expenditure (inverse direction: lower expenditure indicates higher potential for productivity gains); a continuous **scale** score over land area planted in white maize; and a continuous **age** score over the head-of-household age (inverse direction: younger heads of household show higher technological openness). Each continuous score is a step function over percentile breakpoints of the underlying variable, yielding integer levels that align cardinality across components.
+
+Phase E explores the architectural choices of the scoring engine through four sequential sweeps. Each sweep inherits the best configuration from the previous one, so the search proceeds along a one-dimensional path rather than a full grid: the heuristic configuration (E2) is selected on individual-component sensitivity, the segment scheme (E3) is selected against the heuristic configuration, and the weight vector (E4) is selected against the heuristic and segment configurations.
+
+### E2 — Sensitivity to Scoring Heuristics
+
+Each of the four non-segment scoring components is varied independently while the others are held at reference defaults. The univariate best variant of each component is selected on minimum global MAD.
+
+#### E2.1 — score_economic Breakpoints
+
+The economic-benefit score uses three percentile breakpoints over `income_increment` to assign farmers to four bands (with an additional fifth band for non-positive increments). Three variants of the breakpoint vector are evaluated.
+
+```{r}
+#| label: tbl-e2-1-econ
+#| tbl-cap: "Sensitivity to score_economic Breakpoints"
+
+tbl_e2_1_econ_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_economic breakpoints",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+#### E2.2 — score_improvement Breakpoints
+
+The improvement-potential score uses four percentile breakpoints over `exp_total_per_mz_annual` (inverse direction). Three variants of the breakpoint vector are evaluated.
+
+```{r}
+#| label: tbl-e2-2-impr
+#| tbl-cap: "Sensitivity to score_improvement Breakpoints"
+
+tbl_e2_2_impr_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_improvement breakpoints",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+#### E2.3 — score_scale Breakpoints
+
+The scale score uses four percentile breakpoints over `land_wtcorn` to discriminate among farmer scales. Three variants of the breakpoint vector are evaluated.
+
+```{r}
+#| label: tbl-e2-3-scale
+#| tbl-cap: "Sensitivity to score_scale Breakpoints"
+
+tbl_e2_3_scale_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_scale breakpoints",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+#### E2.4 — score_age Breakpoints
+
+The age score uses cutoffs over head-of-household age (inverse direction: younger ages map to higher scores). Three variants are evaluated.
+
+```{r}
+#| label: tbl-e2-4-age
+#| tbl-cap: "Sensitivity to score_age Breakpoints"
+
+tbl_e2_4_age_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_age breakpoints",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+#### E2.5 — Best Heuristic per Component
+
+The best heuristic per component is selected on minimum global MAD within each individual sweep. The combined configuration is carried forward as the reference scoring heuristic for the subsequent sweeps in this phase.
+
+```{r}
+#| label: tbl-e2-5-best-heuristics
+#| tbl-cap: "Selected Heuristic Configuration (Univariate Best per Component)"
+
+tbl_e2_5_best_heuristics |>
+  select(component, variant, label, mad_farmers, mad_land, mad_global) |>
+  gt() |>
+  tab_header(
+    title    = "Selected heuristic configuration (univariate best per component)",
+    subtitle = "Variants minimising global MAD within each component sweep"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+
+### E3 — Sensitivity to Segment-Priority Schemes
+
+The segment-priority sweep explores two families of cardinal configurations. A **steep family** (gap of 20 or more points between consecutive segments) tests whether the segment component, treated as the dominant input to the composite score, reproduces the empirical anchor pattern on its own. A **compressed family** (gap of 5 to 15 points between consecutive segments) tests an alternative architecture in which the segment component provides a weak categorical prior and the discrimination among farmers is carried by the economic, improvement, scale, age, and risk-aversion components.
+
+The heuristic configuration from E2.5 is held fixed during this sweep.
+
+```{r}
+#| label: tbl-e3-segment-schemes
+#| tbl-cap: "Sensitivity to Segment-Priority Schemes"
+
+tbl_e3_segment_schemes |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to segment-priority schemes",
+    subtitle = "Best heuristics from E2 fixed; component weights at reference; ordered by global MAD"
+  ) |>
+  cols_label(
+    scheme      = "Scheme",
+    Low         = "Low",
+    OPV         = "OPV",
+    Mid         = "Mid",
+    High        = "High",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(Low, OPV, Mid, High), decimals = 0) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+
+### E4 — Sensitivity to Component Weights
+
+The component weights are the relative contributions of the five scoring components to the composite score. Holding the heuristic configuration from E2 and the segment scheme from E3 fixed, the weight vector is varied across plausible neighbourhoods of the reference baseline.
+
+The grid is constructed by varying the segment weight on a coarse range. The age and scale weights are held at their reference values (0.07 and 0.08), so the perturbation operates primarily on the segment / economic / improvement balance. The segment weight is bounded at 0.60 from above: a segment weight above this threshold produces a ranking in which the categorical segment classification dominates the composite to the point where intra-segment variation in the other components becomes irrelevant.
+
+```{r}
+#| label: tbl-e4-weight-sweep
+#| tbl-cap: "Sensitivity to Component Weights"
+
+tbl_e4_weight_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to component weights",
+    subtitle = "Best heuristics from E2 and best segment scheme from E3 fixed; ordered by global MAD"
+  ) |>
+  cols_label(
+    w_segment     = "w_seg",
+    w_economic    = "w_econ",
+    w_improvement = "w_impr",
+    w_scale       = "w_scale",
+    w_age         = "w_age",
+    mad_farmers   = "MAD farmers",
+    mad_land      = "MAD land (mz)",
+    mad_global    = "MAD global"
+  ) |>
+  fmt_number(columns = c(w_segment, w_economic, w_improvement,
+                         w_scale, w_age),
+             decimals = 3) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+::: {.callout-note}
+### Recommended Scoring Configuration
+The recommended scoring configuration combines the best heuristics from E2, the best segment scheme from E3, and the best component-weight vector from E4. This configuration is carried forward to Phase F as the base scoring on which the risk-aversion penalty is applied.
+:::
+
+
+## Phase F: Risk-Aversion Sweep
+
+The risk-aversion penalty discounts the composite score of each farmer by an explicit measure of vulnerability to crop loss. Three risk drivers are combined into the penalty: a **yield-variability driver** (the per-farmer variability of expected yield against the departmental reference), a **cost-to-output ratio driver** (the per-farmer ratio of input expenditure to projected gross production value), and a **land-scale driver** (the per-farmer land area in white maize, with smaller plots interpreted as carrying greater relative risk from a single-season loss). A fourth structural driver, the **projected-loss driver**, captures the disincentive associated with a projected negative income increment and is held fixed by design at `α_loss = 1.0` across all configurations: this reflects its structural role as a deterministic disincentive rather than a calibrated component.
+
+The penalty is shaped by a logistic function with slope `β` over the weighted aggregate of the three calibrated drivers, and is subtracted from the composite score with weight `w_R`. Two variants of the driver formulation are evaluated in parallel: the **Z variant** standardises each driver against its departmental mean and standard deviation (yielding interpretable z-scores), while the **A variant** normalises each driver against its population P1–P99 range. Both variants are explored under a five-dimensional joint sweep over `α_yield`, `α_ratio`, `α_land`, `β`, and `w_R`, ranked on the same MAD distance used in Phase E.
+
+```{r}
+#| label: tbl-f4-risk-top
+#| tbl-cap: "Top 5 Risk-Aversion Configurations per Driver Variant"
+
+tbl_f3_risk_sweep |>
+  slice_head(n = 5, by = variant) |>
+  arrange(variant, mad_global) |>
+  gt(groupname_col = "variant") |>
+  tab_header(
+    title    = "Top 5 risk-aversion configurations per variant",
+    subtitle = "Z = departmental z-scores; A = absolute values normalised via P1–P99"
+  ) |>
+  cols_label(
+    alpha_y     = "α_yield",
+    alpha_r     = "α_ratio",
+    alpha_L     = "α_land",
+    beta        = "β",
+    w_R         = "w_R",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(alpha_y, alpha_r, alpha_L, beta, w_R), decimals = 2) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+::: {.callout-note}
+### Combined Configuration Carried Forward
+The best risk-aversion configuration is combined with the best scoring configuration from Phase E. This combined scoring + risk model is the entry point for the continuous-adoption sweeps in Phase G.
+:::
+
+
+## Phase G: Continuous Adoption Sweeps
+
+The continuous adoption model assigns each farmer to one of three behavioural profiles based on white-maize land area: **small (S)** with near-binary adoption (rapid full conversion once the farmer enters the ranking), **medium (M)** with sigmoid adoption (gradual conversion shaped by a logistic curve), and **large (L)** with gradual adoption (slow accumulation that approaches saturation only at high national production coverage). The per-farmer conversion ratio `r_i(p)` depends on the farmer's profile and on the farmer's entry point `p_entry` in the global ranking.
+
+The sweep explores three design axes sequentially, with each axis inheriting the best configuration from the previous one:
+
+1. **G2 — Floor values** define the minimum conversion ratio achieved immediately upon entry into the ranking, per profile.
+2. **G3 — Steepness coefficients** define the slope of the conversion curve between entry and saturation, per profile.
+3. **G4 — Profile cutoffs** define the land-area boundaries that assign farmers to profiles S, M, or L.
+
+Phase G inherits the combined scoring + risk configuration from Phase F.
+
+### G2 — Floor Values per Profile
+
+The floor value of each profile is the conversion ratio achieved immediately upon entry into the ranking. A high floor models a near-step adoption ("once the farmer decides, all land is committed"); a low floor models a gradual scaling that begins from a small fraction of the land. The grid varies all three floors independently across plausible ranges.
+
+```{r}
+#| label: tbl-g2-floors
+#| tbl-cap: "Sensitivity to Floor Values per Profile"
+
+tbl_g2_floor_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to floor values per profile",
+    subtitle = "Steepness coefficients and cutoffs held at reference; ordered by global MAD"
+  ) |>
+  cols_label(
+    floor_S     = "floor_S",
+    floor_M     = "floor_M",
+    floor_L     = "floor_L",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(floor_S, floor_M, floor_L), decimals = 2) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+### G3 — Steepness Coefficients per Profile
+
+The steepness coefficient `k` governs the curvature of the conversion ratio between entry and saturation: large `k` produces a near-step curve (rapid jump from floor to ceiling), small `k` produces a gradual sigmoid (smooth scaling over an extended production coverage range). Holding the best floor values from G2 and the reference cutoff scheme, the steepness coefficients are explored independently across the three profiles.
+
+```{r}
+#| label: tbl-g3-steepness
+#| tbl-cap: "Sensitivity to Steepness Coefficients per Profile"
+
+tbl_g3_steepness_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to steepness coefficients per profile",
+    subtitle = "Best floors from G2 fixed; cutoffs at reference; ordered by global MAD"
+  ) |>
+  cols_label(
+    k_S         = "k_S",
+    k_M         = "k_M",
+    k_L         = "k_L",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(k_S, k_M, k_L), decimals = 2) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+### G4 — Profile Cutoff Sensitivity
+
+The profile cutoffs `S/M` and `M/L` define the land-area boundaries that assign farmers to profiles S, M, or L. Holding the best floors from G2 and the best steepness coefficients from G3, the cutoff grid explores plausible refinements of the empirical land percentiles used as reference.
+
+```{r}
+#| label: tbl-g4-cutoffs
+#| tbl-cap: "Sensitivity to Profile Cutoffs"
+
+tbl_g4_cutoffs_sweep |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to profile cutoffs",
+    subtitle = "Best floors from G2 and best steepness from G3 fixed; ordered by global MAD"
+  ) |>
+  cols_label(
+    cut_S_M     = "cut S/M (mz)",
+    cut_M_L     = "cut M/L (mz)",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(cut_S_M, cut_M_L), decimals = 2) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+
+## Phase H: Integrated Model Evaluation
+
+The integrated model combines all best configurations from Phases E, F, and G: the heuristic configuration from E2, the segment scheme from E3, the component weights from E4, the risk-aversion variant and coefficients from F, and the continuous-adoption parameters (floors, steepness, cutoffs) from G. The integrated model is evaluated against the five-anchor calibration set and exported as the final model artefact consumed when [applying the model](02_06_apply_likely_adopters_model.qmd).
+
+### Integrated Model Calibration Summary
+
+```{r}
+#| label: tbl-h2-integrated-mad
+#| tbl-cap: "Integrated Model — Calibration Distance Against Anchor Set"
+
+tbl_h2_integrated_mad |>
+  gt() |>
+  tab_header(
+    title    = "Integrated model — calibration distance",
+    subtitle = "Relative mean absolute deviation against the five calibration anchors"
+  ) |>
+  cols_label(
+    model       = "Model",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(mad_farmers, mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+
+### Trajectory Visualization Against Anchors
+
+The integrated model's trajectory is visualised against the five calibration anchors: four empirical points from the Semilla Nueva market composition matrix (circles) and one structural point recovered from the population at full production coverage (triangle). The four segment trajectories appear as solid lines on a percentage-share basis.
+
+```{r}
+#| label: fig-h3-trajectory-vs-anchors
+#| fig-cap: "Integrated model trajectory against the calibration anchors"
+#| fig-alt: >
+#|   Line chart with national production coverage (percent) on the x-axis and
+#|   cohort share (percent) on the y-axis. Four solid lines, one per farmer
+#|   segment, trace the integrated model's composition trajectory as coverage
+#|   grows. Overlaid markers show the calibration anchors: circles for the four
+#|   empirical Semilla Nueva points and a triangle for the structural point at full
+#|   coverage. The model lines pass close to their corresponding anchor markers,
+#|   showing the calibrated fit.
+#| fig-width: 11
+#| fig-height: 6
+
+ggplot(
+  fig_h3_trajectory_vs_anchors$trajectory,
+  aes(x = p * 100, y = pct, color = segment)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(
+    data = fig_h3_trajectory_vs_anchors$anchors,
+    aes(x = p_anchor * 100, y = pct, color = segment, shape = role),
+    size = 3, fill = "white", stroke = 1.5
+  ) +
+  scale_color_manual(values = segment_colors) +
+  scale_shape_manual(
+    values = c("Empirical (Semilla Nueva)" = 21,
+               "Structural (population)" = 24)
+  ) +
+  labs(
+    title    = "Integrated model: cohort composition trajectory",
+    subtitle = "Solid lines = integrated model; circles = empirical anchors; triangle = structural anchor",
+    x        = "National production coverage (%)",
+    y        = "Cohort share (%)",
+    color    = NULL,
+    shape    = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12),
+    plot.subtitle   = element_text(size = 10, color = "#7B8B99"),
+    legend.position = "bottom",
+    legend.box      = "vertical"
+  )
+```
+
+
+### Final Configuration Summary
+
+The full set of parameters constituting the determined Likely Adopters model is reported below. This configuration is exported as a single artefact in the model registry and read back when [applying the model](02_06_apply_likely_adopters_model.qmd).
+
+```{r}
+#| label: tbl-h5-final-config
+#| tbl-cap: "Determined Likely Adopters Model Configuration"
+
+tbl_h5_final_config |>
+  gt() |>
+  tab_header(
+    title    = "Determined Likely Adopters model configuration",
+    subtitle = "Calibrated against five anchors on the baseline configuration (2022 seed, current subsidy)"
+  ) |>
+  cols_label(
+    component = "Component",
+    setting   = "Setting"
+  ) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+
+## Summary
+
+### Determination Pipeline
+
+The Likely Adopters model is determined through a sequential, anchor-driven calibration: variable selection (Phase B–C) identifies the predictors with statistically significant association with the adoption priority proxy, the calibration anchor set (Phase D) defines the target against which all subsequent configurations are evaluated, the scoring sensitivity sweeps (Phase E) select the heuristic configuration, segment scheme, and component weights, the risk-aversion sweep (Phase F) selects the driver variant and the coefficients of the risk penalty, and the continuous-adoption sweeps (Phase G) select the floor values, steepness coefficients, and profile cutoffs of the per-farmer conversion curve.
+
+### Single Calibration, Universal Application
+
+The determination is performed once on the baseline configuration (2022 seed × current subsidy). The structural parameters identified depend on the joint distribution of farmer characteristics, not on the magnitude of the projected economic benefit. The single calibration therefore produces the model configuration applicable across the seed by subsidy combinations evaluated by the downstream scoring engine.
+
+### Anchor-Based Calibration
+
+The calibration targets are five anchor points derived from the Semilla Nueva market composition matrix (four empirical production coverage levels) plus one structural anchor (population composition at full production coverage). The MAD distance ranks every configuration on a common dimensionless basis, enabling sequential one-axis optimisation across the four phases. The integrated model trajectory reproduces the empirical anchors with low residual deviation, which is what the continuous-adoption projections downstream rest on.

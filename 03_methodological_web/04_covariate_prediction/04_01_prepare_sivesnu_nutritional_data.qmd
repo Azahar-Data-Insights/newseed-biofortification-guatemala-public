@@ -1,0 +1,744 @@
+---
+title: "Applying Transfer Models to SIVESNU"
+subtitle: "Module 4: Covariate Prediction"
+---
+
+## Overview
+
+The transfer models developed in Module 3 enable us to predict nutrient intake
+for populations where detailed food consumption data is unavailable. SIVESNU 2018
+(Sistema de Vigilancia Epidemiológica de Salud y Nutrición) provides anthropometric
+measurements and food security indicators for Guatemalan children, but lacks the
+detailed dietary recall needed to calculate nutrient intake directly.
+
+By applying our ENCOVI-trained models to the SIVESNU data, we can:
+
+1. **Estimate individual nutrient intake** — Predict iron, zinc, protein, lysine,
+   tryptophan, and energy intake for each child based on their demographic
+   and socioeconomic characteristics.
+
+2. **Link nutrition to stunting outcomes** — Connect predicted intake with measured
+   height-for-age z-scores to model the nutrition–stunting relationship.
+
+3. **Enable biofortification simulation** — Create a baseline for comparing
+   conventional vs. biofortified maize scenarios.
+
+This module bridges the gap between ENCOVI's food consumption data and SIVESNU's
+anthropometric measurements, creating a unified analytical dataset for impact
+modeling.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  car,                # Yeo-Johnson likelihood profile (boxCox)
+  ggpubr,             # Legend extraction utility
+  cowplot,            # Multi-panel plot composition
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by framework 04_01).
+
+tbl_b2_impute_missing <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_tbl_b2_impute_missing.rds"),
+  trust = TRUE
+)
+
+tbl_b2b_completion_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_tbl_b2b_completion_summary.rds"),
+  trust = TRUE
+)
+
+fig_c_yj_miembros_hogar_pre <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_fig_c_yj_miembros_hogar_pre.rds"),
+  trust = TRUE
+)
+
+fig_c_yj_miembros_hogar_post <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_fig_c_yj_miembros_hogar_post.rds"),
+  trust = TRUE
+)
+
+fig_c_yj_n_cuartos_pre <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_fig_c_yj_n_cuartos_pre.rds"),
+  trust = TRUE
+)
+
+fig_c_yj_n_cuartos_post <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_fig_c_yj_n_cuartos_post.rds"),
+  trust = TRUE
+)
+
+tbl_e2_final_validation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_tbl_e2_final_validation.rds"),
+  trust = TRUE
+)
+
+fig_e3_density_comparison <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_fig_e3_density_comparison.rds"),
+  trust = TRUE
+)
+
+tbl_e3_distribution_comparison <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_01_tbl_e3_distribution_comparison.rds"),
+  trust = TRUE
+)
+```
+
+
+## Data Sources
+
+### SIVESNU 2018
+
+SIVESNU is Guatemala's national nutrition surveillance system, collecting data on
+child health and nutritional status [@INCAP2020_SIVESNU]. The 2018 round provides:
+
+- **Anthropometric data** — Height-for-age z-scores for children 6–59 months.
+- **Household characteristics** — Socioeconomic indicators matching ENCOVI structure.
+- **Food security assessment** — FIES (Food Insecurity Experience Scale) responses.
+
+SIVESNU does not include the detailed food consumption records that ENCOVI
+carries, so nutrient intake cannot be calculated directly from it. This is the
+gap the transfer models address.
+
+### ENCOVI Reference Distributions
+
+To calibrate our predictions, we use the observed nutrient distributions from
+ENCOVI 2023 as reference targets, restricted to children aged 6–59 months so
+that the reference describes the same population as the target. Quantile mapping
+transports the predicted SIVESNU distributions onto the empirical patterns of
+that reference.
+
+Nutrient intake scales with body size, and the ENCOVI children in this age range
+consume roughly half of what the all-age population does — median ratios of 0.57
+for the maize-source components and 0.47–0.49 for the non-maize components.
+Restricting the reference to the same age range keeps both the level and the
+composition of the calibrated values on the child scale.
+
+### Transfer Models
+
+The 13 gamma regression models from Module 3 predict nutrient intake separately
+for maize and non-maize sources. This separation enables biofortification
+simulation by modifying only the maize component while preserving baseline
+non-maize intake.
+
+
+## Variable Harmonization
+
+### Aligning Survey Structures
+
+SIVESNU and ENCOVI use different variable names and coding schemes for similar
+concepts. Before applying transfer models, we must harmonize SIVESNU variables
+to match the exact structure expected by the ENCOVI-trained models.
+
+This harmonization includes:
+
+- **Factor level alignment** — Ensuring categorical variables have identical
+  levels and ordering.
+- **Variable renaming** — Matching ENCOVI naming conventions.
+- **Derived variables** — Creating composite indicators (e.g.,
+  [household parental education level](../05_meta_analysis/05_02_transfer_model_height.qmd#imp-grado-estudios-definition))
+  using the same methodology.
+
+
+### Missing Value Imputation
+
+Survey data inevitably contains missing values. We apply Random Forest-based
+multivariate imputation because it:
+
+- Handles mixed data types (continuous and categorical) simultaneously.
+- Preserves variable correlations and multivariate structure.
+- Provides out-of-bag error estimates for quality assessment.
+
+Implementation uses the `impute_rf_parallel()` utility function, which wraps
+`missRanger` with a multi-threaded `ranger` engine and returns imputed values
+alongside out-of-bag error estimates (OOBE for continuous variables, PFC for
+categorical). The multi-threaded engine accelerates the iterative imputation
+process without altering the underlying methodology, which remains the standard
+chained Random Forest approach.
+
+::: {.callout-note}
+## About out-of-bag error
+Out-of-bag (OOB) error estimates are calculated from observations that were
+randomly excluded during tree construction within the Random Forest algorithm,
+providing an internal quality metric for imputed values without requiring a
+separate test set.
+:::
+
+```{r}
+#| label: tbl-b2-impute-missing
+#| tbl-cap: "Random Forest imputation quality metrics"
+
+tbl_b2_impute_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Value Imputation Quality Assessment",
+    subtitle = "Out-of-bag error estimates from Random Forest imputation (includes FIES variables)"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value",
+    interpretation = "Quality Assessment"
+  ) |>
+  fmt_number(
+    columns = value,
+    decimals = 4
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Acceptable"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Review required"
+    )
+  ) |>
+  tab_footnote(
+    footnote = "OOBE: aggregated out-of-bag error across the continuous variables imputed, bounded in [0, 1] and invariant to their scale. Values < 0.5 indicate acceptable imputation quality for continuous variables.",
+    locations = cells_body(columns = metric, rows = 1)
+  ) |>
+  tab_footnote(
+    footnote = "PFC: Proportion of Falsely Classified entries. Values < 0.2 indicate acceptable imputation quality for categorical variables.",
+    locations = cells_body(columns = metric, rows = 2)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-tip}
+## Imputation Quality
+OOBE < 0.5 and PFC < 0.2 are the ranges conventionally treated as acceptable
+for this imputation method.
+:::
+
+
+### Completion of Residual Missing Values
+
+The Random Forest imputation engine can leave a residual `NaN` for a small
+subset of rows when the out-of-bag prediction collapses inside a terminal node
+with zero within-leaf variance. This affects continuous discrete-scale
+predictors.
+
+Downstream analyses (Yeo-Johnson transformation, model prediction, quantile
+mapping) operate on a complete predictor matrix, so residual missing values are
+completed with a variable-specific rule:
+
+- **Numeric / integer variables**: median of the observed values, which
+  preserves the support of discrete-scale ordinal variables (e.g. years of
+  schooling take values such as 1, 1.5, 2, 2.5, ...).
+- **Factor variables**: mode of the observed values.
+
+Completing rather than discarding keeps every record in the predicted
+distributions. The count of values completed by each rule is reported in the
+table below.
+
+```{r}
+#| label: tbl-b2b-completion-summary
+#| tbl-cap: "Residual missing value completion after Random Forest imputation"
+
+tbl_b2b_completion_summary |>
+  gt() |>
+  tab_header(
+    title = "Residual Missing Value Completion",
+    subtitle = "Values completed by variable-specific rule after RF imputation"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_completed = "N Completed",
+    rule = "Completion Rule"
+  ) |>
+  fmt_number(
+    columns = n_completed,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: passed"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: review required"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+
+## Applying Transformations
+
+### Yeo-Johnson Normalization
+
+The transfer models were trained on Yeo-Johnson transformed continuous predictors.
+We apply the same transformations (using parameters fitted on ENCOVI) to ensure
+SIVESNU data enters the models in the expected scale.
+
+```{r}
+#| label: fig-c-yj-miembros-hogar-pre
+#| fig-cap: "Yeo-Johnson transformation profile for household members (pre-transformation)"
+#| fig-alt: >
+#|   Profile log-likelihood curve for the Yeo-Johnson power parameter lambda,
+#|   with lambda on the x-axis and log-likelihood on the y-axis, computed on the
+#|   untransformed household-members variable. Dashed vertical lines mark the
+#|   maximum-likelihood lambda and its 95% confidence interval, indicating the
+#|   power needed to normalize the raw, right-skewed distribution.
+
+boxCox(
+  lm(miembros_hogar ~ 1, data = fig_c_yj_miembros_hogar_pre),
+  main = "Household Members - Pre-Transformation",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-c-yj-miembros-hogar-post
+#| fig-cap: "Yeo-Johnson transformation profile for household members (post-transformation)"
+#| fig-alt: >
+#|   Profile log-likelihood curve for the Yeo-Johnson power parameter lambda,
+#|   with lambda on the x-axis and log-likelihood on the y-axis, computed on the
+#|   transformed household-members variable. The maximum-likelihood lambda now
+#|   sits close to 1, and its 95% confidence interval brackets 1, the value
+#|   expected for an approximately normal distribution.
+
+boxCox(
+  lm(miembros_hogar_transformed ~ 1, data = fig_c_yj_miembros_hogar_post),
+  main = "Household Members - Post-Transformation",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-c-yj-n-cuartos-pre
+#| fig-cap: "Yeo-Johnson transformation profile for number of rooms (pre-transformation)"
+#| fig-alt: >
+#|   Profile log-likelihood curve for the Yeo-Johnson power parameter lambda,
+#|   with lambda on the x-axis and log-likelihood on the y-axis, computed on the
+#|   untransformed number-of-rooms variable. Dashed vertical lines mark the
+#|   maximum-likelihood lambda and its 95% confidence interval, identifying the
+#|   power needed to normalize the raw, skewed distribution.
+
+boxCox(
+  lm(n_cuartos ~ 1, data = fig_c_yj_n_cuartos_pre),
+  main = "Number of Rooms - Pre-Transformation",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-c-yj-n-cuartos-post
+#| fig-cap: "Yeo-Johnson transformation profile for number of rooms (post-transformation)"
+#| fig-alt: >
+#|   Profile log-likelihood curve for the Yeo-Johnson power parameter lambda,
+#|   with lambda on the x-axis and log-likelihood on the y-axis, computed on the
+#|   transformed number-of-rooms variable. The maximum-likelihood lambda now sits
+#|   close to 1, and its 95% confidence interval brackets 1, the value expected
+#|   for an approximately normal distribution.
+
+boxCox(
+  lm(n_cuartos_transformed ~ 1, data = fig_c_yj_n_cuartos_post),
+  main = "Number of Rooms - Post-Transformation",
+  family = "yjPower"
+)
+```
+
+
+## Nutrient Prediction
+
+### Model Application
+
+Each transfer model predicts nutrient intake on the log scale (via log link in
+gamma regression). We apply **exponential back-transformation** to obtain
+predictions in natural units (mg/day or g/day).
+
+::: {.callout-note}
+## Link Functions
+All nutrient models use log link, so their predictions require exponential
+back-transformation.
+:::
+
+### Food Security Adjustment
+
+SIVESNU includes the Food Insecurity Experience Scale (FIES), an 8-question
+instrument measuring household food security. FIES scores are used to apply a
+fine adjustment to nutrient intake predictions before quantile mapping:
+
+| FIES Score | Food Security Status | Description | Adjustment |
+|------------|---------------------|-------------|------------|
+| 0 | Food secure | Adequate food access | +5% |
+| 1–3 | Mild food insecurity | Slight decrease in quantity and/or quality of food consumed | +2% |
+| 4–6 | Moderate food insecurity | Moderate reduction in quantity and/or quality of food consumed | −2% |
+| 7–8 | Severe food insecurity | Have run out of food for a day or more | −5% |
+
+**Why the adjustment is applied.** The transfer models predict nutrient intake
+from demographic and socioeconomic characteristics. Two children sharing the
+same socioeconomic profile therefore receive identical predicted intake values,
+regardless of differences in their actual food security situation. Quantile
+mapping alone cannot separate these two children, because it preserves the ranks
+it receives — if the inputs are identical, the outputs remain identical.
+
+FIES is used as an independent proxy for the household food environment. Children
+in more food-insecure households start from a slightly lower intake value (−2% or
+−5%) than children in more food-secure households (+2% or +5%), even when the
+transfer model assigned them the same starting point. The adjustment is applied
+before quantile mapping, so that the subsequent rank-based calibration operates
+on already-differentiated values rather than on identical ones.
+
+**Origin of the adjustment factors.** The factors (+5% / +2% / −2% / −5%) are a
+modeling parameter of this framework. They were set by inspecting the plausible
+intake distributions across food security strata and choosing modest, symmetric
+adjustments that introduce the intended differentiation without distorting the
+overall distribution.
+
+**Validation.** What is validated is the final intake distribution, after the
+FIES adjustment, the quantile mapping and the maize-source alignment have all
+been applied, against the age-matched ENCOVI reference. That comparison is
+reported at the end of this page.
+
+::: {.callout-note}
+## Role of the Adjustment
+The FIES adjustment is a fine-tuning step that introduces a food-security
+gradient into predictions otherwise driven only by demographic and socioeconomic
+covariates. Its modest magnitude (at most ±5%) reflects this secondary,
+corrective role. Its purpose is to improve discrimination between children with
+similar socioeconomic profiles but different food security status, while avoiding
+the circularity of using the stunting outcome as an input.
+:::
+
+### Target Population Filtering
+
+The stunting analysis focuses on children aged 6–59 months, the standard window
+for assessing chronic malnutrition. Prediction runs on all SIVESNU individuals,
+and the filter to this age range is applied **before** the calibration step that
+follows.
+
+The order matters. Quantile mapping transports the quantiles of a source
+distribution onto those of a reference, so the two need to describe comparable
+populations. Filtering first leaves the source on the child scale, matching the
+ENCOVI reference that was already restricted to the same age range.
+
+### Quantile Mapping Calibration
+
+Model predictions do not match the observed ENCOVI distributions exactly.
+Quantile mapping aligns the predicted distribution to the reference
+distribution, preserving ranks while correcting systematic level differences.
+The mapping is estimated over the pooled age-matched range.
+
+### Maize-Source Alignment
+
+A rank-based alignment is then applied to the maize-source variables, which
+realigns each individual's maize-source values against their overall non-maize
+nutrient profile.
+
+::: {.callout-note}
+## Assumption Behind the Alignment
+The alignment rests on intra-individual nutrient coherence: an individual's
+maize-source intake is expected to sit consistently with the rest of their
+nutrient profile. Maize dependency is itself a marker of household resources,
+so before the alignment the maize-source block and the stunting outcome share
+that socioeconomic gradient.
+:::
+
+### Preserved Raw Predictions
+
+The exported dataset carries two parallel blocks of the twelve source-specific
+nutrient variables. The `_raw` block holds the transfer-model output before the
+FIES adjustment, the quantile mapping and the maize-source alignment; the
+adjusted block holds the calibrated values that the rest of the pipeline
+consumes. Each raw column pairs one-to-one with its calibrated counterpart. The
+raw block is carried unchanged through the remaining scripts of this module and
+takes no part in any calculation: it exists so that the effect of the
+calibration can be audited at any stage.
+
+
+## Final Dataset
+
+### Variable Selection
+
+The final dataset contains all variables needed for stunting modeling and
+biofortification scenario simulation.
+
+```{r}
+#| label: tbl-e2-final-validation
+#| tbl-cap: "Final dataset structure"
+
+tbl_e2_final_validation |>
+  gt() |>
+  tab_header(
+    title = "Final Dataset Structure",
+    subtitle = "SIVESNU 2018 with predicted nutrient intake values"
+  ) |>
+  cols_label(
+    category = "Variable Category",
+    n_variables = "N Variables",
+    observations = "N Observations"
+  ) |>
+  fmt_number(
+    columns = c(n_variables, observations),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = category == "TOTAL")
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    table.width = pct(100)
+  )
+```
+
+
+### Distribution Validation Against the Reference
+
+The figure and table below compare the distribution of calibrated nutrient
+intakes for SIVESNU children (6–59 months) against the ENCOVI children they
+were mapped onto. Both sides cover the same age range, so this is a
+like-for-like comparison.
+
+The figure compares total intake per nutrient, where the two populations track
+each other closely (median ratios between 0.90 and 1.00). The table separates
+the two source blocks, which behave differently by construction: the non-maize
+components leave the quantile mapping untouched and sit within 3–8% of the
+reference medians, with Kolmogorov-Smirnov statistics below 0.075, while the
+maize-source components sit 14–20% above the reference medians, being the only
+block modified after the mapping by the rank-based alignment described above.
+
+```{r}
+#| label: fig-e3-density-comparison
+#| fig-cap: "Distribution comparison: SIVESNU children (6-59m, calibrated) vs ENCOVI children (6-59m, observed)"
+#| fig-alt: >
+#|   Grid of six overlaid density plots, one panel per nutrient: iron, zinc,
+#|   digestible protein, lysine, tryptophan, and energy, each with intake on the
+#|   x-axis and density on the y-axis. Two filled curves per panel compare the
+#|   age-matched ENCOVI 2023 children's reference against the SIVESNU 2018
+#|   calibrated children's intakes. The paired curves overlap closely in every
+#|   panel, with the SIVESNU curves sitting marginally lower for digestible
+#|   protein and lysine.
+#| fig-width: 10
+#| fig-height: 8
+
+# Define color palette and labels
+color_palette <- c(
+  "ENCOVI 2023 (Reference)" = "#5C946E",
+  "SIVESNU 2018 (Predicted)" = "#E07A5F"
+)
+
+nutrients <- c("fe_total", "zn_total", "prot_total", "lys_total", "trp_total", "kcal_total")
+nutrient_labels <- c(
+  "fe_total" = "Iron (mg/day)",
+  "zn_total" = "Zinc (mg/day)",
+  "prot_total" = "Digestible Protein (g/day)",
+  "lys_total" = "Lysine (mg/day)",
+  "trp_total" = "Tryptophan (mg/day)",
+  "kcal_total" = "Energy (kcal/day)"
+)
+
+# Create individual density plots
+plot_list <- map(nutrients, ~ {
+  upper_limit <- quantile(fig_e3_density_comparison[[.x]], 0.95, na.rm = TRUE)
+
+  fig_e3_density_comparison |>
+    filter(.data[[.x]] > 0, .data[[.x]] <= upper_limit) |>
+    ggplot(aes(x = .data[[.x]], fill = source)) +
+    geom_density(alpha = 0.6, color = NA) +
+    scale_fill_manual(values = color_palette, drop = FALSE) +
+    labs(title = nutrient_labels[.x], x = NULL, y = "Density") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 11, color = "azure4", face = "bold"),
+      axis.title = element_text(size = 9, color = "azure4"),
+      axis.text = element_text(size = 8, color = "azure4"),
+      legend.position = "none",
+      panel.grid.minor = element_blank()
+    )
+})
+
+# Create a plot just to extract the legend
+legend_plot <- fig_e3_density_comparison |>
+  ggplot(aes(x = fe_total, fill = source)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = color_palette, drop = FALSE) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11, color = "azure4")
+  ) +
+  guides(fill = guide_legend(override.aes = list(alpha = 0.6)))
+
+# Extract legend and arrange grid
+legend_grob <- ggpubr::get_legend(legend_plot)
+plot_grid <- cowplot::plot_grid(plotlist = plot_list, ncol = 3, nrow = 2)
+cowplot::plot_grid(plot_grid, legend_grob, ncol = 1, rel_heights = c(1, 0.08))
+```
+
+```{r}
+#| label: tbl-e3-distribution-comparison
+#| tbl-cap: "Distribution comparison by source block: SIVESNU children (6-59m) vs age-matched ENCOVI children"
+
+tbl_e3_distribution_comparison |>
+  mutate(
+    Maize_p_formatted = case_when(
+      Maize_p_value < 0.001 ~ "< 0.001",
+      Maize_p_value < 0.01 ~ "< 0.01",
+      Maize_p_value < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", Maize_p_value)
+    ),
+    `Non-Maize_p_formatted` = case_when(
+      `Non-Maize_p_value` < 0.001 ~ "< 0.001",
+      `Non-Maize_p_value` < 0.01 ~ "< 0.01",
+      `Non-Maize_p_value` < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", `Non-Maize_p_value`)
+    )
+  ) |>
+  select(-Maize_p_value, -`Non-Maize_p_value`) |>
+  gt() |>
+  tab_header(
+    title = "Nutrient Intake Distributions — Children 6-59 months, SIVESNU vs ENCOVI",
+    subtitle = "Medians and Kolmogorov-Smirnov statistic against the age-matched calibration reference"
+  ) |>
+  cols_label(
+    nutrient = "Nutrient",
+    Maize_median_encovi = "ENCOVI",
+    Maize_median_sivesnu = "SIVESNU",
+    Maize_ratio = "Ratio",
+    Maize_ks_statistic = "KS",
+    Maize_p_formatted = "p-value",
+    `Non-Maize_median_encovi` = "ENCOVI",
+    `Non-Maize_median_sivesnu` = "SIVESNU",
+    `Non-Maize_ratio` = "Ratio",
+    `Non-Maize_ks_statistic` = "KS",
+    `Non-Maize_p_formatted` = "p-value"
+  ) |>
+  tab_spanner(label = "From Maize", columns = starts_with("Maize")) |>
+  tab_spanner(label = "From Non-Maize", columns = starts_with("Non-Maize")) |>
+  fmt_number(columns = contains("median"), decimals = 1) |>
+  fmt_number(columns = contains("ratio"), decimals = 2) |>
+  fmt_number(columns = contains("ks_statistic"), decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Maize_ratio, rows = Maize_ratio >= 0.9 & Maize_ratio <= 1.1)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = `Non-Maize_ratio`, rows = `Non-Maize_ratio` >= 0.9 & `Non-Maize_ratio` <= 1.1)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Maize_ks_statistic, rows = Maize_ks_statistic < 0.1)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = `Non-Maize_ks_statistic`, rows = `Non-Maize_ks_statistic` < 0.1)
+  ) |>
+  tab_footnote(
+    footnote = "Ratio = SIVESNU median / ENCOVI median, both for children 6-59 months. Green marks ratios within 0.9 to 1.1. The maize-source block sits above that band because the rank-based alignment is applied after the quantile mapping.",
+    locations = cells_column_labels(columns = Maize_ratio)
+  ) |>
+  tab_footnote(
+    footnote = "KS: Kolmogorov-Smirnov statistic on the distribution shape. Green marks values below 0.1.",
+    locations = cells_column_labels(columns = Maize_ks_statistic)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-tip}
+## Reading the Validation
+Both sides of the comparison are children aged 6–59 months, so the medians and
+the Kolmogorov-Smirnov statistics measure how closely the calibrated SIVESNU
+distributions reproduce the reference they were mapped onto.
+
+The non-maize block is the one that reaches the reference directly: its ratios
+fall inside the 0.9–1.1 band and its Kolmogorov-Smirnov statistics stay below
+0.1. The maize-source block is realigned after the mapping, so its ratios sit
+above that band by design.
+:::
+
+
+## Summary
+
+### Processing Pipeline
+
+| Step | Method | Purpose |
+|------|--------|---------|
+| Variable harmonization | Factor recoding | Match ENCOVI predictor structure |
+| Missing imputation | Random Forest (`impute_rf_parallel`) | Handle incomplete records |
+| Residual completion | Median / mode | Complete the predictor matrix |
+| Transformation | Yeo-Johnson | Normalize continuous predictors |
+| Prediction | Gamma GLM | Estimate nutrient intake |
+| Target population filter | Children 6–59 months | Match the age range of the reference |
+| FIES adjustment | Score-based scaling | Incorporate food security |
+| Quantile mapping | Distribution alignment | Calibrate to the age-matched ENCOVI reference |
+| Maize-source alignment | Rank-based realignment | Place the maize block on the individual's nutrient profile |
+
+### Key Findings
+
+1. **Age-matched calibration** — With the target population filtered before the
+   mapping and the reference restricted to the same age range, the non-maize
+   block reproduces the reference medians within 3–8%, with Kolmogorov-Smirnov
+   statistics below 0.075.
+
+2. **Maize block offset by design** — The maize-source components sit 14–20%
+   above the reference medians, the footprint of the rank-based alignment
+   applied after the mapping.
+
+3. **Food security differentiation** — The FIES adjustment separates children
+   whose demographic and socioeconomic profiles are identical, which the
+   transfer models alone map to the same predicted intake.
+
+### Application
+
+This dataset provides the nutrient intake foundation for:
+
+- **[Chispitas integration](04_02_integrate_chispitas_supplementation.qmd)** — Adding micronutrient supplementation effects.
+- **[Bioavailability calculations](04_03_calculate_bioavailability_adjustments.qmd)** — Converting intake to absorbed nutrients.
+- **[Stunting model development](04_06_model_stunting_continuous_zlen.qmd)** — Linking intake to HAZ outcomes.
+- **[Scenario simulation](../06_scenarios/06_01_calculate_market_baseline.qmd)** — Modeling biofortified maize impact.

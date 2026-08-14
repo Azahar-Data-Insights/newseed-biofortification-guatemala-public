@@ -1,0 +1,773 @@
+---
+title: "Prepare SIVESNU Height Data"
+subtitle: "Module 5: Meta-analysis"
+---
+
+## Why Prepare SIVESNU Height Data?
+
+The Meta-analysis (Gunaratna) pathway requires a model that predicts child
+height from socioeconomic and demographic variables. This model will be
+trained on SIVESNU 2018 — which contains direct anthropometric measurements —
+and applied to children in the ENCOVI 2023 dataset, who lack height data but
+have comparable socioeconomic profiles.
+
+The predictor variable set comprises demographic, socioeconomic, and
+geographic indicators present in both surveys, constituting the bridge for
+cross-dataset prediction. The hypothesis is that the same variables predicting
+nutrient intakes ([transfer models](../03_transfer_models/03_01_prepare_modeling_data.qmd))
+also predict child stature, since socioeconomic conditions are linked to both
+dietary quality and growth outcomes.
+
+This document describes the preparation of the SIVESNU training dataset
+through six stages: population filtering, variable harmonization, missing
+value imputation, predictor quality assessment, normalization, and feature
+selection.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  ggcorrplot,         # Correlation matrix visualization (used by fig-d1)
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file (single source of truth)
+source(here("..", "02_code", "00_functions", "00_functions.R"))
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Web resources for visualizations (exported by framework 05_01)
+tbl_a2_population_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_a2_population_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b2_merge_quality <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_b2_merge_quality.rds"),
+  trust = TRUE
+)
+
+tbl_c1_diagnose_missing <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_c1_diagnose_missing.rds"),
+  trust = TRUE
+)
+
+tbl_c2_impute_missing <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_c2_impute_missing.rds"),
+  trust = TRUE
+)
+
+fig_d1_correlation_analysis <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_fig_d1_correlation_analysis.rds"),
+  trust = TRUE
+)
+
+tbl_d2_near_zero_variance <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_d2_near_zero_variance.rds"),
+  trust = TRUE
+)
+
+tbl_e1_yj_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_e1_yj_summary.rds"),
+  trust = TRUE
+)
+
+tbl_f1_boruta_results <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_f1_boruta_results.rds"),
+  trust = TRUE
+)
+
+fig_f1_boruta_importance <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_fig_f1_boruta_importance.rds"),
+  trust = TRUE
+)
+
+tbl_g1_final_dataset_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_tbl_g1_final_dataset_summary.rds"),
+  trust = TRUE
+)
+
+fig_g2_height_distributions <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_01_fig_g2_height_distributions.rds"),
+  trust = TRUE
+)
+
+# Boruta model object (required to recompute shadowMax threshold for fig-f1)
+boruta_objects <- import(
+  here("..", "01_data", "02_processed", "models",
+       "05_01_boruta_results.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Final population size (Nivel 1 from tbl-a2)
+n_final_population <- tbl_a2_population_summary |>
+  filter(Metric == "Final target population") |>
+  pull(N)
+
+# Boruta variable counts (Nivel 1 from tbl-f1)
+n_boruta_confirmed <- tbl_f1_boruta_results |>
+  filter(Metric == "Confirmed (relevant)") |>
+  pull(Value) |>
+  as.integer()
+
+n_boruta_tentative <- tbl_f1_boruta_results |>
+  filter(Metric == "Tentative (borderline)") |>
+  pull(Value) |>
+  as.integer()
+
+n_boruta_selected <- tbl_f1_boruta_results |>
+  filter(Metric == "Variables selected (Confirmed + Tentative)") |>
+  pull(Value) |>
+  as.integer()
+
+n_boruta_evaluated <- tbl_f1_boruta_results |>
+  filter(Metric == "Variables evaluated") |>
+  pull(Value) |>
+  as.integer()
+
+# Shadow maximum threshold for Boruta importance reference line
+# (Recomputed from the Boruta model object — not redundantly exported as RDS)
+shadow_max_median <- boruta_objects$boruta_result$ImpHistory |>
+  as.data.frame() |>
+  pull(shadowMax) |>
+  median(na.rm = TRUE)
+
+# Imputation quality: categorical OOB error and the cells it applies to
+pfc_value <- tbl_c2_impute_missing |>
+  filter(Metric == "PFC (Categorical Variables)") |>
+  pull(Value)
+
+n_missing_cells <- sum(tbl_c1_diagnose_missing$n_missing)
+
+# Strongest off-diagonal correlation pair, for the multicollinearity screen
+cor_offdiag <- fig_d1_correlation_analysis
+diag(cor_offdiag) <- 0
+cor_max_cell <- which(abs(cor_offdiag) == max(abs(cor_offdiag)), arr.ind = TRUE)[1, ]
+cor_max_value <- round(max(abs(cor_offdiag)), 2)
+cor_max_pair <- paste0("`", rownames(cor_offdiag)[cor_max_cell[1]], "` with `",
+                       colnames(cor_offdiag)[cor_max_cell[2]], "`")
+rm(cor_offdiag, cor_max_cell)
+```
+
+
+## Target Population
+
+SIVESNU 2018 includes anthropometric measurements for children under 5 years.
+We filter to the study population (6-59 months) and require valid height and
+height-for-age z-score data, resulting in `r format(n_final_population, big.mark = ",")`
+children available for model training.
+
+Children under 6 months are excluded as they should be exclusively breastfed
+per WHO guidelines, making their anthropometric patterns non-comparable with
+older children's dietary intake profiles.
+
+```{r}
+#| label: tbl-a2-population-summary
+#| tbl-cap: "Target population summary after filtering"
+
+tbl_a2_population_summary |>
+  gt() |>
+  tab_header(
+    title = "Target Population Filtering Summary",
+    subtitle = "SIVESNU 2018 children aged 6-59 months with valid anthropometry"
+  ) |>
+  fmt_number(columns = N, decimals = 0, sep_mark = ",") |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = N) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "Final target population")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "Final target population")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Population Yield
+The filtering pipeline retains `r format(n_final_population, big.mark = ",")`
+of 902 children (85.7%). The age restriction (6-59 months) accounts for most of
+the attrition, removing 90 children, and a further 39 records lack a height
+measurement. Every child with a valid height also carries a valid
+height-for-age z-score, so the two criteria select the same records.
+:::
+
+
+## Variable Harmonization
+
+SIVESNU and ENCOVI use different variable naming conventions and coding
+schemes. We harmonize SIVESNU variables to match the coding structure used in
+ENCOVI 2023, so that the trained height model applies across surveys without
+recoding. The harmonization covers geographic classification,
+household characteristics, housing materials, basic services, and household
+assets.
+
+```{r}
+#| label: tbl-b2-merge-quality
+#| tbl-cap: "Merge quality assessment"
+
+tbl_b2_merge_quality |>
+  gt() |>
+  tab_header(
+    title = "Child-Household Merge Quality",
+    subtitle = "Matching children to their household socioeconomic profiles"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-tip}
+## Merge Quality
+The `r format(n_final_population, big.mark = ",")` children match to their
+household socioeconomic profiles at a rate of 100%. Department and area
+classification are close to complete, at 771 and 770 records respectively,
+leaving 2 and 3 records without a geographic identifier.
+:::
+
+
+## Missing Value Treatment
+
+### Missing Value Diagnosis
+
+Missing data is minimal across predictor variables. The four variables with
+any missing values — `fuente_agua`, `area`, `departamento`, and
+`tipo_vivienda` — each affect fewer than 1% of records.
+
+```{r}
+#| label: tbl-c1-diagnose-missing
+#| tbl-cap: "Missing value summary for predictor variables"
+
+tbl_c1_diagnose_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Values in Predictor Variables",
+    subtitle = "Assessment prior to imputation"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_missing = "N Missing",
+    pct_missing = "% Missing"
+  ) |>
+  fmt_number(columns = n_missing, decimals = 0, sep_mark = ",") |>
+  fmt_number(columns = pct_missing, decimals = 2, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = pct_missing, rows = pct_missing > 10)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF9C4"),
+    locations = cells_body(columns = pct_missing,
+                           rows = pct_missing > 0 & pct_missing <= 10)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#C8E6C9"),
+    locations = cells_body(columns = pct_missing, rows = pct_missing == 0)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Random Forest Imputation
+
+Missing values are imputed via Random Forest using the `impute_rf_parallel()`
+utility function, which wraps `missRanger::missRanger()` with a multi-threaded
+`ranger` engine. The procedure preserves inter-variable correlations and
+handles mixed data types, continuous and categorical, simultaneously.
+Imputation quality is summarized via out-of-bag (OOB) error metrics — OOBE for
+continuous variables and the proportion of falsely classified entries (PFC) for
+categorical variables.
+
+```{r}
+#| label: tbl-c2-impute-missing
+#| tbl-cap: "Random Forest imputation quality metrics"
+
+tbl_c2_impute_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Value Imputation Quality Assessment",
+    subtitle = "Out-of-bag error estimates from Random Forest imputation (missRanger)"
+  ) |>
+  cols_label(
+    Metric = "Metric",
+    Value = "Value",
+    Assessment = "Quality Assessment"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#C8E6C9"),
+    locations = cells_body(columns = Assessment,
+                           rows = Assessment == "Acceptable")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = Assessment,
+                           rows = Assessment == "Review required")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(columns = Assessment,
+                           rows = Assessment == "No continuous variables required imputation")
+  ) |>
+  tab_footnote(
+    footnote = "OOBE: aggregated out-of-bag error across the continuous variables imputed, bounded in [0, 1] and invariant to their scale. Values < 0.5 indicate acceptable imputation quality for continuous variables. N/A when no continuous variables had missing values.",
+    locations = cells_body(columns = Metric, rows = 1)
+  ) |>
+  tab_footnote(
+    footnote = "PFC: Proportion of Falsely Classified entries. Values < 0.2 indicate acceptable imputation quality for categorical variables.",
+    locations = cells_body(columns = Metric, rows = 2)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Reading the Two Metrics
+Out-of-bag (OOB) error is computed from observations randomly excluded during
+tree construction, which gives an internal quality metric without a separate
+test set.
+
+The continuous metric is reported as N/A: the two continuous predictors
+(`miembros_hogar`, `n_cuartos`) had no missing values, so no continuous
+imputation was required.
+
+The categorical metric is `r pfc_value`, above the 0.2 reference value, and the
+table flags it for review. It is the OOB misclassification rate of the forests
+fitted for the four variables that carry missing values, so it measures how
+predictable those variables are from the rest of the predictor set, not the
+accuracy of the specific cells filled. Those cells number
+`r n_missing_cells` across `r format(n_final_population, big.mark = ",")`
+records.
+:::
+
+
+## Predictor Quality Assessment
+
+### Correlation Structure
+
+We assess pairwise correlation among predictor variables to identify potential
+multicollinearity. Pairs correlating above 0.8 are candidates for removal.
+
+```{r}
+#| label: fig-d1-correlation-analysis
+#| fig-cap: "Correlation matrix of predictor variables for height modeling"
+#| fig-alt: >
+#|   Correlation heatmap showing the lower triangle of pairwise correlations
+#|   among the predictor variables, with variables hierarchically clustered
+#|   along both axes and each cell labelled with its coefficient. Color runs
+#|   from orange for negative through white at zero to blue for positive
+#|   correlations. Most pairs are weak; housing quality indicators (materials,
+#|   assets, services) form a block of moderate positive correlations while
+#|   demographic variables stay largely independent. The strongest pair is 0.6,
+#|   recoleccion_basura with area, below the 0.8 multicollinearity screen.
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+
+fig_d1_correlation_analysis |>
+  ggcorrplot(
+    hc.order = TRUE,
+    colors = c("#E46726", "white", "#6D9EC1"),
+    type = "lower",
+    lab = TRUE
+  )
+```
+
+::: {.callout-note}
+## Correlation Patterns
+The highest pairwise correlation is `r cor_max_value` (`r cor_max_pair`), below
+the 0.8 value above which pairs become candidates for removal. Housing quality
+indicators cluster together (materials, assets, services), while demographic
+variables (`edad`, `sexo`, `parentesco`) stay largely independent of the
+socioeconomic indicators. No variable pair is removed on correlation grounds.
+:::
+
+### Near-Zero Variance Analysis
+
+Variables with near-zero variance provide minimal discriminating information
+for the transfer model and can introduce noise in feature selection.
+
+```{r}
+#| label: tbl-d2-near-zero-variance
+#| tbl-cap: "Near-zero variance analysis for predictor variables"
+
+tbl_d2_near_zero_variance |>
+  gt() |>
+  tab_header(
+    title = "Near-Zero Variance Analysis",
+    subtitle = "Variables with insufficient variation for modeling"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    freqRatio = "Frequency Ratio",
+    percentUnique = "% Unique Values",
+    zeroVar = "Zero Variance",
+    nzv = "Near-Zero Variance"
+  ) |>
+  fmt_number(columns = c(freqRatio, percentUnique), decimals = 2) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = nzv, rows = nzv == TRUE)
+  ) |>
+  tab_source_note(
+    source_note = "Variables flagged as near-zero variance will be removed from the modeling dataset."
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-important}
+## Variables Removed
+Two variables are flagged as near-zero variance and removed from the modeling
+dataset: `tipo_vivienda` (frequency ratio 56.62 — dominated by "Casa formal")
+and `telefonia_fija` (frequency ratio 29.92 — nearly all households lack
+landlines). The remaining 20 variables proceed to normalization and feature
+selection.
+:::
+
+
+## Continuous Variable Normalization
+
+The two continuous predictors (`miembros_hogar` and `n_cuartos`) are normalized
+to reduce skewness. `bestNormalize()` evaluates a family of candidate
+transformations for each variable and keeps the one that comes closest to
+normality; the Transformation Type column reports which one it selected. The
+fitted objects are saved and reapplied to ENCOVI data in the
+[transfer step](05_03_transfer_height_to_encovi.qmd), so both surveys enter the
+model on the same scale.
+
+```{r}
+#| label: tbl-e1-yj-summary
+#| tbl-cap: "Yeo-Johnson transformation summary"
+
+tbl_e1_yj_summary |>
+  gt() |>
+  tab_header(
+    title = "Yeo-Johnson Transformation Results",
+    subtitle = "Normalization of continuous predictor variables"
+  ) |>
+  fmt_number(
+    columns = c(`Pre-transform Skewness`, `Post-transform Skewness`),
+    decimals = 3
+  ) |>
+  cols_align(align = "left", columns = Variable) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Transformation Outcomes
+Skewness in `n_cuartos` falls from 1.724 to 0.097 under the transformation.
+For `miembros_hogar` the procedure selects a centre-scale normalization, which
+leaves the skewness at its original value of 1.278: household size is a count
+with a short right tail, and the location-scale shift does not change its
+shape.
+:::
+
+
+## Feature Selection
+
+### Boruta Algorithm
+
+The Boruta algorithm evaluates each candidate predictor against random shadow
+variables to determine statistical relevance for height prediction. Feature
+selection uses raw height in centimetres (`talla_cm`) as the outcome, which is
+the variable transferred to ENCOVI, and keeps the selection independent of age:
+height-for-age z-scores are age-standardized, and age is itself a predictor.
+The implementation uses `Boruta::getImpRfZ` as the importance source, which
+delegates the variable importance computation to the multi-threaded `ranger`
+backend.
+
+```{r}
+#| label: tbl-f1-boruta-results
+#| tbl-cap: "Boruta feature selection results for height prediction"
+
+tbl_f1_boruta_results |>
+  gt() |>
+  tab_header(
+    title = "Boruta Feature Selection Results",
+    subtitle = "Variable importance assessment for height (talla_cm) prediction"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      rows = Metric == "Variables selected (Confirmed + Tentative)"
+    )
+  ) |>
+  tab_source_note(
+    md("**Method:** Boruta with ranger importance source (multi-threaded), 150 iterations against shadow variables")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-f1-boruta-importance
+#| fig-cap: "Variable importance from Boruta feature selection for height prediction"
+#| fig-alt: >
+#|   Horizontal boxplot chart ranking the selected predictor variables by
+#|   Boruta importance, with importance on the x-axis and one box per variable
+#|   on the y-axis. Boxes are colored by decision: green for confirmed and
+#|   yellow for tentative. A dashed vertical line marks the shadow-maximum
+#|   threshold that variables must exceed to be retained. Age (edad) dominates
+#|   with importance an order of magnitude above all others, followed by a
+#|   secondary cluster of geographic and housing quality indicators.
+#| fig-height: 8
+#| fig-width: 10
+
+ggplot(fig_f1_boruta_importance,
+       aes(x = importance, y = variable, fill = decision)) +
+  geom_boxplot(alpha = 0.8, outlier.size = 0.5, color = "grey40") +
+  geom_vline(
+    xintercept = shadow_max_median,
+    linetype = "dashed",
+    color = "azure4",
+    linewidth = 0.8
+  ) +
+  scale_fill_manual(
+    values = c("Confirmed" = "#3AAF85", "Tentative" = "#F9A825")
+  ) +
+  labs(
+    title = "Boruta Variable Importance for Height Prediction",
+    subtitle = "Selected variables only. Dashed line = shadow maximum threshold",
+    x = "Importance",
+    y = NULL,
+    fill = "Decision"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    axis.text.y = element_text(size = 9),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+::: {.callout-important}
+## Feature Selection Results
+Of `r n_boruta_evaluated` candidate predictors, Boruta confirms
+`r n_boruta_confirmed` as relevant and classifies `r n_boruta_tentative` as
+tentative (borderline), yielding `r n_boruta_selected` selected variables. Age
+(`edad`) reaches a median importance of 90.8, an order of magnitude above the
+next variable, which is consistent with the developmental relationship between
+age and height. Geographic (`area`, `departamento`) and housing quality
+indicators (`recoleccion_basura`, `fuente_agua`, `material_piso`) form a
+secondary cluster in the 5 to 9 range, carrying the socioeconomic gradient
+associated with growth beyond what age accounts for.
+:::
+
+
+## Final Modeling Dataset
+
+The selected predictors, outcome variable, and validation references are
+consolidated into a single modeling-ready dataset. Three protected
+variables — `edad`, `departamento`, and `sexo` — are retained regardless of
+their Boruta decision because
+[transferring height to ENCOVI](05_03_transfer_height_to_encovi.qmd) requires
+them: `edad` and `sexo` for the WHO LMS lookup, and `departamento` for survey
+weight recalibration.
+
+```{r}
+#| label: tbl-g1-final-dataset-summary
+#| tbl-cap: "Final modeling dataset summary"
+
+tbl_g1_final_dataset_summary |>
+  gt() |>
+  tab_header(
+    title = "Final Modeling Dataset Structure",
+    subtitle = "Variables retained in the SIVESNU height modeling dataset"
+  ) |>
+  cols_label(
+    Category = "Category",
+    Variables = "Variables",
+    Count = "N"
+  ) |>
+  cols_align(align = "left", columns = c(Category, Variables)) |>
+  cols_align(align = "right", columns = Count) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Category == "TOTAL")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Category == "TOTAL")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Height Distribution by Stunting Status
+
+The final visualization shows how height is distributed by stunting status
+within each age group, which is the variation the transfer model is asked to
+reproduce in ENCOVI.
+
+```{r}
+#| label: fig-g2-height-distributions
+#| fig-cap: "Height distribution by age group and stunting status"
+#| fig-alt: >
+#|   Faceted density plot with one panel per age group, each showing height in
+#|   centimetres on the x-axis. Within every panel two overlaid curves compare
+#|   children who are not stunted (green) against those who are stunted with
+#|   HAZ below -2 (orange). In each age group the stunted curve sits at shorter
+#|   heights than the not-stunted curve, and both shift rightward with older
+#|   age groups, with the distance between the two curves widening from the
+#|   youngest panel to the oldest.
+#| fig-width: 10
+#| fig-height: 7
+
+ggplot(fig_g2_height_distributions,
+       aes(x = talla_cm, fill = stunting_status)) +
+  geom_density(alpha = 0.5, color = NA) +
+  facet_wrap(~ age_group, scales = "free") +
+  scale_fill_manual(
+    values = c("Not stunted" = "#3AAF85",
+               "Stunted (HAZ < -2)" = "#E07A5F")
+  ) +
+  labs(
+    title = "Height Distribution by Age Group and Stunting Status",
+    subtitle = "SIVESNU 2018 children aged 6-59 months",
+    x = "Height (cm)",
+    y = "Density",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4")
+  )
+```
+
+The two curves are separated in every age group, and the distance between their
+means grows from 4.4 cm at 6-11 months to 8.4 cm at 48-59 months. This pattern
+is consistent with the cumulative character of chronic undernutrition, and it
+is the signal the transfer model carries into ENCOVI.
+
+
+## Summary
+
+### Key Findings
+
+1. **Training dataset**: `r format(n_final_population, big.mark = ",")` SIVESNU
+   2018 children aged 6-59 months with valid anthropometric measurements form
+   the training population for the height transfer model.
+
+2. **Variable harmonization**: 22 predictor variables are harmonized between
+   the SIVESNU and ENCOVI coding schemes, and every child matches to a
+   household socioeconomic profile.
+
+3. **Data quality**: `r n_missing_cells` cells are missing across the predictor
+   set, each affected variable below 1% of records, and all of them
+   categorical. They are filled by Random Forest imputation, whose categorical
+   OOB error stands at `r pfc_value`.
+
+4. **Feature selection**: `r n_boruta_selected` of `r n_boruta_evaluated`
+   candidate predictors are selected by Boruta. Age leads the importance
+   ranking by an order of magnitude, and geographic and housing indicators form
+   a secondary cluster.
+
+::: {.callout-warning}
+## Limitations
+
+1. **SIVESNU sampling bias** — SIVESNU 2018 uses a health center-based
+   sampling frame, which may over-represent children who access public health
+   services. The bias is addressed by the weight recalibration against ENSMI
+   stunting prevalence in
+   [transferring height to ENCOVI](05_03_transfer_height_to_encovi.qmd).
+
+2. **Cross-sectional design** — Height is measured at a single point in time,
+   so the transfer model estimates the association between socioeconomic
+   profiles and height.
+
+3. **Sample size** — `r format(n_final_population, big.mark = ",")` children
+   supports the `r n_boruta_selected` selected predictors, and bounds how much
+   interaction structure the model can resolve, particularly in the smaller
+   departments.
+
+4. **Categorical imputation error** — The OOB misclassification rate for the
+   four imputed variables is `r pfc_value`, above the 0.2 reference value.
+:::
+
+### Application
+
+This modeling-ready dataset, along with the saved transformation objects and
+the Boruta selection results, feeds the
+[height transfer model](05_02_transfer_model_height.qmd), trained on SIVESNU
+and then applied to ENCOVI 2023 children in
+[transferring height to ENCOVI](05_03_transfer_height_to_encovi.qmd).

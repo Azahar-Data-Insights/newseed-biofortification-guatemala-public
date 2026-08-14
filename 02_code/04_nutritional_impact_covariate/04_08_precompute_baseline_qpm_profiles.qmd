@@ -1,0 +1,2115 @@
+---
+title: "Pre-compute Baseline and QPM Nutritional and Stunting Profiles"
+subtitle: "Individual-level intake, bioavailability, inadequacy, nutritional index, and GAM-based stunting impact under conventional and biofortified maize"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script pre-computes the complete baseline (conventional maize) and QPM (biofortified maize) profiles for every child in the synthetic population. Both nutrient indicators (intake, bioavailability, inadequacy) and stunting outcomes (nutritional index, GAM-derived HAZ change, stunting classification) are calculated upfront.
+
+The result is a scenario-ready dataset where downstream scripts need only select between pre-computed `*_baseline` and `*_qpm` columns based on each child's biofortification assignment flag.
+
+Main operations:
+
+1. Load synthetic population from script 04_07
+2. Load GAM model and z-score normalization parameters (both from 04_06)
+3. Detect implausible intake records and impute the nutrient variables using k-NN
+4. Define biofortification factors, absorption parameters, and H-AR thresholds
+5. Calculate baseline: total intake, bioavailability, inadequacy, nutritional index
+6. Calculate QPM: biofortified intake, bioavailability, inadequacy, nutritional index
+7. Express both nutritional indices on the estimation scale of the GAM, then calculate delta NI and evaluate the smooth at both index positions
+8. Derive QPM stunting outcomes: delta HAZ, updated HAZ, stunting classification
+9. Compute nutritional deltas and inadequacy resolution flags
+10. Generate diagnostic tables comparing baseline and QPM profiles
+11. Export enriched dataset with both profiles for scenario simulation
+
+# Setup
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Environment Setup
+# =============================================================================
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  mgcv,               # GAM: registers predict.gam() for the 04_06 model object
+  RANN,               # k-NN imputation for outlier treatment
+  gt,                 # Table formatting and presentation
+  glue,               # String interpolation
+  scales,             # Number formatting (comma, percent)
+  patchwork,          # Multi-panel plot composition
+  tidyverse           # General purpose data manipulation
+)
+
+# mgcv is attached rather than called via :: because the GAM evaluation in
+# Phase E relies on S3 dispatch: predict() on the model object loaded from
+# 04_06 resolves to predict.gam() only if the mgcv namespace is loaded.
+# Deserializing the object does not load it. Without this the call silently
+# falls through to predict.glm(), which aborts on the missing 'qr' component.
+# Scripts 04_06 and 04_07 attach mgcv for the same reason.
+
+# Packages used via :: (not loaded to minimize memory footprint)
+# rio     — import() for model loading
+# gratia  — draw() for GAM diagnostics; derivatives() for marginal effects
+# RANN    - k-nn missing values imputation
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# scenarios/
+ensure_output_dir(here("01_data", "02_processed", "scenarios"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Parameters
+
+## A1. Load Synthetic Population
+
+Load the calibrated synthetic population from script 04_07. This dataset contains synthetic children with maize/non-maize nutrient intake components, survey weights, baseline stunting predictions (`zlen_predicted`, `hfa_calculated`), and all covariates needed for scenario simulation.
+
+```{r}
+#| label: a1-load-synthetic-population
+
+# =============================================================================
+# A1. Load Synthetic Population (04_07 output)
+# =============================================================================
+
+df_input <- read_parquet(
+  here("01_data", "02_processed", 
+       "scenarios", "04_07_synthetic_population_calibrated.parquet")
+)
+```
+
+```{r}
+#| label: tbl-a1-input-inventory
+#| tbl-cap: "Input dataset: variable inventory by category"
+
+# =============================================================================
+# A1b. Input Variable Inventory
+# =============================================================================
+
+# Categorise input variables by their role in this script
+# Note: the raw block is matched first so its `_raw` columns are not swept up
+# by the `_(maiz|nomaiz)$` pattern used for the active source components.
+vars_raw_signal   <- grep("_(maiz|nomaiz)_raw$", names(df_input), value = TRUE)
+vars_source_nutri <- grep("_(maiz|nomaiz)$", names(df_input), value = TRUE)
+vars_pc           <- grep("^pc_", names(df_input), value = TRUE)
+vars_predictions  <- intersect(c("zlen_predicted", "hfa_calculated",
+                                  "nutritional_index"), names(df_input))
+vars_ids          <- intersect(c("synthetic_id", "departamento",
+                                  "weight_calibrated"), names(df_input))
+vars_other        <- setdiff(names(df_input),
+                              c(vars_raw_signal, vars_source_nutri, vars_pc,
+                                vars_predictions, vars_ids))
+
+df_input_inventory <- tibble(
+  Category = c(
+    "Identifiers & weights",
+    "Nutritional source components (maize / non-maize)",
+    "Raw transfer-model signal (donor, diagnostics only)",
+    "PCA components",
+    "Upstream predictions",
+    "Other (auxiliary, sociodemographic)"
+  ),
+  N_Variables = c(
+    length(vars_ids), length(vars_source_nutri), length(vars_raw_signal),
+    length(vars_pc), length(vars_predictions), length(vars_other)
+  )
+)
+
+df_input_inventory |>
+  gt() |>
+  tab_header(
+    title = "Input Dataset: Variable Inventory",
+    subtitle = glue("{ncol(df_input)} variables × {scales::comma(nrow(df_input))} observations")
+  ) |>
+  grand_summary_rows(
+    columns = N_Variables,
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., decimals = 0)
+  ) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = N_Variables) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(df_input_inventory, vars_raw_signal, vars_source_nutri, vars_pc,
+   vars_predictions, vars_ids, vars_other)
+```
+
+## A2. Load Model Components
+
+Load the trained GAM model for the relationship between the index and HAZ and the z-score normalization parameters for the nutritional index components, both from script 04_06. Both are fixed objects and remain constant across all scenarios.
+
+```{r}
+#| label: a2-load-models
+
+# =============================================================================
+# A2. Load Model Components
+# =============================================================================
+
+# --- GAM effect model (NI → ZLEN relationship) ---
+# Source: script 04_06_model_stunting_continuous_zlen.qmd
+gam_zlen_ni <- import(
+  here("01_data", "02_processed", 
+       "models", "04_06_gam_zlen_ni.rds"),
+  trust = TRUE
+)
+
+# --- Z-score normalization parameters, calibrated axis ---
+# Source: script 04_06_model_stunting_continuous_zlen.qmd, section A3
+normalization_params <- import(
+  here("01_data", "02_processed",
+       "models", "04_06_ni_zscore_normalization_params.rds"),
+  trust = TRUE
+)
+
+zscore_params <- normalization_params$components
+
+# --- Z-score normalization parameters, non-maize axis ---
+# Source: script 04_06_model_stunting_continuous_zlen.qmd, section G1.
+# The GAM loaded above is fitted on `nutritional_index_bio_nomaiz`. Both the
+# baseline position and the QPM increment must be built on that axis with
+# these parameters; mixing in the whole-diet ones would read the increment off
+# a curve whose unit means something else.
+nomaiz_normalization_params <- import(
+  here("01_data", "02_processed",
+       "models", "04_06_ni_bio_nomaiz_normalization_params.rds"),
+  trust = TRUE
+)
+
+zscore_params_nomaiz <- nomaiz_normalization_params$components
+
+rm(normalization_params, nomaiz_normalization_params)
+```
+
+## A3. Define Biofortification Factors
+
+Nutrient content increases in Quality Protein Maize (QPM) biofortified varieties relative to conventional maize. 
+
+**PDCAAS Calculation Method:**
+
+The Protein Digestibility Corrected Amino Acid Score (PDCAAS) follows FAO/WHO (2007) methodology for children aged 1-2 years, representing the most vulnerable segment of the target population:
+
+$$PDCAAS = AAS \times Digestibility = \frac{Lys_{maize}}{Lys_{requirement}} \times D$$
+
+| Parameter | Conventional | Biofortified | Source |
+|-----------|--------------|--------------|--------|
+| Lysine (mg/g maize) | 20.0 | 39.6 | Semilla Nueva Standard Report (2020) |
+| FAO requirement (1-2 yr) | 52 mg/g | 52 mg/g | FAO/WHO 2007, Table 36 |
+| Amino Acid Score (AAS) | 0.385 | 0.762 | = Lys_maize / 52 |
+| Digestibility | 0.824 | 0.809 | Boye et al. 2012 |
+| **PDCAAS** | **0.317** | **0.616** | = AAS × Digestibility |
+| **Biofortification Factor** | — | **1.94** | = 0.616 / 0.317 |
+
+**Sources:**
+
+- FAO/WHO (2007). Protein and Amino Acid Requirements in Human Nutrition. WHO Technical Report Series 935, Table 36.
+- Boye et al. (2012). Protein quality evaluation twenty years after the introduction of the protein digestibility corrected amino acid score method. British Journal of Nutrition. https://doi.org/10.1017/S0007114512002309
+
+**Biofortification Factors** (relative increase in maize nutrient content):
+
+| Nutrient | Factor | Source |
+|----------|--------|--------|
+| Iron | 1.19 | Semilla Nueva Standard Report (2020), +19% |
+| Zinc | 1.38 | Semilla Nueva Standard Report (2020), +38% |
+| Protein | 1.94 | PDCAAS increase from 0.317 to 0.616 (+94% utilizable protein) |
+| Lysine | 1.98 | Semilla Nueva Standard Report (2020), 2.00% → 3.96% of protein |
+| Tryptophan | 1.425 | Semilla Nueva Standard Report (2020), 0.40% → 0.57% of protein |
+
+**Source:** Semilla Nueva Standard Report, July-December 2020. https://semillanueva.org/wp-content/uploads/2025/12/Semilla-Nueva-Standard-Report-July-December-2020.pdf
+
+**Note on protein biofortification:** Total protein quantity remains unchanged in Quality Protein Maize (QPM) varieties; what changes is the amino acid profile. Lysine and tryptophan carry that change directly, and the PDCAAS rises from 0.317 to 0.616 as its consequence. The lysine and tryptophan factors apply to the amino acid series, which feed the nutritional index; the protein factor applies to the PDCAAS-adjusted protein series, which feeds the inadequacy classification against the protein H-AR threshold. Each series receives the change once.
+
+```{r}
+#| label: a3-define-biofortification-factors
+
+# =============================================================================
+# A3. QPM Biofortification Factors
+# Source: Semilla Nueva Standard Report, July-December 2020
+# =============================================================================
+
+FACTOR_FE   <- 1.19    # Iron: +19% content
+FACTOR_ZN   <- 1.38    # Zinc: +38% content
+FACTOR_PROT <- 1.94    # Protein: PDCAAS improvement (0.317 → 0.616)
+FACTOR_LYS  <- 1.98    # Lysine: 2.00% → 3.96% of protein
+FACTOR_TRP  <- 1.425   # Tryptophan: 0.40% → 0.57% of protein
+FACTOR_ENE  <- 1.00    # Energy: no change in QPM varieties
+```
+
+## A4. Define Absorption Parameters
+
+**Miller Equation Parameters** (source: Miller et al., 2015):
+
+- $K_T = 2.42$ (saturation constant)
+- $A = 0.633$ (age coefficient)
+- $E = 0.311$ (age exponent)
+
+**Iron Absorption:** Uniform 5% based on Allen et al. (2020) for predominantly plant-based diets (>80% plant foods in target population).
+
+```{r}
+#| label: a4-define-absorption-parameters
+
+# =============================================================================
+# A4. Absorption Parameters
+# =============================================================================
+
+# --- Iron absorption factor ---
+# Source: Allen et al. (2020) — 5% for high-phytate, plant-based diets
+IRON_ABSORPTION <- 0.05
+
+# --- Miller equation parameters for zinc absorption ---
+# Source: Miller et al. (2007), validated for children with MNP
+# TAZ = 0.5 × (K_T + A×Age^E + TDZ - sqrt((K_T + A×Age^E + TDZ)² - 4×A×Age^E×TDZ))
+MILLER_K_T <- 2.42
+MILLER_A   <- 0.633
+MILLER_E   <- 0.311
+```
+
+## A5. Define H-AR Thresholds
+
+Harmonized Average Requirements (H-AR) for inadequacy classification, expressed in absorbed/bioavailable units.
+
+```{r}
+#| label: a5-define-har-thresholds
+
+# =============================================================================
+# A5. H-AR Thresholds for Inadequacy Classification
+# =============================================================================
+
+# --- Iron threshold (absorbed, mg/day) --- uniform across ages
+# Source: Allen et al. (2020)
+THRESHOLD_FE_ABSORBED <- 0.5
+
+# --- Zinc thresholds (absorbed via Miller, mg/day) --- age-dependent
+# Source: EFSA (2014), Scientific Opinion on Dietary Reference Values for Zinc
+THRESHOLD_ZN_UNDER12 <- 0.732   # 6-11 months
+THRESHOLD_ZN_12TO35  <- 1.074   # 12-35 months
+THRESHOLD_ZN_36TO59  <- 1.390   # 36-59 months
+
+# --- Protein thresholds (digestible via PDCAAS, g/day) --- age-dependent
+# Source: WHO/FAO, safe level of protein intake
+PROT_THRESHOLD_UNDER36 <- 13    # 6-35 months
+PROT_THRESHOLD_36TO59  <- 19    # 36-59 months
+```
+
+---
+
+# Phase B: Outlier Detection and Imputation
+
+## B1. Define Outlier Ceiling and Identify Implausible Records
+
+Children in the synthetic population with daily maize energy intake exceeding 2,500 kcal (equivalent to approximately 685 g/day of nixtamalized maize at 3.65 kcal/g) are flagged as implausible. This threshold represents an intake level that exceeds plausible consumption for children aged 6–59 months, indicating a systematic error in the household food consumption module from which all nutrient variables are derived.
+
+The same screening applies to the non-maize side. The upper tail of the non-maize energy distribution reaches values far above the median, placing a fraction of the population outside the support of the SIVESNU distributions the models were fitted on. Each non-maize component is therefore screened against its own upper Tukey fence.
+
+**Choice of fence multiplier.** The rule declares a record implausible and triggers imputation, so it uses `k = 3`. On the non-maize energy component this places the cut at a level that, from non-maize sources alone, already exceeds the total energy requirement for this age range.
+
+Since all individual-level nutrient variables (both maize-source and non-maize-source) originate from the same ENCOVI household consumption module, an implausible value on either side signals unreliable data across the entire nutrient profile. All 12 source-specific nutrient variables are set to NA for flagged records and subsequently imputed using k-Nearest Neighbours (RANN k-d tree, k = 10, inverse-distance weighting) with sociodemographic and geographic predictors that are independent of the consumption module. Records are imputed, never dropped, so the synthetic population remains representative.
+
+**Outlier criteria:**
+
+- `ene_kcal_maiz > 2,500 kcal/day` (≈ 685 g maize/day at 3.65 kcal/g)
+- any of `fe_mg_nomaiz`, `zn_mg_nomaiz`, `lys_mg_nomaiz`, `trp_mg_nomaiz`, `ene_kcal_nomaiz` above its own `Q3 + 3·IQR`
+
+**Conversion factor:** 3.65 kcal/g — INCAP food composition value for nixtamalized maize tortilla, the predominant maize consumption form in Guatemala.
+
+```{r}
+#| label: b1-identify-outliers
+
+# =============================================================================
+# B1. Identify Implausible Consumption Records
+# =============================================================================
+
+# --- Maize ceiling ---
+# 2,500 kcal/day ≈ 685 g/day nixtamalized maize (3.65 kcal/g, INCAP)
+MAIZE_KCAL_CEILING <- 2500
+
+# --- Non-maize screen ---
+# Upper Tukey fence per component, at k = 3 (see rationale above)
+NOMAIZE_TUKEY_K <- 3
+
+vars_nomaiz_screen <- c(
+  "fe_mg_nomaiz", "zn_mg_nomaiz",
+  "lys_mg_nomaiz", "trp_mg_nomaiz",
+  "ene_kcal_nomaiz"
+)
+
+upper_fence <- function(x, k) {
+  q <- stats::quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  q[[2]] + k * (q[[2]] - q[[1]])
+}
+
+nomaiz_fences <- vapply(
+  vars_nomaiz_screen,
+  function(v) upper_fence(df_input[[v]], NOMAIZE_TUKEY_K),
+  numeric(1)
+)
+
+# --- Flag outliers ---
+# A record is flagged only on evidence: an unobserved component yields FALSE,
+# so the screen never propagates a missing value into the flag.
+flag_maize <- coalesce(df_input$ene_kcal_maiz > MAIZE_KCAL_CEILING, FALSE)
+
+flag_nomaize <- Reduce(
+  `|`,
+  lapply(vars_nomaiz_screen,
+         function(v) coalesce(df_input[[v]] > nomaiz_fences[[v]], FALSE))
+)
+
+df_flagged <- df_input |>
+  mutate(
+    flag_outlier_maize   = flag_maize,
+    flag_outlier_nomaize = flag_nomaize,
+    flag_outlier         = flag_maize | flag_nomaize
+  )
+
+n_outliers   <- sum(df_flagged$flag_outlier)
+pct_outliers <- mean(df_flagged$flag_outlier) * 100
+```
+
+```{r}
+#| label: tbl-b1-outlier-summary
+#| tbl-cap: "Outlier detection: records exceeding maize energy ceiling"
+
+# =============================================================================
+# B1b. Outlier Detection Summary
+# =============================================================================
+
+df_outlier_summary <- df_flagged |>
+  summarise(
+    n_total = n(),
+    n_outliers = sum(flag_outlier),
+    pct_outliers = mean(flag_outlier) * 100,
+    mean_ene_maiz_outliers = weighted.mean(
+      ene_kcal_maiz[flag_outlier],
+      weight_calibrated[flag_outlier],
+      na.rm = TRUE
+    ),
+    mean_ene_maiz_valid = weighted.mean(
+      ene_kcal_maiz[!flag_outlier],
+      weight_calibrated[!flag_outlier],
+      na.rm = TRUE
+    ),
+    .by = departamento
+  ) |>
+  arrange(desc(n_outliers)) |>
+  bind_rows(
+    df_flagged |>
+      summarise(
+        departamento = "NATIONAL",
+        n_total = n(),
+        n_outliers = sum(flag_outlier),
+        pct_outliers = mean(flag_outlier) * 100,
+        mean_ene_maiz_outliers = weighted.mean(
+          ene_kcal_maiz[flag_outlier],
+          weight_calibrated[flag_outlier],
+          na.rm = TRUE
+        ),
+        mean_ene_maiz_valid = weighted.mean(
+          ene_kcal_maiz[!flag_outlier],
+          weight_calibrated[!flag_outlier],
+          na.rm = TRUE
+        )
+      )
+  )
+
+export(df_outlier_summary, here("01_data", "02_processed", "web_resources", "04_08_tbl_b1_outlier_summary.rds"))
+
+df_outlier_summary |>
+  gt() |>
+  tab_header(
+    title = "Outlier Detection: Implausible Maize Energy Intake",
+    subtitle = glue(
+      "Maize ceiling: {MAIZE_KCAL_CEILING} kcal/day ",
+      "(≈ {round(MAIZE_KCAL_CEILING / 3.65)} g/day) | ",
+      "non-maize: Q3 + {NOMAIZE_TUKEY_K}·IQR per component"
+    )
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_total = "N Total",
+    n_outliers = "N Outliers",
+    pct_outliers = "% Outliers",
+    mean_ene_maiz_outliers = "Mean kcal (outliers)",
+    mean_ene_maiz_valid = "Mean kcal (valid)"
+  ) |>
+  fmt_number(columns = c(n_total, n_outliers), decimals = 0) |>
+  fmt_number(columns = c(pct_outliers), decimals = 1) |>
+  fmt_number(columns = c(mean_ene_maiz_outliers, mean_ene_maiz_valid), decimals = 0) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = departamento == "NATIONAL")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(columns = pct_outliers, rows = pct_outliers > 10)
+  ) |>
+  sub_missing(missing_text = "—") |>
+  tab_source_note(
+    source_note = "Conversion: 3.65 kcal/g (INCAP, nixtamalized maize tortilla)."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_outlier_summary)
+```
+
+## B2. Set Nutrient Variables to NA for Outlier Records
+
+All 12 source-specific nutrient intake variables (6 maize-source + 6 non-maize-source) are set to NA for flagged records. The full nutrient profile is invalidated because all variables derive from the same household food consumption module — an error in maize intake indicates unreliable data across the entire dietary record.
+
+Variables invalidated: `fe_mg_maiz`, `fe_mg_nomaiz`, `zn_mg_maiz`, `zn_mg_nomaiz`, `prot_g_maiz`, `prot_g_nomaiz`, `lys_mg_maiz`, `lys_mg_nomaiz`, `trp_mg_maiz`, `trp_mg_nomaiz`, `ene_kcal_maiz`, `ene_kcal_nomaiz`.
+
+The parallel `*_raw` block — the donor's uncalibrated transfer-model predictions carried through from 04_01 — is left untouched here and in the k-NN imputation that follows, so that it keeps recording what the transfer model produced for the donor.
+
+```{r}
+#| label: b2-set-outliers-to-na
+
+# =============================================================================
+# B2. Invalidate Nutritional Variables for Outlier Records
+# =============================================================================
+
+vars_to_invalidate <- c(
+  "fe_mg_maiz",  "fe_mg_nomaiz",
+  "zn_mg_maiz",  "zn_mg_nomaiz",
+  "prot_g_maiz", "prot_g_nomaiz",
+  "lys_mg_maiz", "lys_mg_nomaiz",
+  "trp_mg_maiz", "trp_mg_nomaiz",
+  "ene_kcal_maiz", "ene_kcal_nomaiz"
+)
+
+df_invalidated <- df_flagged |>
+  mutate(
+    across(
+      all_of(vars_to_invalidate),
+      ~ if_else(flag_outlier, NA_real_, .)
+    )
+  )
+```
+
+## B3. Impute Nutrient Variables Using k-Nearest Neighbours
+
+Plausible nutrient values for flagged records are reconstructed using k-nearest neighbour imputation with a k-d tree search algorithm (RANN). For each outlier child, the algorithm identifies the 10 closest valid children in a scaled Euclidean space defined by sociodemographic and geographic predictors. The imputed value for each nutrient variable is the inverse-distance-weighted mean of the 10 neighbours' values.
+
+This approach assigns values that reflect the expected nutrient intake for children sharing the demographic, geographic and socioeconomic profile of the flagged child.
+
+**Algorithm:** k-NN with k-d tree (RANN), k = 10, inverse-distance weighting.
+
+**Predictors**: the child's own ENCOVI record — age, sex, department, area, household education and the plant-source share of the diet. The quantity being reconstructed is an ENCOVI dietary value, so the imputation is conditioned on variables observed for the same child in the same survey.
+
+Five of the six are collected outside the food consumption module. The plant-source share is a composition ratio derived from it, and is retained on that basis: the reporting error the screen targets scales the reported quantities of a household and leaves their relative composition intact, so the ratio carries dietary-pattern signal that survives the error invalidating the amounts.
+
+The set carries one variable per dimension of the matching space: demographics, geography, socioeconomic position and diet composition. All are continuous or binary, which keeps the scaled Euclidean metric well defined and leaves each dimension weighted once.
+
+**Variables imputed** (12): all source-specific nutrient intake variables (maize and non-maize).
+
+**Biological constraint:** Imputed values are floored at zero to prevent negative nutrient intakes.
+
+```{r}
+#| label: b3-knn-imputation
+
+# =============================================================================
+# B3. k-NN Imputation (RANN k-d tree)
+# =============================================================================
+
+# --- Define predictor variables (continuous and binary, for the k-d tree) ---
+vars_predictors <- c(
+  "edad_mes_nino",         # Child age in months
+  "grado_estudios_hogar",  # Household education level (numeric mean)
+  "per_vegetales",         # Plant-source share of the diet
+  ".sexo_num",             # Sex
+  ".area_num",             # Area
+  ".dept_num"              # Department
+)
+
+# --- Encode the categorical predictors ---
+df_invalidated_numeric <- df_invalidated |>
+  mutate(
+    .sexo_num = as.integer(sexo == "Hombre"),
+    .area_num = as.integer(factor(area)),
+    .dept_num = as.integer(factor(departamento))
+  )
+
+# --- Split valid and outlier records ---
+df_valid   <- df_invalidated_numeric |> filter(!flag_outlier)
+df_outlier <- df_invalidated_numeric |> filter(flag_outlier)
+
+# --- Build predictor matrices (scaled for distance calculation) ---
+predictors_valid <- df_valid |>
+  select(all_of(vars_predictors)) |>
+  mutate(across(everything(), ~ as.numeric(.))) |>
+  as.matrix() |>
+  scale()
+
+# Store scaling parameters to apply same transformation to outliers
+scale_center <- attr(predictors_valid, "scaled:center")
+scale_scale  <- attr(predictors_valid, "scaled:scale")
+
+predictors_outlier <- df_outlier |>
+  select(all_of(vars_predictors)) |>
+  mutate(across(everything(), ~ as.numeric(.))) |>
+  as.matrix() |>
+  scale(center = scale_center, scale = scale_scale)
+
+# --- Find 10 nearest valid neighbours for each outlier ---
+nn_result <- RANN::nn2(
+  data  = predictors_valid,
+  query = predictors_outlier,
+  k = 10
+)
+
+# --- Impute: weighted mean of k neighbours' nutritional values ---
+valid_nutri_matrix <- df_valid |>
+  select(all_of(vars_to_invalidate)) |>
+  as.matrix()
+
+# --- Inverse-distance weights, normalised per row -----------------------
+# weights_matrix[i, k] = 1 / (dist[i, k] + epsilon), then row-normalised
+weights_matrix <- 1 / (nn_result$nn.dists + 1e-8)
+weights_matrix <- weights_matrix / rowSums(weights_matrix)
+
+# --- Vectorised imputation: weighted mean of k neighbours per outlier ---
+# For each outlier i and nutrient j:
+#   imputed[i, j] = sum_k(weights[i, k] * valid_nutri[nn.idx[i, k], j])
+# Implemented column-by-column with matrix indexing — no explicit row loop.
+imputed_matrix <- vapply(
+  seq_along(vars_to_invalidate),
+  function(j) {
+    # Look up each outlier's 10 neighbour values for nutrient j
+    # Result shape: [n_outliers x 10]
+    neighbour_values <- matrix(
+      valid_nutri_matrix[nn_result$nn.idx, j],
+      nrow = nrow(nn_result$nn.idx),
+      ncol = ncol(nn_result$nn.idx)
+    )
+    # Weighted sum across the k neighbours for each outlier
+    rowSums(neighbour_values * weights_matrix)
+  },
+  numeric(nrow(nn_result$nn.idx))
+)
+colnames(imputed_matrix) <- vars_to_invalidate
+
+# --- Floor negative values to zero (biological constraint) ---
+df_imputed_values <- as_tibble(imputed_matrix) |>
+  mutate(across(everything(), ~ pmax(., 0)))
+
+# --- Reassemble full dataset ---
+df_reassembled <- df_invalidated
+
+outlier_rows <- which(df_reassembled$flag_outlier)
+df_reassembled[outlier_rows, vars_to_invalidate] <- df_imputed_values
+
+df_imputed <- df_reassembled
+
+# --- Cleanup intermediate objects ---
+rm(df_invalidated_numeric, df_valid, df_outlier,
+   predictors_valid, predictors_outlier,
+   scale_center, scale_scale, nn_result, valid_nutri_matrix,
+   imputed_matrix, outlier_rows, df_imputed_values, df_reassembled)
+```
+
+
+## B4. Imputation Quality Assessment
+
+Imputation quality is evaluated by comparing the distribution of imputed values against valid records within the same departments. Outlier records concentrate in high-maize-consumption departments, so the comparison is stratified by department and each imputed child is benchmarked against the valid children of its own department.
+
+Mean ratios close to 1.0 indicate that imputed values are consistent with the intake patterns observed among valid children in the same geographic and demographic context.
+
+```{r}
+#| label: tbl-b4-imputation-quality
+#| tbl-cap: "k-NN imputation quality: department-stratified comparison of imputed vs valid distributions"
+
+# =============================================================================
+# B4. Imputation Quality Assessment (Department-Stratified)
+# =============================================================================
+
+# --- Departments with outliers ---
+depts_with_outliers <- df_invalidated |>
+  filter(flag_outlier) |>
+  distinct(departamento) |>
+  pull(departamento)
+
+# --- Valid records in affected departments ---
+df_valid_dept <- df_invalidated |>
+  filter(!flag_outlier, departamento %in% depts_with_outliers) |>
+  select(all_of(vars_to_invalidate)) |>
+  summarise(across(everything(), list(mean = mean, sd = sd))) |>
+  pivot_longer(everything(), names_to = "stat", values_to = "value") |>
+  mutate(group = "Valid (same depts)")
+
+# --- Imputed records ---
+df_imputed_dept <- df_imputed |>
+  filter(df_invalidated$flag_outlier) |>
+  select(all_of(vars_to_invalidate)) |>
+  summarise(across(everything(), list(mean = mean, sd = sd))) |>
+  pivot_longer(everything(), names_to = "stat", values_to = "value") |>
+  mutate(group = "Imputed")
+
+# --- Build comparison table ---
+df_quality <- bind_rows(df_valid_dept, df_imputed_dept) |>
+  separate(stat, into = c("variable", "metric"), sep = "_(?=mean$|sd$)") |>
+  pivot_wider(names_from = c(group, metric), values_from = value) |>
+  rename(
+    Valid_mean = `Valid (same depts)_mean`,
+    Valid_sd = `Valid (same depts)_sd`,
+    Imputed_mean = Imputed_mean,
+    Imputed_sd = Imputed_sd
+  ) |>
+  mutate(
+    mean_ratio = Imputed_mean / Valid_mean,
+    sd_ratio = Imputed_sd / Valid_sd
+  )
+
+export(df_quality, here("01_data", "02_processed", "web_resources", "04_08_tbl_b4_imputation_quality.rds"))
+
+df_quality |>
+  gt() |>
+  tab_header(
+    title = "k-NN Imputation Quality Assessment",
+    subtitle = glue(
+      "k = 10, inverse-distance weighted, RANN k-d tree — {n_outliers} records ({round(pct_outliers, 1)}%)\n",
+      "Comparison restricted to {length(depts_with_outliers)} departments with outlier records"
+    )
+  ) |>
+  cols_label(
+    variable = "Variable",
+    Valid_mean = "Valid Mean",
+    Imputed_mean = "Imputed Mean",
+    Valid_sd = "Valid SD",
+    Imputed_sd = "Imputed SD",
+    mean_ratio = "Mean Ratio",
+    sd_ratio = "SD Ratio"
+  ) |>
+  fmt_number(columns = c(Valid_mean, Imputed_mean, Valid_sd, Imputed_sd), decimals = 2) |>
+  fmt_number(columns = c(mean_ratio, sd_ratio), decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = mean_ratio, rows = mean_ratio > 0.8 & mean_ratio < 1.2)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(columns = mean_ratio, rows = mean_ratio <= 0.8 | mean_ratio >= 1.2)
+  ) |>
+  tab_source_note(
+    source_note = "k-NN with k-d tree (RANN). Euclidean distance on scaled numeric predictors + department. Inverse-distance weighting. Comparison stratified to departments containing outlier records."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(df_quality, df_valid_dept, df_imputed_dept, depts_with_outliers)
+```
+
+## B5. Pre- and Post-Imputation Distribution Comparison
+
+Density plots comparing the distribution of key nutrient variables before and after imputation. The imputed values (outlier records only) should fall within the range of valid observations without generating artificial peaks or distribution artefacts.
+
+```{r}
+#| label: fig-b5-imputation-density
+#| fig-cap: "Pre- and post-imputation density comparison for key nutritional variables"
+#| fig-height: 10
+#| fig-width: 10
+
+# =============================================================================
+# B5. Distribution Comparison: Pre- vs Post-Imputation
+# =============================================================================
+
+df_comparison <- bind_rows(
+  df_input |>
+    filter(df_flagged$flag_outlier) |>
+    select(fe_mg_maiz, zn_mg_maiz, prot_g_maiz, ene_kcal_maiz) |>
+    mutate(source = "Original (outliers)"),
+  df_imputed |>
+    filter(flag_outlier) |>
+    select(fe_mg_maiz, zn_mg_maiz, prot_g_maiz, ene_kcal_maiz) |>
+    mutate(source = "Imputed"),
+  df_input |>
+    filter(!df_flagged$flag_outlier) |>
+    select(fe_mg_maiz, zn_mg_maiz, prot_g_maiz, ene_kcal_maiz) |>
+    mutate(source = "Valid (non-outlier)")
+)
+
+export(df_comparison, here("01_data", "02_processed", "web_resources", "04_08_fig_b5_imputation_density.rds"))
+
+colors_comparison <- c(
+  "Original (outliers)" = "#E74C3C",
+  "Imputed" = "#3AAF85",
+  "Valid (non-outlier)" = "#1B6CA8"
+)
+
+theme_density <- theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 11, face = "bold", color = "gray30"),
+    axis.title = element_text(size = 9, color = "gray30"),
+    legend.title = element_blank()
+  )
+
+p_fe <- ggplot(df_comparison, aes(x = fe_mg_maiz, fill = source, color = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.5) +
+  scale_fill_manual(values = colors_comparison) +
+  scale_color_manual(values = colors_comparison) +
+  labs(title = "Iron from maize (mg/day)", x = "Fe maize (mg/day)", y = "Density") +
+  coord_cartesian(xlim = c(0, quantile(df_input$fe_mg_maiz, 0.99))) +
+  theme_density
+
+p_zn <- ggplot(df_comparison, aes(x = zn_mg_maiz, fill = source, color = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.5) +
+  scale_fill_manual(values = colors_comparison) +
+  scale_color_manual(values = colors_comparison) +
+  labs(title = "Zinc from maize (mg/day)", x = "Zn maize (mg/day)", y = "Density") +
+  coord_cartesian(xlim = c(0, quantile(df_input$zn_mg_maiz, 0.99))) +
+  theme_density
+
+p_prot <- ggplot(df_comparison, aes(x = prot_g_maiz, fill = source, color = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.5) +
+  scale_fill_manual(values = colors_comparison) +
+  scale_color_manual(values = colors_comparison) +
+  labs(title = "Protein from maize (g/day)", x = "Prot maize (g/day)", y = "Density") +
+  coord_cartesian(xlim = c(0, quantile(df_input$prot_g_maiz, 0.99))) +
+  theme_density
+
+p_ene <- ggplot(df_comparison, aes(x = ene_kcal_maiz, fill = source, color = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.5) +
+  scale_fill_manual(values = colors_comparison) +
+  scale_color_manual(values = colors_comparison) +
+  labs(title = "Energy from maize (kcal/day)", x = "Energy maize (kcal/day)", y = "Density") +
+  coord_cartesian(xlim = c(0, quantile(df_input$ene_kcal_maiz, 0.99))) +
+  theme_density
+
+(p_fe + p_zn) / (p_prot + p_ene) +
+  plot_annotation(
+    title = "Distribution Comparison: Original Outliers vs Imputed Values",
+    subtitle = glue("{n_outliers} records imputed ({round(pct_outliers, 1)}% of population)"),
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", color = "gray30"),
+      plot.subtitle = element_text(size = 11, color = "gray50")
+    )
+  )
+
+rm(df_comparison, p_fe, p_zn, p_prot, p_ene, theme_density, colors_comparison)
+```
+
+## B6. Non-Maize Protein Outlier Treatment
+
+Digestible protein from non-maize sources exhibits a heavy right tail in the dietary intake distribution. A small fraction of children report non-maize protein intake exceeding its upper Tukey fence, and those extreme values propagate into the protein totals.
+
+**Choice of fence multiplier.** Protein is screened on its own axis, after the block treatment of B1-B3 has settled the rest of the nutrient profile. The criterion targets the tail of a single component rather than a systematically unreliable record, so it uses `k = 1.5`.
+
+Implausible non-maize protein records are detected against the fence and replaced via k-NN imputation with the ENCOVI predictor set of B3. Only the non-maize protein variable is invalidated and imputed; all other nutrient variables remain unchanged.
+
+```{r}
+#| label: b6-protein-nomaize-treatment
+
+# =============================================================================
+# B6. Non-Maize Protein Outlier Treatment
+# =============================================================================
+
+PROT_NOMAIZ_TUKEY_K <- 1.5
+
+PROT_NOMAIZ_FENCE <- upper_fence(df_imputed$prot_g_nomaiz, PROT_NOMAIZ_TUKEY_K)
+
+df_prot_flagged <- df_imputed |>
+  mutate(flag_prot_nomaiz = prot_g_nomaiz > PROT_NOMAIZ_FENCE)
+
+n_prot_flagged   <- sum(df_prot_flagged$flag_prot_nomaiz)
+pct_prot_flagged <- mean(df_prot_flagged$flag_prot_nomaiz) * 100
+
+# --- Encode the categorical predictors ---
+df_prot_numeric <- df_prot_flagged |>
+  mutate(
+    .sexo_num = as.integer(sexo == "Hombre"),
+    .area_num = as.integer(factor(area)),
+    .dept_num = as.integer(factor(departamento))
+  )
+
+# --- Split valid and outlier records ---
+df_prot_valid   <- df_prot_numeric |> filter(!flag_prot_nomaiz)
+df_prot_outlier <- df_prot_numeric |> filter(flag_prot_nomaiz)
+
+# --- Build predictor matrices (scaled for distance calculation) ---
+prot_predictors_valid <- df_prot_valid |>
+  select(all_of(vars_predictors)) |>
+  mutate(across(everything(), ~ as.numeric(.))) |>
+  as.matrix() |>
+  scale()
+
+prot_scale_center <- attr(prot_predictors_valid, "scaled:center")
+prot_scale_scale  <- attr(prot_predictors_valid, "scaled:scale")
+
+prot_predictors_outlier <- df_prot_outlier |>
+  select(all_of(vars_predictors)) |>
+  mutate(across(everything(), ~ as.numeric(.))) |>
+  as.matrix() |>
+  scale(center = prot_scale_center, scale = prot_scale_scale)
+
+# --- Find 10 nearest valid neighbours for each outlier ---
+prot_nn_result <- RANN::nn2(
+  data  = prot_predictors_valid,
+  query = prot_predictors_outlier,
+  k = 10
+)
+
+# --- Inverse-distance weights, normalised per row ---
+prot_weights <- 1 / (prot_nn_result$nn.dists + 1e-8)
+prot_weights <- prot_weights / rowSums(prot_weights)
+
+# --- Impute: weighted mean of the k neighbours, floored at zero ---
+prot_neighbour_values <- matrix(
+  df_prot_valid$prot_g_nomaiz[prot_nn_result$nn.idx],
+  nrow = nrow(prot_nn_result$nn.idx),
+  ncol = ncol(prot_nn_result$nn.idx)
+)
+
+prot_imputed_values <- pmax(rowSums(prot_neighbour_values * prot_weights), 0)
+
+# --- Reassemble full dataset ---
+df_prot_replaced <- df_prot_flagged
+df_prot_replaced$prot_g_nomaiz[df_prot_replaced$flag_prot_nomaiz] <- prot_imputed_values
+
+df_prot_imputed <- df_prot_replaced |>
+  select(-flag_prot_nomaiz)
+```
+
+```{r}
+#| label: tbl-b6-protein-imputation
+#| tbl-cap: "Non-maize protein imputation: valid, original and imputed values"
+
+# =============================================================================
+# B6b. Non-Maize Protein Imputation Diagnostics
+# =============================================================================
+
+df_b6_diag <- tibble(
+  Source = c("Valid (non-flagged)", "Original outliers", "Imputed (k-NN)"),
+  N = c(nrow(df_prot_valid), nrow(df_prot_outlier), nrow(df_prot_outlier)),
+  Mean = c(mean(df_prot_valid$prot_g_nomaiz),
+           mean(df_prot_outlier$prot_g_nomaiz),
+           mean(prot_imputed_values)),
+  Median = c(median(df_prot_valid$prot_g_nomaiz),
+             median(df_prot_outlier$prot_g_nomaiz),
+             median(prot_imputed_values)),
+  Max = c(max(df_prot_valid$prot_g_nomaiz),
+          max(df_prot_outlier$prot_g_nomaiz),
+          max(prot_imputed_values))
+)
+
+export(df_b6_diag, here("01_data", "02_processed", "web_resources",
+                        "04_08_tbl_b6_protein_imputation.rds"))
+
+df_b6_diag |>
+  gt() |>
+  tab_header(
+    title = "Non-Maize Protein: Imputation Diagnostics",
+    subtitle = glue(
+      "{n_prot_flagged} records imputed ({round(pct_prot_flagged, 1)}%) | ",
+      "Fence: {round(PROT_NOMAIZ_FENCE, 1)} g/day"
+    )
+  ) |>
+  fmt_number(columns = c(Mean, Median, Max), decimals = 2) |>
+  fmt_number(columns = N, decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "left", columns = Source) |>
+  tab_source_note(
+    "k-NN RANN (k = 10, inverse-distance weighted). Same predictors as the B3 imputation."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(df_b6_diag)
+```
+
+```{r}
+#| label: b7-cleanup
+
+# =============================================================================
+# Phase Cleanup
+# =============================================================================
+
+rm(df_flagged, df_invalidated, df_imputed,
+   vars_to_invalidate, vars_predictors,
+   n_outliers, pct_outliers, MAIZE_KCAL_CEILING,
+   NOMAIZE_TUKEY_K, vars_nomaiz_screen, upper_fence, nomaiz_fences,
+   flag_maize, flag_nomaize,
+   df_prot_flagged, df_prot_numeric, df_prot_replaced,
+   df_prot_valid, df_prot_outlier,
+   prot_predictors_valid, prot_predictors_outlier,
+   prot_scale_center, prot_scale_scale,
+   prot_nn_result, prot_weights, prot_neighbour_values, prot_imputed_values,
+   n_prot_flagged, pct_prot_flagged,
+   PROT_NOMAIZ_TUKEY_K, PROT_NOMAIZ_FENCE)
+```
+
+---
+
+# Phase C: Baseline Nutrient Profile
+
+## C1. Calculate Total Intake and Bioavailability (Baseline)
+
+Aggregate maize and non-maize sources to obtain total daily intake under conventional maize, then compute bioavailable fractions: iron (uniform 5%) and zinc (Miller equation).
+
+```{r}
+#| label: c1-baseline-intake-and-bioavailability
+
+# =============================================================================
+# C1. Total Intake and Bioavailability — Baseline (Conventional Maize)
+# =============================================================================
+
+df_baseline <- df_prot_imputed |>
+  select(-flag_outlier, -flag_outlier_maize, -flag_outlier_nomaize) |>
+  mutate(
+    # --- Total intake (maize + non-maize) ---
+    fe_mg_total_baseline    = fe_mg_maiz + fe_mg_nomaiz,
+    zn_mg_total_baseline    = zn_mg_maiz + zn_mg_nomaiz,
+    prot_g_total_baseline   = prot_g_maiz + prot_g_nomaiz,
+    lys_mg_total_baseline   = lys_mg_maiz + lys_mg_nomaiz,
+    trp_mg_total_baseline   = trp_mg_maiz + trp_mg_nomaiz,
+    ene_kcal_total_baseline = ene_kcal_maiz + ene_kcal_nomaiz,
+    
+    # --- Iron absorption (uniform 5%) ---
+    fe_absorbed_mg_baseline = fe_mg_total_baseline * IRON_ABSORPTION,
+    
+    # --- Zinc absorption (Miller equation) ---
+    miller_age_factor = MILLER_A * (edad_mes_nino ^ MILLER_E),
+    miller_sum        = MILLER_K_T + miller_age_factor + zn_mg_total_baseline,
+    miller_disc       = (miller_sum ^ 2) - (4 * miller_age_factor * zn_mg_total_baseline),
+    taz_mg_baseline   = 0.5 * (miller_sum - sqrt(miller_disc)),
+    zn_fractional_absorption_baseline = taz_mg_baseline / zn_mg_total_baseline
+  ) |>
+  select(-miller_age_factor, -miller_sum, -miller_disc)
+```
+
+## C2. Calculate Nutritional Index (Baseline)
+
+Two 4-component indices are computed, one per axis.
+
+`nutritional_index_bio_baseline` runs on the calibrated block with the section A3 parameters. It describes the nutrient position of the synthetic child on the same scale as the rest of the pipeline and feeds the diagnostic tables of Phase G.
+
+`nutritional_index_bio_nomaiz_baseline` runs on the non-maize sources alone with the section G1 parameters. This is the axis the GAM effect model is fitted on, and the one at which Phase E evaluates it. Both use the same absorption constants; they differ in the sources they draw on, in applying the Miller model to the non-maize zinc pool alone, and in their normalization parameters.
+
+```{r}
+#| label: c2-baseline-nutritional-index
+
+# =============================================================================
+# C2. Nutritional Index — Baseline (4-component, z-score normalized)
+# =============================================================================
+
+df_baseline_ni <- df_baseline |>
+  mutate(
+    # --- Calibrated axis (descriptive) ---
+    fe_zscore_baseline  = (fe_absorbed_mg_baseline - zscore_params$fe_absorbed_mg$mean) /
+                           zscore_params$fe_absorbed_mg$sd,
+    zn_zscore_baseline  = (taz_mg_baseline - zscore_params$taz_mg$mean) /
+                           zscore_params$taz_mg$sd,
+    lys_zscore_baseline = (lys_mg_total_baseline - zscore_params$lys_mg_total$mean) /
+                           zscore_params$lys_mg_total$sd,
+    trp_zscore_baseline = (trp_mg_total_baseline - zscore_params$trp_mg_total$mean) /
+                           zscore_params$trp_mg_total$sd,
+
+    nutritional_index_bio_baseline = (fe_zscore_baseline + zn_zscore_baseline +
+                                        lys_zscore_baseline + trp_zscore_baseline) / 4,
+
+    # --- Non-maize axis (GAM evaluation) ---
+    # Built from the non-maize sources alone, which already carry the Chispitas
+    # contribution added in 04_07. The Miller model is applied to the non-maize
+    # zinc pool, matching the construction used to fit the smooth in 04_06.
+    fe_absorbed_mg_nomaiz_baseline = fe_mg_nomaiz * IRON_ABSORPTION,
+
+    miller_age_nm  = MILLER_A * (edad_mes_nino ^ MILLER_E),
+    miller_sum_nm  = MILLER_K_T + miller_age_nm + zn_mg_nomaiz,
+    miller_disc_nm = (miller_sum_nm ^ 2) - (4 * miller_age_nm * zn_mg_nomaiz),
+    taz_mg_nomaiz_baseline = 0.5 * (miller_sum_nm - sqrt(miller_disc_nm)),
+
+    fe_zscore_nm_baseline  = (fe_absorbed_mg_nomaiz_baseline -
+                              zscore_params_nomaiz$fe_absorbed_mg_nomaiz$mean) /
+                              zscore_params_nomaiz$fe_absorbed_mg_nomaiz$sd,
+    zn_zscore_nm_baseline  = (taz_mg_nomaiz_baseline -
+                              zscore_params_nomaiz$taz_mg_nomaiz$mean) /
+                              zscore_params_nomaiz$taz_mg_nomaiz$sd,
+    lys_zscore_nm_baseline = (lys_mg_nomaiz -
+                              zscore_params_nomaiz$lys_mg_nomaiz$mean) /
+                              zscore_params_nomaiz$lys_mg_nomaiz$sd,
+    trp_zscore_nm_baseline = (trp_mg_nomaiz -
+                              zscore_params_nomaiz$trp_mg_nomaiz$mean) /
+                              zscore_params_nomaiz$trp_mg_nomaiz$sd,
+
+    nutritional_index_bio_nomaiz_baseline = (fe_zscore_nm_baseline + zn_zscore_nm_baseline +
+                                               lys_zscore_nm_baseline + trp_zscore_nm_baseline) / 4
+  ) |>
+  select(-fe_zscore_baseline, -zn_zscore_baseline,
+         -lys_zscore_baseline, -trp_zscore_baseline,
+         -miller_age_nm, -miller_sum_nm, -miller_disc_nm,
+         -fe_zscore_nm_baseline, -zn_zscore_nm_baseline,
+         -lys_zscore_nm_baseline, -trp_zscore_nm_baseline)
+```
+
+## C3. Classify Inadequacy (Baseline)
+
+Compare absorbed nutrient values against age-specific H-AR thresholds.
+
+```{r}
+#| label: c3-baseline-inadequacy
+
+# =============================================================================
+# C3. Inadequacy Classification — Baseline
+# =============================================================================
+
+df_baseline_inadeq <- df_baseline_ni |>
+  mutate(
+    # --- H-AR thresholds (age-dependent, retained for downstream reference) ---
+    har_taz_mg = case_when(
+      edad_mes_nino < 12  ~ THRESHOLD_ZN_UNDER12,
+      edad_mes_nino < 36  ~ THRESHOLD_ZN_12TO35,
+      edad_mes_nino >= 36 ~ THRESHOLD_ZN_36TO59
+    ),
+    har_prot_g = case_when(
+      edad_mes_nino < 36  ~ PROT_THRESHOLD_UNDER36,
+      edad_mes_nino >= 36 ~ PROT_THRESHOLD_36TO59
+    ),
+    
+    # --- Iron inadequacy (uniform threshold) ---
+    inadequacy_fe_baseline = as.integer(fe_absorbed_mg_baseline < THRESHOLD_FE_ABSORBED),
+    gap_fe_mg_baseline     = fe_absorbed_mg_baseline - THRESHOLD_FE_ABSORBED,
+    ratio_fe_baseline      = fe_absorbed_mg_baseline / THRESHOLD_FE_ABSORBED,
+    
+    # --- Zinc inadequacy ---
+    inadequacy_zn_baseline = as.integer(taz_mg_baseline < har_taz_mg),
+    gap_zn_mg_baseline     = taz_mg_baseline - har_taz_mg,
+    ratio_zn_baseline      = taz_mg_baseline / har_taz_mg,
+    
+    # --- Protein inadequacy ---
+    inadequacy_prot_baseline = as.integer(prot_g_total_baseline < har_prot_g),
+    gap_prot_g_baseline      = prot_g_total_baseline - har_prot_g,
+    ratio_prot_baseline      = prot_g_total_baseline / har_prot_g,
+    
+    # --- Combined inadequacy ---
+    n_inadequacies_baseline  = inadequacy_fe_baseline + inadequacy_zn_baseline + inadequacy_prot_baseline,
+    any_inadequacy_baseline  = as.integer(n_inadequacies_baseline > 0),
+    all_inadequate_baseline  = as.integer(n_inadequacies_baseline == 3)
+  )
+```
+
+---
+
+# Phase D: QPM Nutrient Profile
+
+## D1. Calculate QPM Intake, Bioavailability, and Nutritional Index
+
+Apply biofortification factors to maize-source nutrients, recalculate totals, compute bioavailable fractions, and derive the QPM nutritional index. Non-maize sources remain unchanged.
+
+The factors are applied twice, once per axis, and always to the maize component of that axis alone: on the whole-diet axis they multiply the maize component, and on the non-maize axis the extra nutrient the improved grain delivers, `maiz × (FACTOR − 1)`, enters the non-maize pool. The non-maize QPM index is the one that enters the GAM in Phase E, and both its position and its increment are scored with the non-maize normalization parameters, so the increment is expressed in the same units as the smooth.
+
+```{r}
+#| label: d1-qpm-intake-bioavailability-ni
+
+# =============================================================================
+# D1. Total Intake, Bioavailability, and Nutritional Index — QPM
+# =============================================================================
+
+df_qpm <- df_baseline_inadeq |>
+  mutate(
+    # --- Total intake (biofortified maize + non-maize) ---
+    fe_mg_total_qpm    = (fe_mg_maiz * FACTOR_FE) + fe_mg_nomaiz,
+    zn_mg_total_qpm    = (zn_mg_maiz * FACTOR_ZN) + zn_mg_nomaiz,
+    prot_g_total_qpm   = (prot_g_maiz * FACTOR_PROT) + prot_g_nomaiz,
+    lys_mg_total_qpm   = (lys_mg_maiz * FACTOR_LYS) + lys_mg_nomaiz,
+    trp_mg_total_qpm   = (trp_mg_maiz * FACTOR_TRP) + trp_mg_nomaiz,
+    ene_kcal_total_qpm = (ene_kcal_maiz * FACTOR_ENE) + ene_kcal_nomaiz,
+    
+    # --- Iron absorption (uniform 5%) ---
+    fe_absorbed_mg_qpm = fe_mg_total_qpm * IRON_ABSORPTION,
+    
+    # --- Zinc absorption (Miller equation) ---
+    miller_age_factor = MILLER_A * (edad_mes_nino ^ MILLER_E),
+    miller_sum        = MILLER_K_T + miller_age_factor + zn_mg_total_qpm,
+    miller_disc       = (miller_sum ^ 2) - (4 * miller_age_factor * zn_mg_total_qpm),
+    taz_mg_qpm        = 0.5 * (miller_sum - sqrt(miller_disc)),
+    zn_fractional_absorption_qpm = taz_mg_qpm / zn_mg_total_qpm,
+    
+    # --- Nutritional index (4-component, z-score normalized) ---
+    fe_zscore_qpm  = (fe_absorbed_mg_qpm - zscore_params$fe_absorbed_mg$mean) / 
+                      zscore_params$fe_absorbed_mg$sd,
+    zn_zscore_qpm  = (taz_mg_qpm - zscore_params$taz_mg$mean) / 
+                      zscore_params$taz_mg$sd,
+    lys_zscore_qpm = (lys_mg_total_qpm - zscore_params$lys_mg_total$mean) / 
+                      zscore_params$lys_mg_total$sd,
+    trp_zscore_qpm = (trp_mg_total_qpm - zscore_params$trp_mg_total$mean) / 
+                      zscore_params$trp_mg_total$sd,
+    
+    nutritional_index_bio_qpm = (fe_zscore_qpm + zn_zscore_qpm +
+                                   lys_zscore_qpm + trp_zscore_qpm) / 4,
+
+    # === NON-MAIZE AXIS — the profile the GAM is evaluated at ===
+    # The biofortification increment is the extra nutrient the improved grain
+    # delivers, `maiz * (FACTOR - 1)`. It is added to the non-maize pool: the
+    # smooth was fitted on nutrients arriving through non-maize sources, so the
+    # increment must enter on the same footing to be read off the same curve.
+    # This assumes a milligram acts the same whatever food carried it.
+    fe_mg_nomaiz_qpm  = fe_mg_nomaiz  + fe_mg_maiz  * (FACTOR_FE  - 1),
+    zn_mg_nomaiz_qpm  = zn_mg_nomaiz  + zn_mg_maiz  * (FACTOR_ZN  - 1),
+    lys_mg_nomaiz_qpm = lys_mg_nomaiz + lys_mg_maiz * (FACTOR_LYS - 1),
+    trp_mg_nomaiz_qpm = trp_mg_nomaiz + trp_mg_maiz * (FACTOR_TRP - 1),
+
+    fe_absorbed_mg_nomaiz_qpm = fe_mg_nomaiz_qpm * IRON_ABSORPTION,
+
+    miller_age_nm  = MILLER_A * (edad_mes_nino ^ MILLER_E),
+    miller_sum_nm  = MILLER_K_T + miller_age_nm + zn_mg_nomaiz_qpm,
+    miller_disc_nm = (miller_sum_nm ^ 2) - (4 * miller_age_nm * zn_mg_nomaiz_qpm),
+    taz_mg_nomaiz_qpm = 0.5 * (miller_sum_nm - sqrt(miller_disc_nm)),
+
+    fe_zscore_nm_qpm  = (fe_absorbed_mg_nomaiz_qpm -
+                         zscore_params_nomaiz$fe_absorbed_mg_nomaiz$mean) /
+                         zscore_params_nomaiz$fe_absorbed_mg_nomaiz$sd,
+    zn_zscore_nm_qpm  = (taz_mg_nomaiz_qpm -
+                         zscore_params_nomaiz$taz_mg_nomaiz$mean) /
+                         zscore_params_nomaiz$taz_mg_nomaiz$sd,
+    lys_zscore_nm_qpm = (lys_mg_nomaiz_qpm -
+                         zscore_params_nomaiz$lys_mg_nomaiz$mean) /
+                         zscore_params_nomaiz$lys_mg_nomaiz$sd,
+    trp_zscore_nm_qpm = (trp_mg_nomaiz_qpm -
+                         zscore_params_nomaiz$trp_mg_nomaiz$mean) /
+                         zscore_params_nomaiz$trp_mg_nomaiz$sd,
+
+    nutritional_index_bio_nomaiz_qpm = (fe_zscore_nm_qpm + zn_zscore_nm_qpm +
+                                          lys_zscore_nm_qpm + trp_zscore_nm_qpm) / 4
+  ) |>
+  select(-miller_age_factor, -miller_sum, -miller_disc,
+         -fe_zscore_qpm, -zn_zscore_qpm, -lys_zscore_qpm, -trp_zscore_qpm,
+         -miller_age_nm, -miller_sum_nm, -miller_disc_nm,
+         -fe_zscore_nm_qpm, -zn_zscore_nm_qpm,
+         -lys_zscore_nm_qpm, -trp_zscore_nm_qpm)
+```
+
+## D2. Classify Inadequacy (QPM)
+
+Compare QPM absorbed nutrient values against the same H-AR thresholds used for baseline.
+
+```{r}
+#| label: d2-qpm-inadequacy
+
+# =============================================================================
+# D2. Inadequacy Classification — QPM
+# =============================================================================
+
+df_qpm_inadeq <- df_qpm |>
+  mutate(
+    # --- Iron inadequacy ---
+    inadequacy_fe_qpm = as.integer(fe_absorbed_mg_qpm < THRESHOLD_FE_ABSORBED),
+    gap_fe_mg_qpm     = fe_absorbed_mg_qpm - THRESHOLD_FE_ABSORBED,
+    ratio_fe_qpm      = fe_absorbed_mg_qpm / THRESHOLD_FE_ABSORBED,
+    
+    # --- Zinc inadequacy (har_taz_mg from B3) ---
+    inadequacy_zn_qpm = as.integer(taz_mg_qpm < har_taz_mg),
+    gap_zn_mg_qpm     = taz_mg_qpm - har_taz_mg,
+    ratio_zn_qpm      = taz_mg_qpm / har_taz_mg,
+    
+    # --- Protein inadequacy (har_prot_g from B3) ---
+    inadequacy_prot_qpm = as.integer(prot_g_total_qpm < har_prot_g),
+    gap_prot_g_qpm      = prot_g_total_qpm - har_prot_g,
+    ratio_prot_qpm      = prot_g_total_qpm / har_prot_g,
+    
+    # --- Combined inadequacy ---
+    n_inadequacies_qpm  = inadequacy_fe_qpm + inadequacy_zn_qpm + inadequacy_prot_qpm,
+    any_inadequacy_qpm  = as.integer(n_inadequacies_qpm > 0),
+    all_inadequate_qpm  = as.integer(n_inadequacies_qpm == 3)
+  )
+```
+
+---
+
+# Phase E: GAM-Based Stunting Impact
+
+## E1. Calculate Delta NI
+
+The baseline and QPM nutritional indices are built from the same fixed z-score parameters, so the two profiles share one scale and their difference is the increment each child receives under full biofortification.
+
+The increment is computed on both axes. `delta_ni_nomaiz` is the one that drives the impact estimate: it is expressed on the axis the GAM was fitted on and is what Phase E2 traverses. `delta_ni` is its whole-diet counterpart, retained as a descriptive quantity on the scale the rest of the pipeline reports.
+
+```{r}
+#| label: e1-calculate-delta-ni
+
+# =============================================================================
+# E1. Nutritional Index Increment
+# =============================================================================
+
+df_delta_ni <- df_qpm_inadeq |>
+  mutate(
+    # Calibrated axis — descriptive
+    delta_ni = nutritional_index_bio_qpm - nutritional_index_bio_baseline,
+    # Raw axis — drives the GAM evaluation in E2
+    delta_ni_nomaiz = nutritional_index_bio_nomaiz_qpm - nutritional_index_bio_nomaiz_baseline
+  )
+```
+
+```{r}
+#| label: tbl-e1-index-profiles
+#| tbl-cap: "Nutritional index distribution under both profiles"
+
+# =============================================================================
+# E1b. Index Distribution Table
+# =============================================================================
+
+probs_profiles <- c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99)
+
+df_e1_profiles <- tibble(
+  Quantile = paste0("P", probs_profiles * 100),
+  Baseline = weighted_quantiles(
+    df_delta_ni$nutritional_index_bio_baseline,
+    df_delta_ni$weight_calibrated, probs_profiles),
+  QPM = weighted_quantiles(
+    df_delta_ni$nutritional_index_bio_qpm,
+    df_delta_ni$weight_calibrated, probs_profiles),
+  Delta = weighted_quantiles(
+    df_delta_ni$delta_ni,
+    df_delta_ni$weight_calibrated, probs_profiles),
+  Baseline_raw = weighted_quantiles(
+    df_delta_ni$nutritional_index_bio_nomaiz_baseline,
+    df_delta_ni$weight_calibrated, probs_profiles),
+  QPM_raw = weighted_quantiles(
+    df_delta_ni$nutritional_index_bio_nomaiz_qpm,
+    df_delta_ni$weight_calibrated, probs_profiles),
+  Delta_raw = weighted_quantiles(
+    df_delta_ni$delta_ni_nomaiz,
+    df_delta_ni$weight_calibrated, probs_profiles)
+)
+
+export(df_e1_profiles, here("01_data", "02_processed", "web_resources",
+                            "04_08_tbl_e1_index_profiles.rds"))
+
+df_e1_profiles |>
+  gt() |>
+  tab_header(
+    title = "Nutritional Index Profiles",
+    subtitle = glue(
+      "Survey-weighted quantiles over {comma(nrow(df_delta_ni))} children"
+    )
+  ) |>
+  cols_label(
+    Quantile     = "Quantile",
+    Baseline     = "Baseline",
+    QPM          = "QPM",
+    Delta        = "Increment",
+    Baseline_raw = "Baseline",
+    QPM_raw      = "QPM",
+    Delta_raw    = "Increment"
+  ) |>
+  tab_spanner(label = "Calibrated axis (descriptive)",
+              columns = c(Baseline, QPM, Delta)) |>
+  tab_spanner(label = "Non-maize axis (drives the GAM)",
+              columns = c(Baseline_raw, QPM_raw, Delta_raw)) |>
+  fmt_number(columns = -Quantile, decimals = 3) |>
+  cols_align(align = "left", columns = Quantile) |>
+  cols_align(align = "right", columns = -Quantile) |>
+  tab_source_note(
+    source_note = paste(
+      "Each axis uses its own z-score parameters from script 04_06:",
+      "section A3 for the calibrated block, section G1 for the non-maize axis.",
+      "The two increments are not comparable in magnitude."
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(df_e1_profiles, probs_profiles)
+```
+
+## E2. Evaluate the GAM at Both Nutrient Profiles
+
+The GAM is evaluated at each child's baseline and QPM nutritional index, holding age and sex at their observed values. The difference between the two fitted values is the HAZ change the child experiences under full biofortification, and it follows the curvature of the smooth over the whole interval the index traverses.
+
+Evaluation runs on the **non-maize axis**: the model of script 04_06 carries `nutritional_index_bio_nomaiz` as its smooth term, and both positions supplied here are built from the non-maize sources with the matching parameters. The whole-diet indices computed in Phases C and D never enter the model.
+
+The local slope of the smooth at the baseline position is retained alongside it as a descriptive quantity, reported per child in the outputs.
+
+```{r}
+#| label: e2-evaluate-gam
+
+# =============================================================================
+# E2. GAM Evaluation at Baseline and QPM Index Positions (non-maize axis)
+# =============================================================================
+
+# Adjustment terms as fitted in script 04_06
+df_gam_input <- df_delta_ni |>
+  mutate(
+    sexo_factor = factor(
+      dplyr::case_when(
+        as.character(sexonino) %in% c("1", "Hombre") ~ "Hombre",
+        as.character(sexonino) %in% c("2", "Mujer")  ~ "Mujer",
+        TRUE ~ NA_character_
+      ),
+      levels = c("Hombre", "Mujer")
+    )
+  )
+
+# Fitted ZLEN at the baseline index
+zlen_fitted_baseline <- as.numeric(predict(
+  gam_zlen_ni,
+  newdata = df_gam_input |>
+    mutate(nutritional_index_bio_nomaiz = nutritional_index_bio_nomaiz_baseline),
+  type = "response"
+))
+
+# Fitted ZLEN at the QPM index
+zlen_fitted_qpm <- as.numeric(predict(
+  gam_zlen_ni,
+  newdata = df_gam_input |>
+    mutate(nutritional_index_bio_nomaiz = nutritional_index_bio_nomaiz_qpm),
+  type = "response"
+))
+
+# Local slope at the baseline position, retained for reporting
+deriv_data <- gratia::derivatives(
+  gam_zlen_ni,
+  select = "s(nutritional_index_bio_nomaiz)",
+  data = df_gam_input |>
+    mutate(nutritional_index_bio_nomaiz = nutritional_index_bio_nomaiz_baseline)
+)
+
+df_gam <- df_delta_ni |>
+  mutate(
+    zlen_gam_baseline   = zlen_fitted_baseline,
+    zlen_gam_qpm        = zlen_fitted_qpm,
+    marginal_effect_gam = deriv_data$.derivative
+  )
+
+rm(df_gam_input, zlen_fitted_baseline, zlen_fitted_qpm, deriv_data)
+```
+
+## E3. Derive QPM Stunting Outcomes
+
+The HAZ change is the difference between the two fitted values from E2, applied to each child's predicted z-score. The resulting QPM stunting variables represent the outcome if a child receives biofortified maize. Downstream scenario scripts select between `*_baseline` and `*_qpm` columns based on the assignment flag.
+
+```{r}
+#| label: e3-derive-qpm-stunting
+
+# =============================================================================
+# E3. QPM Stunting Outcomes (GAM-derived)
+# =============================================================================
+
+df_stunting <- df_gam |>
+  mutate(
+    # --- Delta ZLEN: exact difference of the fitted smooth ---
+    delta_zlen_qpm = zlen_gam_qpm - zlen_gam_baseline,
+    
+    # --- Updated ZLEN under QPM ---
+    zlen_predicted_qpm = zlen_predicted + delta_zlen_qpm,
+    
+    # --- Stunting classification under QPM (WHO threshold: HAZ < -2 SD) ---
+    hfa_calculated_qpm = as.integer(zlen_predicted_qpm < -2),
+    
+    # --- Stunting resolution flag ---
+    stunting_resolved_qpm = as.integer(hfa_calculated == 1L & hfa_calculated_qpm == 0L)
+  ) |>
+  select(-zlen_gam_baseline, -zlen_gam_qpm)
+```
+
+```{r}
+#| label: tbl-e3-stunting-impact-summary
+#| tbl-cap: "Pre-computed stunting impact: baseline vs QPM (full biofortification)"
+
+# =============================================================================
+# F3b. Stunting Impact Summary Table
+# =============================================================================
+
+df_stunting_impact_summary <- tibble(
+  Metric = c(
+    "Mean ZLEN",
+    "Stunting prevalence (%)",
+    "Mean delta ZLEN (QPM effect)",
+    "Cases with stunting resolved",
+    "Stunting resolved (%)"
+  ),
+  Baseline = c(
+    weighted.mean(df_stunting$zlen_predicted, df_stunting$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_stunting$hfa_calculated, df_stunting$weight_calibrated, na.rm = TRUE) * 100,
+    NA_real_,
+    NA_real_,
+    NA_real_
+  ),
+  QPM = c(
+    weighted.mean(df_stunting$zlen_predicted_qpm, df_stunting$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_stunting$hfa_calculated_qpm, df_stunting$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_stunting$delta_zlen_qpm, df_stunting$weight_calibrated, na.rm = TRUE),
+    sum(df_stunting$stunting_resolved_qpm * df_stunting$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_stunting$stunting_resolved_qpm, df_stunting$weight_calibrated, na.rm = TRUE) * 100
+  )
+) |>
+  mutate(
+    Change = QPM - Baseline
+  )
+
+export(df_stunting_impact_summary, here("01_data", "02_processed", "web_resources", "04_08_tbl_e3_stunting_impact_summary.rds"))
+
+df_stunting_impact_summary |>
+  gt() |>
+  tab_header(
+    title = "Stunting Impact: Baseline vs QPM (Full Biofortification)",
+    subtitle = "Survey-weighted estimates for all synthetic children"
+  ) |>
+  fmt_number(columns = c(Baseline, QPM, Change), 
+             decimals = 2, rows = c(1, 2, 3, 5)) |>
+  fmt_number(columns = c(Baseline, QPM, Change), 
+             decimals = 0, rows = 4) |>
+  sub_missing(missing_text = "—") |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = -Metric) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Change, rows = !is.na(Change) & Change > 0)
+  ) |>
+  tab_source_note(
+    source_note = paste(
+      "GAM: s(nutritional_index_bio_nomaiz) → ZLEN, evaluated on the non-maize axis.",
+      "delta_zlen is the exact difference of the two fitted values; it is not floored."
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_stunting_impact_summary)
+```
+
+```{r}
+#| label: tbl-e3-verify-delta-ni-by-age-group
+
+# =============================================================================
+# Verification: delta NI and delta ZLEN distribution by 6-month age bands
+# =============================================================================
+
+df_verify_delta_ni_by_age_group <- df_stunting |>
+  mutate(
+    age_group = cut(
+      edad_mes_nino,
+      breaks = c(6, 12, 18, 24, 30, 36, 42, 48, 54, 59),
+      include.lowest = TRUE,
+      right = FALSE,
+      labels = c("6-11", "12-17", "18-23", "24-29",
+                 "30-35", "36-41", "42-47", "48-53", "54-59")
+    )
+  ) |>
+  summarise(
+    n = n(),
+    # Raw axis: the marginal effect and the ZLEN change alongside it are both
+    # read off the raw smooth, so the increment reported here must be the raw one.
+    mean_delta_ni = weighted.mean(delta_ni_nomaiz, weight_calibrated, na.rm = TRUE),
+    mean_marginal = weighted.mean(marginal_effect_gam, weight_calibrated, na.rm = TRUE),
+    mean_delta_zlen = weighted.mean(delta_zlen_qpm, weight_calibrated, na.rm = TRUE),
+    pct_stunted_baseline = weighted.mean(hfa_calculated, weight_calibrated, na.rm = TRUE) * 100,
+    stunting_reduction_pp = (
+      weighted.mean(hfa_calculated, weight_calibrated, na.rm = TRUE) -
+      weighted.mean(hfa_calculated_qpm, weight_calibrated, na.rm = TRUE)
+    ) * 100,
+    .by = age_group
+  ) |>
+  arrange(age_group)
+
+export(df_verify_delta_ni_by_age_group, here("01_data", "02_processed", "web_resources", "04_08_tbl_e3_verify_delta_ni_by_age_group.rds"))
+
+df_verify_delta_ni_by_age_group |>
+  gt() |>
+  tab_header(
+    title = "Delta NI and Stunting Impact by 6-Month Age Band",
+    subtitle = "Diagnostic: AME granularity effect on the covariate prediction pathway (full biofortification)"
+  ) |>
+  cols_label(
+    age_group = "Age (months)",
+    n = "N",
+    mean_delta_ni = "Mean Δ NI (raw axis)",
+    mean_marginal = "Mean Marginal Effect",
+    mean_delta_zlen = "Mean Δ ZLEN",
+    pct_stunted_baseline = "Stunting Baseline (%)",
+    stunting_reduction_pp = "Reduction (pp)"
+  ) |>
+  fmt_number(columns = c(mean_delta_ni, mean_marginal, mean_delta_zlen), decimals = 4) |>
+  fmt_number(columns = c(pct_stunted_baseline, stunting_reduction_pp), decimals = 2) |>
+  fmt_integer(columns = n) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = mean_delta_ni, rows = age_group == "6-11")
+  ) |>
+  tab_source_note(
+    source_note = "If AME granularity drives the divergence, delta NI should be disproportionately higher in 6-11 months."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_verify_delta_ni_by_age_group)
+```
+
+
+---
+
+# Phase F: Nutrient Deltas and Resolution Flags
+
+## F1. Compute QPM-Baseline Deltas
+
+```{r}
+#| label: f1-compute-deltas
+
+# =============================================================================
+# F1. QPM — Baseline Deltas and Inadequacy Resolution Flags
+# =============================================================================
+
+df_with_deltas <- df_stunting |>
+  mutate(
+    # --- Intake deltas ---
+    delta_fe_mg_total  = fe_mg_total_qpm - fe_mg_total_baseline,
+    delta_zn_mg_total  = zn_mg_total_qpm - zn_mg_total_baseline,
+    delta_prot_g_total = prot_g_total_qpm - prot_g_total_baseline,
+    
+    # --- Absorbed nutrient deltas ---
+    delta_fe_absorbed_mg = fe_absorbed_mg_qpm - fe_absorbed_mg_baseline,
+    delta_taz_mg         = taz_mg_qpm - taz_mg_baseline,
+    
+    # --- Inadequacy resolution flags ---
+    resolved_fe   = as.integer(inadequacy_fe_baseline == 1L & inadequacy_fe_qpm == 0L),
+    resolved_zn   = as.integer(inadequacy_zn_baseline == 1L & inadequacy_zn_qpm == 0L),
+    resolved_prot = as.integer(inadequacy_prot_baseline == 1L & inadequacy_prot_qpm == 0L),
+    resolved_any  = as.integer(any_inadequacy_baseline == 1L & any_inadequacy_qpm == 0L)
+  )
+```
+
+---
+
+# Phase G: Diagnostic Tables
+
+## G1. Intake Comparison
+
+```{r}
+#| label: tbl-g1-intake-comparison
+#| tbl-cap: "Mean nutrient intake: baseline vs QPM (full biofortification)"
+
+# =============================================================================
+# Baseline vs QPM — Mean Intake Comparison
+# =============================================================================
+
+df_intake_comparison <- tibble(
+  Nutrient = c("Iron (mg/day)", "Zinc (mg/day)", "Protein (g/day)",
+               "Lysine (mg/day)", "Tryptophan (mg/day)", "Energy (kcal/day)"),
+
+  Baseline = c(
+    weighted.mean(df_with_deltas$fe_mg_total_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$zn_mg_total_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$prot_g_total_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$lys_mg_total_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$trp_mg_total_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$ene_kcal_total_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE)
+  ),
+
+  QPM = c(
+    weighted.mean(df_with_deltas$fe_mg_total_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$zn_mg_total_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$prot_g_total_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$lys_mg_total_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$trp_mg_total_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$ene_kcal_total_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE)
+  )
+) |>
+  mutate(
+    Delta = QPM - Baseline,
+    Pct_Change = Delta / Baseline * 100
+  )
+
+export(df_intake_comparison, here("01_data", "02_processed", "web_resources", "04_08_tbl_g1_intake_comparison.rds"))
+
+df_intake_comparison |>
+  gt() |>
+  tab_header(
+    title = "Nutrient Intake Comparison: Baseline vs QPM",
+    subtitle = "Survey-weighted mean intake (full biofortification, all children)"
+  ) |>
+  fmt_number(columns = c(Baseline, QPM, Delta), decimals = 2) |>
+  fmt_number(columns = Pct_Change, decimals = 1) |>
+  cols_label(Pct_Change = "% Change") |>
+  cols_align(align = "left", columns = Nutrient) |>
+  cols_align(align = "right", columns = -Nutrient) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Pct_Change, rows = Pct_Change > 0)
+  ) |>
+  tab_source_note(
+    source_note = "Biofortification factors: Fe ×1.19, Zn ×1.38, Protein ×1.94 (PDCAAS). Lys, Trp, Energy unchanged."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_intake_comparison)
+```
+
+## G2. Bioavailability and Nutritional Index Comparison
+
+```{r}
+#| label: tbl-g2-bioavailability-comparison
+#| tbl-cap: "Absorbed nutrient and NI comparison: baseline vs QPM"
+
+# =============================================================================
+# Baseline vs QPM — Absorbed Nutrients and Nutritional Index
+# =============================================================================
+
+df_bioavailability_comparison <- tibble(
+  Nutrient = c("Iron absorbed (mg/day)", "Zinc absorbed — TAZ (mg/day)",
+               "Nutritional Index (4-component)"),
+
+  Baseline = c(
+    weighted.mean(df_with_deltas$fe_absorbed_mg_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$taz_mg_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$nutritional_index_bio_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE)
+  ),
+
+  QPM = c(
+    weighted.mean(df_with_deltas$fe_absorbed_mg_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$taz_mg_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE),
+    weighted.mean(df_with_deltas$nutritional_index_bio_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE)
+  )
+) |>
+  mutate(
+    Delta = QPM - Baseline,
+    Pct_Change = Delta / Baseline * 100
+  )
+
+export(df_bioavailability_comparison, here("01_data", "02_processed", "web_resources", "04_08_tbl_g2_bioavailability_comparison.rds"))
+
+df_bioavailability_comparison |>
+  gt() |>
+  tab_header(
+    title = "Absorbed Nutrients and Nutritional Index: Baseline vs QPM",
+    subtitle = "Survey-weighted mean values (full biofortification)"
+  ) |>
+  fmt_number(columns = c(Baseline, QPM, Delta), decimals = 3) |>
+  fmt_number(columns = Pct_Change, decimals = 1) |>
+  cols_label(Pct_Change = "% Change") |>
+  cols_align(align = "left", columns = Nutrient) |>
+  cols_align(align = "right", columns = -Nutrient) |>
+  tab_source_note(
+    source_note = "Iron: 5% absorption. Zinc: Miller equation. NI: z-score normalized (SIVESNU training params)."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_bioavailability_comparison)
+```
+
+## G3. Inadequacy Prevalence Comparison
+
+```{r}
+#| label: tbl-g3-inadequacy-comparison
+#| tbl-cap: "Inadequacy prevalence: baseline vs QPM (full biofortification)"
+
+# =============================================================================
+# Baseline vs QPM — Inadequacy Prevalence
+# =============================================================================
+
+df_inadequacy_comparison <- tibble(
+  Nutrient = c("Iron", "Zinc", "Protein", "Any nutrient", "All three nutrients"),
+
+  Baseline_pct = c(
+    weighted.mean(df_with_deltas$inadequacy_fe_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$inadequacy_zn_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$inadequacy_prot_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$any_inadequacy_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$all_inadequate_baseline, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100
+  ),
+
+  QPM_pct = c(
+    weighted.mean(df_with_deltas$inadequacy_fe_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$inadequacy_zn_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$inadequacy_prot_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$any_inadequacy_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$all_inadequate_qpm, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100
+  ),
+
+  Resolved_pct = c(
+    weighted.mean(df_with_deltas$resolved_fe, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$resolved_zn, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$resolved_prot, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    weighted.mean(df_with_deltas$resolved_any, df_with_deltas$weight_calibrated, na.rm = TRUE) * 100,
+    NA_real_
+  )
+) |>
+  mutate(
+    Reduction_pp = Baseline_pct - QPM_pct
+  )
+
+export(df_inadequacy_comparison, here("01_data", "02_processed", "web_resources", "04_08_tbl_g3_inadequacy_comparison.rds"))
+
+df_inadequacy_comparison |>
+  gt() |>
+  tab_header(
+    title = "Inadequacy Prevalence: Baseline vs QPM",
+    subtitle = "Survey-weighted prevalence (%, full biofortification scenario)"
+  ) |>
+  fmt_number(columns = c(Baseline_pct, QPM_pct, Resolved_pct, Reduction_pp), decimals = 1) |>
+  cols_label(
+    Baseline_pct = "Baseline (%)",
+    QPM_pct = "QPM (%)",
+    Resolved_pct = "Resolved (%)",
+    Reduction_pp = "Reduction (pp)"
+  ) |>
+  sub_missing(missing_text = "—") |>
+  cols_align(align = "left", columns = Nutrient) |>
+  cols_align(align = "right", columns = -Nutrient) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Reduction_pp, rows = Reduction_pp > 0)
+  ) |>
+  tab_source_note(
+    source_note = "H-AR: Fe 0.5 mg/d absorbed (Allen 2020), Zn age-dependent (EFSA 2014), Protein 13/19 g/d (WHO/FAO)."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_inadequacy_comparison)
+```
+
+## G4. Delta Distribution Visualization
+
+```{r}
+#| label: fig-g4-delta-distributions
+#| fig-cap: "Distribution of QPM-baseline deltas: absorbed iron, absorbed zinc, and delta ZLEN"
+#| fig-height: 10
+#| fig-width: 10
+
+# =============================================================================
+# QPM-Baseline Delta Distributions
+# =============================================================================
+
+export(df_with_deltas, here("01_data", "02_processed", "web_resources", "04_08_fig_g4_delta_distributions.rds"))
+
+theme_delta <- theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "gray30"),
+    axis.title = element_text(size = 10, color = "gray30"),
+    axis.text = element_text(size = 9, color = "gray40")
+  )
+
+p_delta_fe <- ggplot(df_with_deltas, aes(x = delta_fe_absorbed_mg)) +
+  geom_density(fill = "#3E7CB1", alpha = 0.4, color = "#3E7CB1", linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "Delta iron absorbed (mg/day)", x = "Δ Fe absorbed", y = "Density") +
+  theme_delta
+
+p_delta_zn <- ggplot(df_with_deltas, aes(x = delta_taz_mg)) +
+  geom_density(fill = "#3E7CB1", alpha = 0.4, color = "#3E7CB1", linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "Delta zinc absorbed — TAZ (mg/day)", x = "Δ TAZ", y = "Density") +
+  theme_delta
+
+p_delta_zlen <- ggplot(df_with_deltas, aes(x = delta_zlen_qpm)) +
+  geom_density(fill = "#6BAF6B", alpha = 0.4, color = "#6BAF6B", linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "Delta ZLEN (GAM-derived stunting impact)", x = "Δ ZLEN (SD units)", y = "Density") +
+  theme_delta
+
+p_delta_fe / p_delta_zn / p_delta_zlen +
+  plot_annotation(
+    title = "QPM — Baseline Deltas: Nutritional and Stunting Impact",
+    subtitle = "Individual-level improvements under full biofortification (all children)",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", color = "gray30"),
+      plot.subtitle = element_text(size = 11, color = "gray50")
+    )
+  )
+
+rm(p_delta_fe, p_delta_zn, p_delta_zlen, theme_delta)
+```
+
+
+---
+
+# Phase H: Export Output
+
+## H1. Select Output Variables
+
+Select all variables required by downstream scenario scripts. The output preserves complete identifiers, covariates, model inputs, and the pre-computed baseline/QPM profiles.
+
+Variables calculated within this script (baseline/QPM profiles, delta columns) are always present. Variables inherited from script 04_07 (auxiliary sociodemographic columns) are selected via `any_of()` so the export succeeds even if the upstream variable set changes; a coverage table reports which optional variables are absent.
+
+```{r}
+#| label: h1-select-output
+
+# =============================================================================
+# H1. Select and Split Output Variables for Scenario Simulation
+# =============================================================================
+
+# --- Identifiers (always present) ---
+vars_out_ids <- c("synthetic_id", "departamento", "weight_calibrated")
+
+# --- Auxiliary sociodemographic variables from 04_07 (optional: present when
+#     upstream pipeline exports them, but selection is resilient if absent) ---
+vars_out_auxiliary <- c(
+  "sexonino", "edad_mes_nino", "ruralurbano", "ocupacion_hogar"
+)
+
+# --- Nutritional BASE source variables (always present: loaded in A1) ---
+vars_out_nutri_base <- c(
+  "fe_mg_maiz", "fe_mg_nomaiz",
+  "zn_mg_maiz", "zn_mg_nomaiz",
+  "prot_g_maiz", "prot_g_nomaiz",
+  "ene_kcal_maiz", "ene_kcal_nomaiz"
+)
+
+# --- Raw transfer-model signal donated in 04_07 (optional: selected via
+#     any_of() so the export survives an upstream change) ---
+# The 04_01 model output before the FIES adjustment, the quantile mapping and
+# the maize-source alignment. Diagnostics only: these columns are neither
+# invalidated in B2, nor imputed in B3, nor used in any Phase C/D calculation.
+vars_out_nutri_raw <- c(
+  "fe_mg_maiz_raw", "fe_mg_nomaiz_raw",
+  "zn_mg_maiz_raw", "zn_mg_nomaiz_raw",
+  "prot_g_maiz_raw", "prot_g_nomaiz_raw",
+  "lys_mg_maiz_raw", "lys_mg_nomaiz_raw",
+  "trp_mg_maiz_raw", "trp_mg_nomaiz_raw",
+  "ene_kcal_maiz_raw", "ene_kcal_nomaiz_raw"
+)
+
+# --- Columns calculated in this script: guaranteed present ---
+vars_out_computed_a <- c(
+  "ene_kcal_total_baseline", "ene_kcal_total_qpm"
+)
+
+vars_out_computed_b <- c(
+  "nutritional_index",
+  "zlen_predicted", "hfa_calculated",
+  "fe_mg_total_baseline", "zn_mg_total_baseline", "prot_g_total_baseline",
+  "fe_absorbed_mg_baseline", "taz_mg_baseline",
+  "nutritional_index_bio_baseline",
+  "fe_mg_total_qpm", "zn_mg_total_qpm", "prot_g_total_qpm",
+  "fe_absorbed_mg_qpm", "taz_mg_qpm",
+  "nutritional_index_bio_qpm",
+  "delta_ni",
+  # --- Raw axis: the positions the GAM was actually evaluated at ---
+  # Exported so that delta_zlen_qpm can be traced back to the smooth it came
+  # from without re-deriving the index from the source components.
+  "nutritional_index_bio_nomaiz_baseline",
+  "nutritional_index_bio_nomaiz_qpm",
+  "delta_ni_nomaiz",
+  "delta_zlen_qpm",
+  "zlen_predicted_qpm", "hfa_calculated_qpm"
+)
+
+# --- Part A: Demographics, assignment, and energy context ---
+df_output_a <- df_with_deltas |>
+  select(
+    all_of(vars_out_ids),
+    any_of(vars_out_auxiliary),
+    all_of(c(vars_out_nutri_base, vars_out_computed_a)),
+    any_of(vars_out_nutri_raw)
+  )
+
+# --- Part B: Pre-computed nutritional profiles and stunting outcomes ---
+df_output_b <- df_with_deltas |>
+  select(
+    all_of(c(vars_out_ids, vars_out_computed_b))
+  )
+```
+
+```{r}
+#| label: tbl-h1-output-coverage
+#| tbl-cap: "Output variable coverage: auxiliary columns from 04_07"
+
+# =============================================================================
+# H1b. Coverage Table: Auxiliary Variables
+# =============================================================================
+
+vars_out_optional <- c(vars_out_auxiliary, vars_out_nutri_raw)
+
+df_coverage <- tibble(
+  Variable  = vars_out_optional,
+  Present   = vars_out_optional %in% names(df_with_deltas),
+  Exported_to = "04_08_baseline_qpm_demographics.parquet"
+) |>
+  mutate(Status = if_else(Present, "Available", "Absent — not exported by 04_07"))
+
+export(df_coverage, here("01_data", "02_processed", "web_resources",
+                          "04_08_tbl_h1_output_coverage.rds"))
+
+df_coverage |>
+  gt() |>
+  tab_header(
+    title = "Output Coverage: Auxiliary and Raw-Signal Variables",
+    subtitle = "Columns inherited from 04_07; selection is resilient to upstream changes"
+  ) |>
+  cols_label(
+    Variable   = "Variable",
+    Present    = "Present",
+    Exported_to = "Exported to",
+    Status     = "Status"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Status, rows = Present)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3CD"),
+    locations = cells_body(columns = Status, rows = !Present)
+  ) |>
+  cols_align(align = "left") |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(df_coverage, vars_out_ids, vars_out_auxiliary, vars_out_optional,
+   vars_out_nutri_base, vars_out_nutri_raw,
+   vars_out_computed_a, vars_out_computed_b)
+```
+
+## H2. Export Output
+
+```{r}
+#| label: h2-export-output
+
+# =============================================================================
+# H2. Export Split Parquets
+# =============================================================================
+
+write_parquet(
+  df_output_a,
+  here("01_data", "02_processed", 
+       "scenarios", "04_08_baseline_qpm_demographics.parquet")
+)
+
+write_parquet(
+  df_output_b,
+  here("01_data", "02_processed", 
+       "scenarios", "04_08_baseline_qpm_profiles.parquet")
+)
+```
+
+---
+
+# Notes
+
+## Outlier Treatment
+
+Records with implausible maize energy intake (>2,500 kcal/day, equivalent to approximately 685 g/day at 3.65 kcal/g INCAP conversion), or with a non-maize component above its upper Tukey fence at `k = 3`, are detected and their 12 source-specific nutrient variables (6 maize + 6 non-maize) are replaced via k-nearest neighbour imputation.
+
+The full nutrient profile is invalidated for these records because all individual-level intake variables originate from the same ENCOVI household food consumption module. An implausible value on either side signals systematic error across all dietary variables for that record.
+
+Non-maize digestible protein is screened separately, against its own upper Tukey fence at `k = 1.5`, and only that variable is invalidated and imputed for the records it flags.
+
+Imputation uses the child's own ENCOVI record (age, sex, department, area, household education and the plant-source share of the diet) to find the 10 nearest valid children in scaled Euclidean space (RANN k-d tree). Imputed values are inverse-distance-weighted means, floored at zero.
+
+The predictor set is drawn from ENCOVI alone because the quantity being reconstructed is an ENCOVI dietary value. Conditioning it on variables observed for the same child in the same survey keeps the reconstruction within one measurement frame, and it is the same information set the meta-analysis pathway uses for the equivalent treatment in script 05_04.
+
+The share of the synthetic population treated by the outlier rules is reported in the Phase B diagnostic tables.
+
+## The Two Nutritional Index Axes
+
+This script computes the 4-component biofortification index twice, on two scales that must never be mixed.
+
+| | Whole-diet axis | Non-maize axis |
+|---|---|---|
+| Columns | `nutritional_index_bio_baseline` / `_qpm`, `delta_ni` | `nutritional_index_bio_nomaiz_baseline` / `_qpm`, `delta_ni_nomaiz` |
+| Source components | maize + non-maize | non-maize only |
+| Parameters | `04_06_ni_zscore_normalization_params.rds` (section A3) | `04_06_ni_bio_nomaiz_normalization_params.rds` (section G1) |
+| QPM increment | applied to the maize component | added to the non-maize pool |
+| Role | Descriptive; feeds the Phase G diagnostic tables | Drives the impact estimate; the axis the GAM is fitted on |
+
+The GAM of script 04_06 carries `nutritional_index_bio_nomaiz` as its smooth term, so Phase E supplies non-maize positions and the prediction binds to the axis the model was fitted on. The magnitudes of `delta_ni` and `delta_ni_nomaiz` are not comparable and neither is a rescaling of the other: the first spreads the increment over the whole diet, the second concentrates it in a narrower pool.
+
+The two axes share the absorption constants (`IRON_ABSORPTION`, Miller) but differ in where the Miller model is evaluated — on total zinc for the whole-diet axis, on the non-maize zinc pool for the other — and in how the increment enters. On the whole-diet axis the factors multiply the maize component; on the non-maize axis the extra nutrient the improved grain delivers, `maiz × (FACTOR − 1)`, is added to the non-maize pool so that it is read off the curve on the same footing as the nutrients that fitted it.
+
+## Pre-computability of GAM Impact
+
+The GAM-based stunting impact can be pre-computed because both index positions are fixed per-child:
+
+- **Baseline position** = `nutritional_index_bio_nomaiz_baseline` — depends only on the child's observed non-maize intake, which is constant.
+- **QPM position** = `nutritional_index_bio_nomaiz_qpm` — depends only on that intake, the child's maize intake and the biofortification factors, all constant.
+
+`delta_zlen_qpm` is the **exact difference of the two fitted values**, `f(NI_qpm) − f(NI_baseline)`, not a linearisation. It therefore follows the curvature of the smooth across the whole interval the index traverses, which matters because the increment is large enough for the local slope to change over it. The per-child slope at the baseline position (`marginal_effect_gam`) is computed for the Phase E3 diagnostic table only and is not used in the impact calculation.
+
+Downstream scripts select between `zlen_predicted` (baseline) and `zlen_predicted_qpm` (QPM) based on the assignment flag.
+
+## References
+
+- Allen LH, Carriquiry AL, Murphy SP (2020). Perspective: Proposed Harmonized Nutrient Reference Values for Populations. *Advances in Nutrition* 11(3):469–483. doi:10.1093/advances/nmz096
+
+- EFSA NDA Panel (2014). Scientific Opinion on Dietary Reference Values for zinc. *EFSA Journal* 12(10):3844. doi:10.2903/j.efsa.2014.3844
+
+- FAO/WHO (2007). Protein and Amino Acid Requirements in Human Nutrition. WHO Technical Report Series 935. Geneva: World Health Organization.
+
+- Miller LV, Krebs NF, Hambidge KM (2007). A mathematical model of zinc absorption in humans as a function of dietary zinc and phytate. *Journal of Nutrition* 137(1):135–141. doi:10.1093/jn/137.1.135
+
+- Semilla Nueva (2020). Standard Report, July-December 2020. https://semillanueva.org/wp-content/uploads/2025/12/Semilla-Nueva-Standard-Report-July-December-2020.pdf
+
+## Terminology
+
+The dataset columns `hfa` and `zlen` carry the anthropometric outcome as it is
+named in the SIVESNU source. In the published outputs the continuous
+height-for-age z-score is reported as **HAZ** and the binary variable
+(HAZ < -2) as **stunting**.

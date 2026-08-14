@@ -1,0 +1,719 @@
+---
+title: "Calculate Household Nutrient Intake"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script processes household food consumption data and calculates nutrient intake at the household level. It performs:
+
+1. Loads cleaned base datasets from previous script
+2. Processes food consumption with unit conversions
+3. Calculates separate intake for: total foods, maize only, plant-based foods, animal-based foods
+4. Applies special adjustments for maize products (tortillas, flour)
+5. Aggregates nutrient values by household
+
+All calculations are performed at the **household level** before distributing to individuals in the next script.
+
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  gt,             # Table formatting and presentation
+  tidyverse       # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading
+
+Load the cleaned datasets created in the previous script.
+
+```{r}
+#| label: a-load-data
+
+# Load integrated INCAP food composition data
+df_incap <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_01_incap_integrated.parquet")
+)
+
+# Load ENCOVI food consumption data
+encovi_alimentos <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_01_encovi_alimentos.parquet")
+)
+
+# Load food equivalences
+equivalencias <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_01_food_equivalences.parquet")
+)
+
+# Load reference lists
+ref_lists <- import(
+  here("01_data", "02_processed", 
+       "transfer", "01_01_reference_lists.rds"),
+  trust = TRUE
+)
+nombres_alimentos <- ref_lists$nombres_alimentos
+unidades_medida <- ref_lists$unidades_medida
+```
+
+---
+
+# Phase B: Food Consumption Processing
+
+Calculate total household nutrient intake from all foods.
+
+## B1. Process Total Food Consumption
+
+**ENCOVI food consumption variables:**
+- `p13a07a`: Quantity purchased in last 15 days
+- `p13a07c`: Unit code for purchased quantity
+- `p13a11a`: Quantity obtained without purchase in last 15 days  
+- `p13a11c`: Unit code for obtained quantity
+
+**Maize Products Standardization (INCAP Methodology)**
+
+Following INCAP guidelines for dietary intake assessment in Guatemala, we standardize maize-derived products to maize grain equivalent. Households report maize in three presentations — raw grain (codine 21), tortillas (codine 7) and flour (codine 17) — and all reported records are retained.
+
+**Conversion to maize grain equivalent:**
+Weight conversion factors isolate the maize component for biofortification modeling:
+
+- **Tortillas (×0.52)**: Approximately 52% of tortilla weight corresponds to maize grain. The remaining mass consists of water absorbed during nixtamalization, calcium hydroxide (cal), and processing losses.
+- **Maize flour (×0.98)**: Flour retains ~98% of original grain weight after dry milling.
+
+**Nutrient value reassignment:**
+After weight conversion, nutrient values are reassigned to raw white maize composition (per 100g): 365 kcal, 9.42g protein, 2.71mg iron, 2.21mg zinc. Nutrient calculations then reflect the maize fraction that biofortification modifies. Total dietary energy intake is unchanged by this step: the conversion identifies the maize-derived nutrient fraction within the household diet.
+
+**Source:** Conversion factors derived from INCAP dietary assessment protocols.
+
+```{r}
+#| label: b1-process-total-foods
+
+df_alimentos <- encovi_alimentos |>
+  # Create unified measurement unit variable
+  mutate(medida_encovi = case_when(
+    !is.na(p13a07c) ~ p13a07c,
+    is.na(p13a07c) & !is.na(p13a11c) ~ p13a11c,
+    is.na(p13a07c) & is.na(p13a11c) ~ NA_real_
+  )) |>
+  # Join with food equivalences for unit conversion
+  left_join(equivalencias, by = join_by(codine, medida_encovi == medida)) |>
+  # Join with INCAP food composition data
+  left_join(df_incap, by = join_by(codine)) |>
+  # Recode food and measurement variables as factors
+  mutate(
+    codine = factor(
+      codine, 
+      levels = 1:length(nombres_alimentos),
+      labels = nombres_alimentos,
+      ordered = TRUE
+    ),
+    medida_encovi_factor = factor(
+      medida_encovi,
+      levels = c(1:67, 98, 101:125, 128, 129),
+      labels = unidades_medida
+    )
+  ) |>
+  # Convert quantities to grams using equivalence table
+  mutate(
+    gr_comida_comprada = gramos * p13a07a,
+    gr_comida_obtenida = gramos * p13a11a
+  ) |>
+  # Sum purchased and obtained quantities
+  rowwise() |>
+  mutate(gr_comida_totales = sum(c(gr_comida_comprada, gr_comida_obtenida), na.rm = TRUE)) |>
+  ungroup() |>
+  # Calculate net grams per day (15-day recall / 15, adjusted for edible portion)
+  mutate(gr_netos = (gr_comida_totales / 15) * pct_aprov) |>
+  # Standardize maize products to grain equivalent (INCAP methodology)
+  mutate(
+    # Weight conversion: tortilla to grain (x0.52), flour to grain (x0.98)
+    gr_netos = case_when(
+      codine == "7 Tortillas de MAIZ" ~ gr_netos * 0.52,
+      codine == "17 Harina de MAIZ" ~ gr_netos * 0.98,
+      TRUE ~ gr_netos
+    ),
+    # Reassign nutrient composition to raw white maize values per 100 g
+    # Source: INCAP Food Composition Table 2014
+    across(
+      c(energ_kcal, proteina_g, hierro_mg, zinc_mg, lys_g, met_g, cys_g, thr_g, trp_g),
+      ~ if_else(
+        codine %in% c("7 Tortillas de MAIZ", "17 Harina de MAIZ"), 
+        case_when(
+          cur_column() == "energ_kcal" ~ 365 / 100,
+          cur_column() == "proteina_g" ~ 9.42 / 100,
+          cur_column() == "hierro_mg" ~ 2.71 / 100,
+          cur_column() == "zinc_mg" ~ 2.21 / 100,
+          cur_column() == "lys_g" ~ 0.27 / 100,
+          cur_column() == "met_g" ~ 0.20 / 100,
+          cur_column() == "cys_g" ~ 0.17 / 100,
+          cur_column() == "thr_g" ~ 0.35 / 100,
+          cur_column() == "trp_g" ~ 0.07 / 100
+        ),
+        .x
+      )
+    )
+  ) |>
+  # Calculate nutrient content per food item
+  mutate(
+    across(
+      c(energ_kcal, proteina_g, hierro_mg, zinc_mg, lys_g, met_g, cys_g, thr_g, trp_g),
+      ~ if_else(!is.na(gr_netos), gr_netos * .x, NA_real_),
+      .names = "{col}_comida"
+    ),
+    .by = codine
+  ) |>
+  # Calculate digestible protein (adjusted by PDCAAS)
+  mutate(
+    proteina_aprovechada_comida = if_else(
+      !is.na(gr_netos), 
+      gr_netos * proteina_g * pdcaas, 
+      NA_real_
+    )
+  ) |>
+  # Aggregate to household level
+  summarise(
+    gr_hogar_dia_totales = sum(gr_netos, na.rm = TRUE),
+    across(
+      c(energ_kcal_comida, proteina_g_comida, proteina_aprovechada_comida, 
+        hierro_mg_comida, zinc_mg_comida, lys_g_comida,
+        met_g_comida, cys_g_comida, thr_g_comida, trp_g_comida),
+      ~ sum(.x, na.rm = TRUE),
+      .names = "{.col}"
+    ),
+    .by = c(no_hogar, depto)
+  ) |>
+  # Rename columns for clarity
+  rename(
+    kcal_hogar_dia_totales = energ_kcal_comida,
+    prot_hogar_dia_totales = proteina_g_comida,
+    prot_apro_hogar_dia_totales = proteina_aprovechada_comida,
+    fe_hogar_dia_totales = hierro_mg_comida,
+    zn_hogar_dia_totales = zinc_mg_comida,
+    lys_hogar_dia_totales = lys_g_comida,
+    met_hogar_dia_totales = met_g_comida,
+    cys_hogar_dia_totales = cys_g_comida,
+    thr_hogar_dia_totales = thr_g_comida,
+    trp_hogar_dia_totales = trp_g_comida
+  ) |>
+  select(-depto)
+```
+
+## B2. Process Maize-Only Consumption
+
+Calculate household nutrient intake from maize products only (grain, tortillas, flour).
+
+```{r}
+#| label: b2-process-maize
+
+df_maiz <- encovi_alimentos |>
+  mutate(medida_encovi = case_when(
+    !is.na(p13a07c) ~ p13a07c,
+    is.na(p13a07c) & !is.na(p13a11c) ~ p13a11c,
+    is.na(p13a07c) & is.na(p13a11c) ~ NA_real_
+  )) |>
+  left_join(equivalencias, by = join_by(codine, medida_encovi == medida)) |>
+  left_join(df_incap, by = join_by(codine)) |>
+  mutate(
+    codine = factor(
+      codine, 
+      levels = 1:length(nombres_alimentos),
+      labels = nombres_alimentos,
+      ordered = TRUE
+    ),
+    medida_encovi_factor = factor(
+      medida_encovi,
+      levels = c(1:67, 98, 101:125, 128, 129),
+      labels = unidades_medida
+    )
+  ) |>
+  mutate(
+    gr_comida_comprada = gramos * p13a07a,
+    gr_comida_obtenida = gramos * p13a11a
+  ) |>
+  rowwise() |>
+  mutate(gr_comida_totales = sum(c(gr_comida_comprada, gr_comida_obtenida), na.rm = TRUE)) |>
+  ungroup() |>
+  # Filter for maize products only
+  filter(codine %in% c("7 Tortillas de MAIZ", "17 Harina de MAIZ", "21 MAIZ")) |>
+  mutate(gr_netos = (gr_comida_totales / 15) * pct_aprov) |>
+  # Standardize maize products to grain equivalent
+  mutate(
+    gr_netos = case_when(
+      codine == "7 Tortillas de MAIZ" ~ gr_netos * 0.52,
+      codine == "17 Harina de MAIZ" ~ gr_netos * 0.98,
+      TRUE ~ gr_netos
+    ),
+    across(
+      c(energ_kcal, proteina_g, hierro_mg, zinc_mg, lys_g, met_g, cys_g, thr_g, trp_g),
+      ~ if_else(
+        codine %in% c("7 Tortillas de MAIZ", "17 Harina de MAIZ"), 
+        case_when(
+          cur_column() == "energ_kcal" ~ 365 / 100,
+          cur_column() == "proteina_g" ~ 9.42 / 100,
+          cur_column() == "hierro_mg" ~ 2.71 / 100,
+          cur_column() == "zinc_mg" ~ 2.21 / 100,
+          cur_column() == "lys_g" ~ 0.27 / 100,
+          cur_column() == "met_g" ~ 0.20 / 100,
+          cur_column() == "cys_g" ~ 0.17 / 100,
+          cur_column() == "thr_g" ~ 0.35 / 100,
+          cur_column() == "trp_g" ~ 0.07 / 100
+        ),
+        .x
+      )
+    )
+  ) |>
+  mutate(
+    across(
+      c(energ_kcal, proteina_g, hierro_mg, zinc_mg, lys_g, met_g, cys_g, thr_g, trp_g),
+      ~ if_else(!is.na(gr_netos), gr_netos * .x, NA_real_),
+      .names = "{col}_comida"
+    ),
+    .by = codine
+  ) |>
+  mutate(
+    proteina_aprovechada_comida = if_else(
+      !is.na(gr_netos), 
+      gr_netos * proteina_g * pdcaas, 
+      NA_real_
+    )
+  ) |>
+  summarise(
+    gr_hogar_dia_maiz = sum(gr_netos, na.rm = TRUE),
+    across(
+      c(energ_kcal_comida, proteina_g_comida, proteina_aprovechada_comida,
+        hierro_mg_comida, zinc_mg_comida, lys_g_comida,
+        met_g_comida, cys_g_comida, thr_g_comida, trp_g_comida),
+      ~ sum(.x, na.rm = TRUE),
+      .names = "{.col}"
+    ),
+    .by = c(no_hogar, depto)
+  ) |>
+  rename(
+    kcal_hogar_dia_maiz = energ_kcal_comida,
+    prot_hogar_dia_maiz = proteina_g_comida,
+    prot_apro_hogar_dia_maiz = proteina_aprovechada_comida,
+    fe_hogar_dia_maiz = hierro_mg_comida,
+    zn_hogar_dia_maiz = zinc_mg_comida,
+    lys_hogar_dia_maiz = lys_g_comida,
+    met_hogar_dia_maiz = met_g_comida,
+    cys_hogar_dia_maiz = cys_g_comida,
+    thr_hogar_dia_maiz = thr_g_comida,
+    trp_hogar_dia_maiz = trp_g_comida
+  ) |>
+  select(-depto)
+```
+
+## B3. Process Plant-Based Foods
+
+Calculate household intake from plant-based foods (for phytate estimation).
+
+```{r}
+#| label: b3-process-vegetables
+
+df_vegetales <- encovi_alimentos |>
+  mutate(medida_encovi = case_when(
+    !is.na(p13a07c) ~ p13a07c,
+    is.na(p13a07c) & !is.na(p13a11c) ~ p13a11c,
+    is.na(p13a07c) & is.na(p13a11c) ~ NA_real_
+  )) |>
+  left_join(equivalencias, by = join_by(codine, medida_encovi == medida)) |>
+  left_join(df_incap, by = join_by(codine)) |>
+  # Filter for plant-based foods only
+  filter(vegetal_cereal == "si") |>
+  mutate(
+    codine = factor(
+      codine, 
+      levels = 1:length(nombres_alimentos),
+      labels = nombres_alimentos,
+      ordered = TRUE
+    ),
+    medida_encovi_factor = factor(
+      medida_encovi,
+      levels = c(1:67, 98, 101:125, 128, 129),
+      labels = unidades_medida
+    )
+  ) |>
+  mutate(
+    gr_comida_comprada = gramos * p13a07a,
+    gr_comida_obtenida = gramos * p13a11a
+  ) |>
+  rowwise() |>
+  mutate(gr_comida_totales = sum(c(gr_comida_comprada, gr_comida_obtenida), na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(gr_netos = (gr_comida_totales / 15) * pct_aprov) |>
+  # Standardize maize products to grain equivalent
+  mutate(
+    gr_netos = case_when(
+      codine == "7 Tortillas de MAIZ" ~ gr_netos * 0.52,
+      codine == "17 Harina de MAIZ" ~ gr_netos * 0.98,
+      TRUE ~ gr_netos
+    ),
+    across(
+      c(energ_kcal, proteina_g, hierro_mg, zinc_mg, lys_g, met_g, cys_g, thr_g, trp_g),
+      ~ if_else(
+        codine %in% c("7 Tortillas de MAIZ", "17 Harina de MAIZ"), 
+        case_when(
+          cur_column() == "energ_kcal" ~ 365 / 100,
+          cur_column() == "proteina_g" ~ 9.42 / 100,
+          cur_column() == "hierro_mg" ~ 2.71 / 100,
+          cur_column() == "zinc_mg" ~ 2.21 / 100,
+          cur_column() == "lys_g" ~ 0.27 / 100,
+          cur_column() == "met_g" ~ 0.20 / 100,
+          cur_column() == "cys_g" ~ 0.17 / 100,
+          cur_column() == "thr_g" ~ 0.35 / 100,
+          cur_column() == "trp_g" ~ 0.07 / 100
+        ),
+        .x
+      )
+    )
+  ) |>
+  summarise(
+    gr_hogar_dia_vegetales = sum(gr_netos, na.rm = TRUE),
+    .by = c(no_hogar, depto)
+  ) |>
+  select(-depto)
+```
+
+## B4. Process Animal-Based Foods
+
+Calculate household intake from animal-based foods.
+
+```{r}
+#| label: b4-process-non-vegetables
+
+df_no_vegetales <- encovi_alimentos |>
+  mutate(medida_encovi = case_when(
+    !is.na(p13a07c) ~ p13a07c,
+    is.na(p13a07c) & !is.na(p13a11c) ~ p13a11c,
+    is.na(p13a07c) & is.na(p13a11c) ~ NA_real_
+  )) |>
+  left_join(equivalencias, by = join_by(codine, medida_encovi == medida)) |>
+  left_join(df_incap, by = join_by(codine)) |>
+  # Filter for animal-based foods only
+  filter(vegetal_cereal == "no") |>
+  mutate(
+    codine = factor(
+      codine, 
+      levels = 1:length(nombres_alimentos),
+      labels = nombres_alimentos,
+      ordered = TRUE
+    ),
+    medida_encovi_factor = factor(
+      medida_encovi,
+      levels = c(1:67, 98, 101:125, 128, 129),
+      labels = unidades_medida
+    )
+  ) |>
+  mutate(
+    gr_comida_comprada = gramos * p13a07a,
+    gr_comida_obtenida = gramos * p13a11a
+  ) |>
+  rowwise() |>
+  mutate(gr_comida_totales = sum(c(gr_comida_comprada, gr_comida_obtenida), na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(gr_netos = (gr_comida_totales / 15) * pct_aprov) |>
+  # Standardize maize products to grain equivalent
+  mutate(
+    gr_netos = case_when(
+      codine == "7 Tortillas de MAIZ" ~ gr_netos * 0.52,
+      codine == "17 Harina de MAIZ" ~ gr_netos * 0.98,
+      TRUE ~ gr_netos
+    ),
+    across(
+      c(energ_kcal, proteina_g, hierro_mg, zinc_mg, lys_g, met_g, cys_g, thr_g, trp_g),
+      ~ if_else(
+        codine %in% c("7 Tortillas de MAIZ", "17 Harina de MAIZ"), 
+        case_when(
+          cur_column() == "energ_kcal" ~ 365 / 100,
+          cur_column() == "proteina_g" ~ 9.42 / 100,
+          cur_column() == "hierro_mg" ~ 2.71 / 100,
+          cur_column() == "zinc_mg" ~ 2.21 / 100,
+          cur_column() == "lys_g" ~ 0.27 / 100,
+          cur_column() == "met_g" ~ 0.20 / 100,
+          cur_column() == "cys_g" ~ 0.17 / 100,
+          cur_column() == "thr_g" ~ 0.35 / 100,
+          cur_column() == "trp_g" ~ 0.07 / 100
+        ),
+        .x
+      )
+    )
+  ) |>
+  summarise(
+    gr_hogar_dia_no_vegetales = sum(gr_netos, na.rm = TRUE),
+    .by = c(no_hogar, depto)
+  ) |>
+  select(-depto)
+```
+
+---
+
+# Phase C: Household Aggregation
+
+```{r}
+#| label: tbl-c-summary
+
+# Calculate summary statistics for each dataset
+summary_stats <- tibble(
+  Metric = c(
+    "Households (N)",
+    "Grams (median)",
+    "Grams (IQR)",
+    "Energy - kcal (median)",
+    "Energy - kcal (IQR)",
+    "Protein - g (median)",
+    "Protein - g (IQR)",
+    "Iron - mg (median)",
+    "Iron - mg (IQR)",
+    "Zinc - mg (median)",
+    "Zinc - mg (IQR)"
+  ),
+  Total = c(
+    nrow(df_alimentos),
+    round(median(df_alimentos$gr_hogar_dia_totales, na.rm = TRUE), 1),
+    paste0(
+      round(quantile(df_alimentos$gr_hogar_dia_totales, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(df_alimentos$gr_hogar_dia_totales, 0.75, na.rm = TRUE), 1)
+    ),
+    round(median(df_alimentos$kcal_hogar_dia_totales, na.rm = TRUE), 0),
+    paste0(
+      round(quantile(df_alimentos$kcal_hogar_dia_totales, 0.25, na.rm = TRUE), 0),
+      " - ",
+      round(quantile(df_alimentos$kcal_hogar_dia_totales, 0.75, na.rm = TRUE), 0)
+    ),
+    round(median(df_alimentos$prot_hogar_dia_totales, na.rm = TRUE), 1),
+    paste0(
+      round(quantile(df_alimentos$prot_hogar_dia_totales, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(df_alimentos$prot_hogar_dia_totales, 0.75, na.rm = TRUE), 1)
+    ),
+    round(median(df_alimentos$fe_hogar_dia_totales, na.rm = TRUE), 2),
+    paste0(
+      round(quantile(df_alimentos$fe_hogar_dia_totales, 0.25, na.rm = TRUE), 2),
+      " - ",
+      round(quantile(df_alimentos$fe_hogar_dia_totales, 0.75, na.rm = TRUE), 2)
+    ),
+    round(median(df_alimentos$zn_hogar_dia_totales, na.rm = TRUE), 2),
+    paste0(
+      round(quantile(df_alimentos$zn_hogar_dia_totales, 0.25, na.rm = TRUE), 2),
+      " - ",
+      round(quantile(df_alimentos$zn_hogar_dia_totales, 0.75, na.rm = TRUE), 2)
+    )
+  ),
+  Maize = c(
+    nrow(df_maiz),
+    round(median(df_maiz$gr_hogar_dia_maiz, na.rm = TRUE), 1),
+    paste0(
+      round(quantile(df_maiz$gr_hogar_dia_maiz, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(df_maiz$gr_hogar_dia_maiz, 0.75, na.rm = TRUE), 1)
+    ),
+    round(median(df_maiz$kcal_hogar_dia_maiz, na.rm = TRUE), 0),
+    paste0(
+      round(quantile(df_maiz$kcal_hogar_dia_maiz, 0.25, na.rm = TRUE), 0),
+      " - ",
+      round(quantile(df_maiz$kcal_hogar_dia_maiz, 0.75, na.rm = TRUE), 0)
+    ),
+    round(median(df_maiz$prot_hogar_dia_maiz, na.rm = TRUE), 1),
+    paste0(
+      round(quantile(df_maiz$prot_hogar_dia_maiz, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(df_maiz$prot_hogar_dia_maiz, 0.75, na.rm = TRUE), 1)
+    ),
+    round(median(df_maiz$fe_hogar_dia_maiz, na.rm = TRUE), 2),
+    paste0(
+      round(quantile(df_maiz$fe_hogar_dia_maiz, 0.25, na.rm = TRUE), 2),
+      " - ",
+      round(quantile(df_maiz$fe_hogar_dia_maiz, 0.75, na.rm = TRUE), 2)
+    ),
+    round(median(df_maiz$zn_hogar_dia_maiz, na.rm = TRUE), 2),
+    paste0(
+      round(quantile(df_maiz$zn_hogar_dia_maiz, 0.25, na.rm = TRUE), 2),
+      " - ",
+      round(quantile(df_maiz$zn_hogar_dia_maiz, 0.75, na.rm = TRUE), 2)
+    )
+  ),
+  `Plant-based` = c(
+    nrow(df_vegetales),
+    round(median(df_vegetales$gr_hogar_dia_vegetales, na.rm = TRUE), 1),
+    paste0(
+      round(quantile(df_vegetales$gr_hogar_dia_vegetales, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(df_vegetales$gr_hogar_dia_vegetales, 0.75, na.rm = TRUE), 1)
+    ),
+    "—", "—", "—", "—", "—", "—", "—", "—"
+  ),
+  `Animal-based` = c(
+    nrow(df_no_vegetales),
+    round(median(df_no_vegetales$gr_hogar_dia_no_vegetales, na.rm = TRUE), 1),
+    paste0(
+      round(quantile(df_no_vegetales$gr_hogar_dia_no_vegetales, 0.25, na.rm = TRUE), 1),
+      " - ",
+      round(quantile(df_no_vegetales$gr_hogar_dia_no_vegetales, 0.75, na.rm = TRUE), 1)
+    ),
+    "—", "—", "—", "—", "—", "—", "—", "—"
+  )
+)
+
+# Save data for web resources
+export(
+  summary_stats,
+  here("01_data", "02_processed",
+       "web_resources", "01_02_tbl_c_summary.rds")
+)
+
+# Create GT table
+summary_stats |>
+  gt() |>
+  tab_header(
+    title = "Household Daily Intake Summary",
+    subtitle = "Median and interquartile range (IQR) by food group"
+  ) |>
+  cols_label(
+    Metric = "Metric",
+    Total = "Total Foods",
+    Maize = "Maize Only",
+    `Plant-based` = "Plant-based",
+    `Animal-based` = "Animal-based"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = Metric,
+      rows = Metric %in% c("Households (N)", "Grams (median)", "Energy - kcal (median)", 
+                           "Protein - g (median)", "Iron - mg (median)", "Zinc - mg (median)")
+    )
+  ) |>
+  tab_style(
+    style = cell_text(style = "italic", color = "gray50"),
+    locations = cells_body(
+      columns = Metric,
+      rows = grepl("IQR", Metric)
+    )
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Plant-based and animal-based datasets track weight (grams) only.",
+    locations = cells_column_labels(columns = c(`Plant-based`, `Animal-based`))
+  )
+
+# Cleanup auxiliary objects
+rm(summary_stats)
+```
+
+---
+
+# Phase D: Export
+
+```{r}
+#| label: d-save-outputs
+
+# Save all household intake datasets
+write_parquet(
+  df_alimentos,
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_total.parquet")
+)
+
+write_parquet(
+  df_maiz,
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_maize.parquet")
+)
+
+write_parquet(
+  df_vegetales,
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_plantbased.parquet")
+)
+
+write_parquet(
+  df_no_vegetales,
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_animalbased.parquet")
+)
+```
+
+# Notes
+
+## Methodology
+
+### Unit Conversions
+- All food quantities converted to grams using expert-provided equivalence table
+- Purchased and obtained (non-purchased) foods combined for total household intake
+- Daily intake calculated by dividing 15-day recall period by 15
+
+### Maize Product Adjustments
+Conversion factors standardize processed maize to grain equivalent:
+- **Tortillas**: 0.52 factor (water absorbed during nixtamalization, cal, and processing losses)
+- **Flour**: 0.98 factor (dry milling loss)
+- **Nutrient values reassigned** to raw white maize composition
+
+### Edible Portion
+All calculations include adjustment for edible portion (`pct_aprov`) to account for waste (peels, bones, etc.).
+
+### Food Groupings
+- **Total foods**: All consumed foods
+- **Maize**: Grain, tortillas, and flour
+- **Plant-based**: All cereals, grains, vegetables, fruits (proxy for phytate content)
+- **Animal-based**: All meat, dairy, eggs, fish
+
+## Data Quality
+
+### Missing Values
+Missing values in measurement units are handled by prioritizing purchased quantity measurements, then obtained quantity measurements.
+
+### Zero Consumption
+Households with zero reported consumption for a food grouping will have corresponding zero values in that dataset.
+
+

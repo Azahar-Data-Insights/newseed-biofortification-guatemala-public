@@ -1,0 +1,842 @@
+---
+title: "Precompute Biofortification Scenarios"
+subtitle: "Module 6: Scenarios"
+---
+
+## Why Precompute Scenarios?
+
+The Shiny dashboard requires real-time response to user interactions. Computing biofortification impacts on-the-fly would involve:
+
+- Resolving each farmer's conversion ratio along the continuous adoption curve for every national production coverage level.
+- Looking up pre-computed individual profiles (baseline intake, QPM intake, baseline stunting, QPM stunting) for the 4,065 children of the synthetic population or the 4,134 ENCOVI children, depending on the pathway.
+- Allocating biofortified maize across departments using the gravity-based redistribution from the market baseline.
+- Aggregating survey-weighted metrics across 22 departments and 11 production coverage levels.
+
+This pipeline takes approximately 3-5 minutes per scenario combination. The framework evaluates a grid of **18 scenario combinations**: three seed variants (2022, 2026 and 2028 seed), three subsidy regimes (current, 50% reduction, 75% reduction), and two stunting methodologies (covariate prediction and meta-analysis). Computing the grid on demand would take longer than an interactive session allows, so every scenario is computed in advance and the dashboard reads the result.
+
+This page documents the simulation methodology with the **baseline scenario** combining the **2022 biofortified seed variety** with the **current subsidy regime** as of April 2026 as the canonical reference. Alternative seed variants and subsidy regimes follow the same methodology with different upstream parameters.
+
+## Simulation Architecture
+
+The scenario simulation pipeline generates two complementary datasets for each combination of seed × subsidy × pathway:
+
+| Output | Rows | Use case |
+|--------|------|----------|
+| Departmental scenarios | 242 (22 × 11) | Geographic comparisons, departmental filtering |
+| National scenarios | 11 | National-level indicators, overview metrics |
+
+The two share the same simulation logic and differ in the aggregation level: the departmental dataset aggregates metrics by `departamento`, and the national one computes weighted means directly at the Guatemala level.
+
+::: {.callout-note}
+## Direct Aggregation Principle
+
+National metrics are computed from individual-level data using survey weights, not by averaging departmental summaries. Averaging the summaries would weight each department equally regardless of its population, which is where Simpson's paradox enters.
+:::
+
+### Pre-Computed Individual Profiles
+
+A defining feature of this module is the separation of responsibilities with respect to the upstream nutritional and stunting modeling:
+
+> Module 6 receives **pre-computed individual profiles** (baseline intake, QPM intake, baseline stunting, QPM stunting, delta HAZ) from Modules 4 and 5. Module 6's role is exclusively to (i) determine which children receive biofortified maize at each production coverage level using the hierarchical priority assignment, and (ii) aggregate the resulting individual outcomes to departmental and national level. The nutritional modeling itself (intake calculation, bioavailability adjustment, stunting prediction) is upstream of this module.
+
+This separation is important for two reasons. First, it makes Module 6 fast and reproducible — no re-fitting of models, no recomputation of nutrient intakes, just lookup and aggregation. Second, it isolates the decisions that change across pathways (which stunting methodology is applied) from the decisions that change across production coverage levels (which farmers adopt and which children consume biofortified maize).
+
+The source of the individual profiles depends on the pathway:
+
+- **Covariate prediction pathway (PCO)** — Profiles come from the synthetic population built in [Baseline and QPM Profiles](../04_covariate_prediction/04_08_precompute_baseline_and_qpm_profiles.qmd). Stunting is predicted with the GAM fitted in Module 4.
+- **Meta-analysis (Gunaratna) pathway (PMA)** — Profiles come from the ENCOVI children carrying the hierarchy of [Biofortification Priority Assignment](../05_meta_analysis/05_06_assign_biofortification_priority.qmd). The stunting impact uses the Gunaratna et al. (2010) meta-analysis effect size.
+
+## Simulation Pipeline
+
+For each production coverage level (0% to 100% in 10% increments) the pipeline executes five sequential steps:
+
+### Step 1: Determine Each Farmer's Conversion Ratio
+
+Production coverage is implemented as a continuous adoption process driven by the per-farmer parameters calibrated in Module 2. At national production coverage `p`, every farmer with entry point `p_entry ≤ p` is in the adoption pool, and contributes a fraction of their potential biofortified production determined by the profile-specific sigmoid:
+
+$$
+r_i(p) = \text{sigmoid}(p, p_{entry,i}, \text{floor}_{profile}, k_{profile})
+$$
+
+The effective biofortified production of farmer `i` at production coverage `p` is:
+
+$$
+\text{bio}_i(p) = \text{production\_biofortified}_i \times \text{weight\_calibrated}_i \times r_i(p)
+$$
+
+This formulation expresses adoption as a smooth conversion intensity per farmer. The conversion curves and their calibration are documented in detail in the [Market Baseline Calculation](06_01_calculate_market_baseline.qmd#continuous-adoption-model) page.
+
+### Step 2: Calculate Economic Metrics
+
+For adopting farmers (those with `p_entry ≤ p`), the script calculates survey-weighted aggregates:
+
+- **n_farmers_bio** — Total adopting farmers (with conversion ratio applied).
+- **land_bio_ha** — Biofortified land area (hectares).
+- **production_biofortified_total** — Total biofortified production (quintales).
+- **income_increment_total** — Additional farmer income (Q).
+- **cost_seeds_increment_total** — Change in seed costs (Q).
+
+The seed cost component depends on the active subsidy regime: under the current regime the per-area subsidy is funded entirely by Semilla Nueva, while under the reduced regimes part of the cost becomes producer subsidy absorption and part is passed to the farmer. The decomposition by actor is documented in [Module 2](../02_economic_impact/02_04_calculate_economic_impact.qmd).
+
+### Step 3: Retrieve Departmental Coverage
+
+Consumption coverage percentages at each production coverage level are retrieved from [Market Baseline Calculation](06_01_calculate_market_baseline.qmd#consumption-coverage-after-redistribution), where the gravity-based redistribution has already been applied. Both stages therefore read the same coverage trajectory.
+
+$$
+\text{Coverage}_d(p) = \frac{\text{Biofortified production consumed in } d \text{ at } p}{\text{Total maize consumption in } d}
+$$
+
+Consumption coverage can exceed local production share when departments receive redistributed surplus from saturated neighbours through the gravity model.
+
+### Step 4: Assign Biofortified Maize to Children
+
+Children in the target population receive biofortified maize based on departmental consumption coverage and household priority. This is the methodologically complex step of the pipeline.
+
+::: {.callout-important}
+## Hierarchical Assignment Logic
+
+ENCOVI (farmer data) and SIVESNU (child anthropometry) cannot be linked at the household level — there is no common identifier. We cannot directly identify children of adopting farmers who consume biofortified maize from own-production.
+
+The hierarchical assignment uses **observable proxies** in the target population (head of household occupation, urban/rural area) to approximate the probability that a child's household would access locally-produced biofortified maize. This is a probabilistic assignment based on plausible consumption patterns, not a deterministic link to specific adopting households.
+:::
+
+**Priority hierarchy.** The two pathways order children differently, because the
+information available about each child's household differs between them.
+
+The covariate prediction pathway works on the synthetic population, where the
+household is characterised by the occupation of its head and by area of
+residence:
+
+| Priority | Group | Rationale |
+|----------|-------|-----------|
+| 1 | Cereal farmers (`Granjero cereales`) | Direct access to biofortified production |
+| 2 | Other farmers (`Granjero otros`) | Agricultural households with market access |
+| 3 | Agricultural workers (`Trabajador del campo`) | Rural employment in the farming sector |
+| 4 | Rural, other occupations | Rural households without a direct farming connection |
+| 5 | Urban households | Dependent on commercial distribution |
+
+The Meta-analysis (Gunaratna) pathway works on the ENCOVI children and reuses
+the household-level hierarchy built in
+[Biofortification Priority Assignment](../05_meta_analysis/05_06_assign_biofortification_priority.qmd),
+which is based on observed agricultural production rather than on occupation:
+maize producers with self-consumption first, then maize producers without,
+then other agricultural households, then rural and urban.
+
+**Assignment algorithm.** For each department at each production coverage
+level, children are sorted by priority and, within a priority level, by a
+random tie-breaker. The tie-breaker is drawn per child in the covariate
+pathway and per household in the meta-analysis pathway, so siblings there enter
+together. The cumulative survey weight is then accumulated down that order and
+compared against the departmental target:
+
+$$
+W_{\text{target},d} = \text{coverage}_d \times \sum_{i \in d} w_i
+\qquad
+\text{flag}_i = \mathbb{1}\left[\sum_{j \preceq i} w_j \le W_{\text{target},d}\right]
+$$
+
+The quota is therefore expressed in represented children rather than in sampled
+records, which keeps the assigned share consistent with the departmental
+consumption coverage under the survey design. Farmer households enter first,
+urban households only once rural demand is met, and the ordering inside each
+priority level carries no further structure.
+
+### Step 5: Lookup Pre-Computed Profiles and Aggregate
+
+For each child, the script retrieves the pre-computed individual profile produced upstream:
+
+- If `flag_biofortified = 1`, use the QPM profile (intake under biofortified maize consumption, stunting outcome under QPM).
+- If `flag_biofortified = 0`, use the baseline profile (intake under conventional maize, baseline stunting outcome).
+
+Individual-level outcomes are then aggregated using survey weights to produce departmental and national metrics: mean intakes, inadequacy prevalence, stunting prevalence, mean HAZ, and cases averted.
+
+::: {.callout-note}
+## Heterogeneous Effects
+
+Heterogeneity in the response to biofortification enters upstream, at the level of the individual profiles. In the covariate prediction pathway the GAM admits a non-linear relationship between the nutrient index and HAZ; over the fitted range the estimated smooth turns out close to linear, so each child's change in HAZ follows mainly from the size of their own change in the index. In the Meta-analysis (Gunaratna) pathway the effect size is applied to height growth velocity, modulated per child by their protein adequacy. Both routes produce per-child outcomes, which is what allows the aggregation at this stage.
+:::
+
+## Simulation Results
+
+The following sections summarise the pre-computed national scenarios, organised in three parallel blocks. The first two blocks document the stunting and nutrient outcomes under the two pathways (covariate prediction and meta-analysis), with the **current subsidy regime** held fixed and the three seed variants compared. The third block documents the economic outcomes (which are invariant to the pathway), with the full grid of three seed variants and three subsidy regimes.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-data
+#| include: false
+
+# Centralized load for this script. Three blocks of RDS exported by
+# framework 06_03x:
+#
+#   (1) Covariate prediction pathway (PCO), current subsidy (sub00),
+#       three seed variants. Two RDS per seed: scenario progression
+#       (D4) and nutritional progression (D5).
+#
+#   (2) Meta-analysis (Gunaratna) pathway (PMA), current subsidy (sub00), three
+#       seed variants. Same structure as block (1).
+#
+#   (3) Economic progression (D6), pathway-invariant. Loaded from PCO
+#       only (D6 is identical across pathways by construction: farmers
+#       adopt the same in both pathways, only the stunting model differs).
+#       Three seeds x three subsidy regimes = 9 RDS.
+
+# --- Block 1: Covariate prediction pathway (PCO) -----------------------
+
+tbl_pco_s22_scenario <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s22_sub00_pco_tbl_d4_scenario_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pco_s22_nutritional <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s22_sub00_pco_tbl_d5_nutritional_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pco_s26_scenario <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s26_sub00_pco_tbl_d4_scenario_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pco_s26_nutritional <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s26_sub00_pco_tbl_d5_nutritional_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pco_s28_scenario <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s28_sub00_pco_tbl_d4_scenario_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pco_s28_nutritional <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s28_sub00_pco_tbl_d5_nutritional_progression.rds"),
+  trust = TRUE
+)
+
+# --- Block 2: Meta-analysis (Gunaratna) pathway (PMA) ------------------
+
+tbl_pma_s22_scenario <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s22_sub00_pma_tbl_d4_scenario_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pma_s22_nutritional <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s22_sub00_pma_tbl_d5_nutritional_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pma_s26_scenario <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s26_sub00_pma_tbl_d4_scenario_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pma_s26_nutritional <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s26_sub00_pma_tbl_d5_nutritional_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pma_s28_scenario <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s28_sub00_pma_tbl_d4_scenario_progression.rds"),
+  trust = TRUE
+)
+
+tbl_pma_s28_nutritional <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s28_sub00_pma_tbl_d5_nutritional_progression.rds"),
+  trust = TRUE
+)
+
+# --- Block 3: Economic progression (pathway-invariant, loaded from PCO) -
+
+tbl_economic_s22_sub00 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s22_sub00_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s22_sub50 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s22_sub50_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s22_sub75 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s22_sub75_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s26_sub00 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s26_sub00_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s26_sub50 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s26_sub50_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s26_sub75 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s26_sub75_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s28_sub00 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s28_sub00_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s28_sub50 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s28_sub50_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+
+tbl_economic_s28_sub75 <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_03_s28_sub75_pco_tbl_d6_economic_progression.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: helpers
+#| include: false
+
+# Two reusable formatting helpers used across the 21 result tables.
+# Defining them once avoids 21 near-identical copies of gt() pipelines.
+
+format_scenario_table <- function(df, seed_label, pathway_label, zlen_label) {
+  df |>
+    gt() |>
+    tab_header(
+      title = paste0("National Metrics by Production Coverage Level — ", seed_label),
+      subtitle = paste0("Pathway: ", pathway_label, " | Subsidy: current regime")
+    ) |>
+    cols_label(
+      penetration = "Production Coverage",
+      n_farmers_bio = "Farmers Bio",
+      coverage_pct = "Coverage",
+      stunting_pct = "Stunting (%)",
+      mean_zlen = zlen_label,
+      zinc_inad_pct = "Zinc Inad. (%)",
+      iron_inad_pct = "Iron Inad. (%)"
+    ) |>
+    fmt_percent(columns = penetration, decimals = 0) |>
+    fmt_number(columns = n_farmers_bio, decimals = 0, use_seps = TRUE) |>
+    fmt_number(columns = coverage_pct, decimals = 1, pattern = "{x}%") |>
+    fmt_number(columns = c(stunting_pct, zinc_inad_pct, iron_inad_pct), decimals = 1) |>
+    fmt_number(columns = mean_zlen, decimals = 3) |>
+    tab_style(
+      style = cell_fill(color = "#E8F5E9"),
+      locations = cells_body(columns = stunting_pct, rows = penetration == 1)
+    ) |>
+    tab_style(
+      style = cell_fill(color = "#FFEBEE"),
+      locations = cells_body(columns = stunting_pct, rows = penetration == 0)
+    ) |>
+    tab_options(
+      table.font.size = px(12),
+      heading.title.font.size = px(14),
+      heading.subtitle.font.size = px(12)
+    )
+}
+
+format_nutritional_table <- function(df, seed_label, pathway_label) {
+  df |>
+    gt() |>
+    tab_header(
+      title = paste0("Nutrient Intake by Production Coverage Level — ", seed_label),
+      subtitle = paste0("Weighted mean bioavailable nutrients — Pathway: ", pathway_label, " | Subsidy: current regime")
+    ) |>
+    cols_label(
+      penetration = "Production Coverage",
+      coverage_pct = "Coverage",
+      mean_zinc = "Zinc (mg)",
+      mean_iron = "Iron (mg)",
+      mean_protein = "Protein (g)",
+      zinc_change_pct = "Zn Δ%",
+      iron_change_pct = "Fe Δ%",
+      protein_change_pct = "Prot Δ%"
+    ) |>
+    fmt_percent(columns = penetration, decimals = 0) |>
+    fmt_number(columns = coverage_pct, decimals = 1, pattern = "{x}%") |>
+    fmt_number(columns = c(mean_zinc, mean_iron), decimals = 3) |>
+    fmt_number(columns = mean_protein, decimals = 2) |>
+    fmt_number(
+      columns = c(zinc_change_pct, iron_change_pct, protein_change_pct),
+      decimals = 1, pattern = "{x}%", force_sign = TRUE
+    ) |>
+    tab_spanner(label = "Absorbed Intake", columns = c(mean_zinc, mean_iron, mean_protein)) |>
+    tab_spanner(label = "Change vs Baseline", columns = c(zinc_change_pct, iron_change_pct, protein_change_pct)) |>
+    tab_style(
+      style = cell_fill(color = "#E8F5E9"),
+      locations = cells_body(
+        columns = c(zinc_change_pct, iron_change_pct, protein_change_pct),
+        rows = penetration == 1
+      )
+    ) |>
+    tab_style(
+      style = cell_text(color = "#2E7D32", weight = "bold"),
+      locations = cells_body(
+        columns = c(zinc_change_pct, iron_change_pct, protein_change_pct),
+        rows = penetration > 0
+      )
+    ) |>
+    tab_source_note(
+      source_note = "Zinc and iron values are absorbed (TAZ via Miller equation, Fe at 5% absorption). Protein is PDCAAS-adjusted."
+    ) |>
+    tab_options(
+      table.font.size = px(12),
+      heading.title.font.size = px(14),
+      heading.subtitle.font.size = px(12)
+    )
+}
+
+format_economic_table <- function(df, seed_label, subsidy_label) {
+  df |>
+    gt() |>
+    tab_header(
+      title = paste0("Economic Impact by Production Coverage Level — ", seed_label),
+      subtitle = paste0("Farmer adoption, land use, and economic outcomes — Subsidy: ", subsidy_label)
+    ) |>
+    cols_label(
+      penetration = "Production Coverage",
+      n_farmers_bio = "Total",
+      n_hybrid_bio = "Hybrid",
+      n_opv_bio = "OPV",
+      land_bio_ha = "Ha",
+      production_biofortified_total = "Prod Bio (qq)",
+      income_increment_mgtq = "Net Income Change (M GTQ)"
+    ) |>
+    tab_spanner(label = "Adopting Farmers", columns = c(n_farmers_bio, n_hybrid_bio, n_opv_bio)) |>
+    fmt_percent(columns = penetration, decimals = 0) |>
+    fmt_number(columns = c(n_farmers_bio, n_hybrid_bio, n_opv_bio), decimals = 0, use_seps = TRUE) |>
+    fmt_number(columns = land_bio_ha, decimals = 0, use_seps = TRUE) |>
+    fmt_number(columns = production_biofortified_total, decimals = 0, use_seps = TRUE) |>
+    fmt_number(columns = income_increment_mgtq, decimals = 2) |>
+    tab_style(
+      style = cell_fill(color = "#E8F5E9"),
+      locations = cells_body(columns = income_increment_mgtq, rows = penetration == 1)
+    ) |>
+    tab_style(
+      style = cell_fill(color = "#FFEBEE"),
+      locations = cells_body(columns = income_increment_mgtq, rows = penetration == 0)
+    ) |>
+    tab_source_note(
+      source_note = "Net Income Change is the change in net income, with the seed cost difference included. Land converted at 0.7 ha/mz."
+    ) |>
+    tab_options(
+      table.font.size = px(12),
+      heading.title.font.size = px(14),
+      heading.subtitle.font.size = px(12)
+    )
+}
+```
+
+
+## Scenarios Under Covariate Prediction Pathway
+
+The covariate prediction pathway estimates per-child stunting outcomes using a GAM model fitted in Module 4 on the synthetic population generated in Module 4. For each child, the model captures the non-linear relationship between the nutritional index and the height-for-age z-score (HAZ), and the HAZ change is the difference between its fitted values at the baseline and QPM index positions. Aggregating individual outcomes across all children yields the national progression below.
+
+This block compares the three seed variants under the **current subsidy regime**. The seed variant primarily affects yield change factors per segment, and therefore the volume of biofortified production available at each production coverage level; subsidy regimes (held constant here) modulate the order in which farmers enter the adoption pool but converge at the endpoints. See the [Economic Progression](#economic-progression) section for the full subsidy × seed grid on the economic side.
+
+### 2022 Seed — Covariate Prediction
+
+```{r}
+#| label: tbl-pco-s22-scenario-progression
+#| tbl-cap: "National scenario progression — 2022 seed, covariate prediction pathway, current subsidy"
+
+format_scenario_table(
+  tbl_pco_s22_scenario,
+  seed_label = "Seed 2022",
+  pathway_label = "Covariate prediction",
+  zlen_label = "Mean HAZ"
+)
+```
+
+```{r}
+#| label: tbl-pco-s22-nutritional-progression
+#| tbl-cap: "National nutrient intake progression — 2022 seed, covariate prediction pathway, current subsidy"
+
+format_nutritional_table(
+  tbl_pco_s22_nutritional,
+  seed_label = "Seed 2022",
+  pathway_label = "Covariate prediction"
+)
+```
+
+### 2026 Seed — Covariate Prediction
+
+```{r}
+#| label: tbl-pco-s26-scenario-progression
+#| tbl-cap: "National scenario progression — 2026 seed, covariate prediction pathway, current subsidy"
+
+format_scenario_table(
+  tbl_pco_s26_scenario,
+  seed_label = "Seed 2026",
+  pathway_label = "Covariate prediction",
+  zlen_label = "Mean HAZ"
+)
+```
+
+```{r}
+#| label: tbl-pco-s26-nutritional-progression
+#| tbl-cap: "National nutrient intake progression — 2026 seed, covariate prediction pathway, current subsidy"
+
+format_nutritional_table(
+  tbl_pco_s26_nutritional,
+  seed_label = "Seed 2026",
+  pathway_label = "Covariate prediction"
+)
+```
+
+### 2028 Seed — Covariate Prediction
+
+```{r}
+#| label: tbl-pco-s28-scenario-progression
+#| tbl-cap: "National scenario progression — 2028 seed, covariate prediction pathway, current subsidy"
+
+format_scenario_table(
+  tbl_pco_s28_scenario,
+  seed_label = "Seed 2028",
+  pathway_label = "Covariate prediction",
+  zlen_label = "Mean HAZ"
+)
+```
+
+```{r}
+#| label: tbl-pco-s28-nutritional-progression
+#| tbl-cap: "National nutrient intake progression — 2028 seed, covariate prediction pathway, current subsidy"
+
+format_nutritional_table(
+  tbl_pco_s28_nutritional,
+  seed_label = "Seed 2028",
+  pathway_label = "Covariate prediction"
+)
+```
+
+
+## Scenarios Under Meta-Analysis (Gunaratna) Pathway
+
+The Meta-analysis (Gunaratna) pathway estimates per-child stunting outcomes using the effect size from Gunaratna et al. (2010), which reports a 9% increase in height growth velocity for children consuming Quality Protein Maize relative to conventional maize. This effect is the common reference effect, modulated for each child by the protein-adequacy factor defined in Module 5, and applied to the ENCOVI children population produced by `05_06`, with stunting outcomes derived from the resulting HAZ trajectories.
+
+The Meta-analysis (Gunaratna) pathway functions as a methodological sensitivity check for the covariate prediction pathway. Both pathways express child growth on the same height-for-age z-score (HAZ) scale, but reach it by different routes: they use different populations (an ENCOVI-based synthetic population enriched with SIVESNU anthropometric donors, against the ENCOVI child population directly) and different stunting models (GAM-based vs effect-size-based), while sharing the same upstream farmer adoption mechanics, the same hierarchical priority assignment, and the same gravity-based redistribution. Comparing the two pathways across the same seed variants provides a range of plausible impact estimates under different methodological assumptions.
+
+### 2022 Seed — Meta-Analysis
+
+```{r}
+#| label: tbl-pma-s22-scenario-progression
+#| tbl-cap: "National scenario progression — 2022 seed, Meta-analysis (Gunaratna) pathway, current subsidy"
+
+format_scenario_table(
+  tbl_pma_s22_scenario,
+  seed_label = "Seed 2022",
+  pathway_label = "Meta-analysis (Gunaratna)",
+  zlen_label = "Mean HAZ"
+)
+```
+
+```{r}
+#| label: tbl-pma-s22-nutritional-progression
+#| tbl-cap: "National nutrient intake progression — 2022 seed, Meta-analysis (Gunaratna) pathway, current subsidy"
+
+format_nutritional_table(
+  tbl_pma_s22_nutritional,
+  seed_label = "Seed 2022",
+  pathway_label = "Meta-analysis (Gunaratna)"
+)
+```
+
+### 2026 Seed — Meta-Analysis
+
+```{r}
+#| label: tbl-pma-s26-scenario-progression
+#| tbl-cap: "National scenario progression — 2026 seed, Meta-analysis (Gunaratna) pathway, current subsidy"
+
+format_scenario_table(
+  tbl_pma_s26_scenario,
+  seed_label = "Seed 2026",
+  pathway_label = "Meta-analysis (Gunaratna)",
+  zlen_label = "Mean HAZ"
+)
+```
+
+```{r}
+#| label: tbl-pma-s26-nutritional-progression
+#| tbl-cap: "National nutrient intake progression — 2026 seed, Meta-analysis (Gunaratna) pathway, current subsidy"
+
+format_nutritional_table(
+  tbl_pma_s26_nutritional,
+  seed_label = "Seed 2026",
+  pathway_label = "Meta-analysis (Gunaratna)"
+)
+```
+
+### 2028 Seed — Meta-Analysis
+
+```{r}
+#| label: tbl-pma-s28-scenario-progression
+#| tbl-cap: "National scenario progression — 2028 seed, Meta-analysis (Gunaratna) pathway, current subsidy"
+
+format_scenario_table(
+  tbl_pma_s28_scenario,
+  seed_label = "Seed 2028",
+  pathway_label = "Meta-analysis (Gunaratna)",
+  zlen_label = "Mean HAZ"
+)
+```
+
+```{r}
+#| label: tbl-pma-s28-nutritional-progression
+#| tbl-cap: "National nutrient intake progression — 2028 seed, Meta-analysis (Gunaratna) pathway, current subsidy"
+
+format_nutritional_table(
+  tbl_pma_s28_nutritional,
+  seed_label = "Seed 2028",
+  pathway_label = "Meta-analysis (Gunaratna)"
+)
+```
+
+
+## Economic Progression
+
+The economic dimension is invariant to the stunting pathway: the same farmers adopt the same land under the same conversion curves regardless of whether the downstream stunting impact is estimated via covariate prediction or meta-analysis. The economic block therefore consolidates the full grid of nine combinations — three seed variants (2022, 2026 and 2028 seed) and three subsidy regimes (current, 50% reduction, 75% reduction) — drawing from the covariate prediction pathway outputs.
+
+The subsidy regime affects the seed cost structure faced by farmers. Under the current regime the per-area subsidy is funded entirely by Semilla Nueva, at 242 Q/mz of direct commitment, with no producer subsidy absorption and no extra cost to the farmer. Under the reduced regimes the reduction is split equally between producer subsidy absorption, through improved producibility, and the farmer, through a higher biofortified seed price. The complete decomposition by actor is documented in [Module 2](../02_economic_impact/02_04_calculate_economic_impact.qmd).
+
+The seed variant affects yield change factors per farmer segment. The 2022 variety reflects current field performance; the 2026 and 2028 varieties reflect expected improvements from ongoing breeding pipelines. Higher yield change factors translate into higher per-farmer income increments and larger production volumes at the same production coverage level.
+
+### 2022 Seed
+
+```{r}
+#| label: tbl-economic-s22-sub00
+#| tbl-cap: "Economic impact progression — 2022 seed, current subsidy regime"
+
+format_economic_table(
+  tbl_economic_s22_sub00,
+  seed_label = "Seed 2022",
+  subsidy_label = "Current"
+)
+```
+
+```{r}
+#| label: tbl-economic-s22-sub50
+#| tbl-cap: "Economic impact progression — 2022 seed, 50% subsidy reduction"
+
+format_economic_table(
+  tbl_economic_s22_sub50,
+  seed_label = "Seed 2022",
+  subsidy_label = "50% reduction"
+)
+```
+
+```{r}
+#| label: tbl-economic-s22-sub75
+#| tbl-cap: "Economic impact progression — 2022 seed, 75% subsidy reduction"
+
+format_economic_table(
+  tbl_economic_s22_sub75,
+  seed_label = "Seed 2022",
+  subsidy_label = "75% reduction"
+)
+```
+
+### 2026 Seed
+
+```{r}
+#| label: tbl-economic-s26-sub00
+#| tbl-cap: "Economic impact progression — 2026 seed, current subsidy regime"
+
+format_economic_table(
+  tbl_economic_s26_sub00,
+  seed_label = "Seed 2026",
+  subsidy_label = "Current"
+)
+```
+
+```{r}
+#| label: tbl-economic-s26-sub50
+#| tbl-cap: "Economic impact progression — 2026 seed, 50% subsidy reduction"
+
+format_economic_table(
+  tbl_economic_s26_sub50,
+  seed_label = "Seed 2026",
+  subsidy_label = "50% reduction"
+)
+```
+
+```{r}
+#| label: tbl-economic-s26-sub75
+#| tbl-cap: "Economic impact progression — 2026 seed, 75% subsidy reduction"
+
+format_economic_table(
+  tbl_economic_s26_sub75,
+  seed_label = "Seed 2026",
+  subsidy_label = "75% reduction"
+)
+```
+
+### 2028 Seed
+
+```{r}
+#| label: tbl-economic-s28-sub00
+#| tbl-cap: "Economic impact progression — 2028 seed, current subsidy regime"
+
+format_economic_table(
+  tbl_economic_s28_sub00,
+  seed_label = "Seed 2028",
+  subsidy_label = "Current"
+)
+```
+
+```{r}
+#| label: tbl-economic-s28-sub50
+#| tbl-cap: "Economic impact progression — 2028 seed, 50% subsidy reduction"
+
+format_economic_table(
+  tbl_economic_s28_sub50,
+  seed_label = "Seed 2028",
+  subsidy_label = "50% reduction"
+)
+```
+
+```{r}
+#| label: tbl-economic-s28-sub75
+#| tbl-cap: "Economic impact progression — 2028 seed, 75% subsidy reduction"
+
+format_economic_table(
+  tbl_economic_s28_sub75,
+  seed_label = "Seed 2028",
+  subsidy_label = "75% reduction"
+)
+```
+
+
+## Key Outputs
+
+The pre-computed scenario datasets carry three families of variables.
+
+### Economic Variables
+
+| Variable | Description | Unit |
+|----------|-------------|------|
+| `n_farmers_bio` | Adopting farmers (survey-weighted, conversion ratio applied) | count |
+| `land_bio_ha` | Biofortified land area | hectares |
+| `production_biofortified_total` | Total biofortified production | quintales |
+| `income_increment_total` | Additional farmer income | Q |
+| `cost_seeds_increment_total` | Change in seed costs | Q |
+| `income_increment_mgtq` | Net income change, seed cost difference included | M GTQ |
+
+### Nutritional Variables
+
+| Variable | Description | Unit |
+|----------|-------------|------|
+| `mean_zinc` | Mean absorbed zinc (TAZ via Miller equation) | mg/day |
+| `mean_iron` | Mean absorbed iron (5% absorption) | mg/day |
+| `mean_protein` | Mean PDCAAS-adjusted protein | g/day |
+| `*_inad_pct` | Nutrient inadequacy prevalence | % |
+| `*_change_pct` | Change vs baseline | % |
+
+### Stunting Variables
+
+| Variable | Description | Unit |
+|----------|-------------|------|
+| `stunting_pct` | Stunting prevalence | % |
+| `mean_zlen` | Mean height-for-age z-score (HAZ) | SD units |
+
+## Departmental vs National: Key Differences
+
+| Aspect | 06_02 Departmental | 06_03 National |
+|--------|-------------------|----------------|
+| Rows | 242 (22 depts × 11 levels) | 11 (1 region × 11 levels) |
+| Identifier | `departamento` | `region = "Guatemala Total"` |
+| Quantiles | Included (distribution boxplots) | Excluded (require individual data) |
+| Use | Geographic filtering, departmental comparisons | Overview tab, national indicators |
+| Aggregation | `.by = departamento` | No grouping (national weighted mean) |
+
+Both datasets share identical variable schemas for compatibility with downstream Shiny processing.
+
+## Methodological Assumptions
+
+### Adoption Mechanism
+
+The continuous adoption mechanism assumes that farmers with higher adoption scores (better technology fit, larger scale, prior hybrid experience) enter the adoption pool at lower national production coverage levels. Within each farmer, the conversion intensity follows the profile-specific sigmoid calibrated against empirical adoption anchors in Module 2.
+
+### Consumption Coverage Assignment
+
+The hierarchical assignment assumes that farmer households prioritise self-consumption of their own production, that local markets receive biofortified maize before commercial distribution, that urban access depends on formal supply chain reach, and that within each priority group access is random (no further stratification).
+
+### Stunting Response
+
+The covariate prediction pathway assumes that the GAM-based relationship between nutritional index and HAZ fitted on the synthetic population generalises to the scenario simulation, and that estimated effects are heterogeneous (stronger marginal benefits for nutritionally deficient children). The Meta-analysis (Gunaratna) pathway assumes that the Gunaratna et al. (2010) effect size on height growth velocity is transportable to the Guatemalan ENCOVI children population. Both scenario applications are model-based ex-ante projections and report point estimates without propagated uncertainty. The covariate prediction pathway derives its response from observational survey data; the meta-analysis pathway imports its reference effect from randomized trial evidence.
+
+## Limitations
+
+::: {.callout-warning}
+## Key Limitations
+
+1. **No household-level linkage** — Children cannot be directly linked to specific adopting farmer households; assignment is based on occupational proxies.
+
+2. **Uniform biofortification factors** — All biofortified maize is assumed to have identical nutrient increases regardless of variety, soil conditions, or processing.
+
+3. **No uncertainty quantification** — Point estimates only; confidence intervals would require bootstrap or Monte Carlo simulation.
+
+4. **No supply chain modelling** — Distribution is assumed to follow the priority hierarchy and the gravity model without modelling transport costs, market access, or price differentials.
+
+5. **Cross-sectional stunting model** — Predictions represent point-in-time associations, not longitudinal growth trajectories.
+:::
+
+## Summary
+
+The scenario precomputation step generates the analytical backbone for the Shiny dashboard. For each of the 18 combinations in the seed × subsidy × pathway grid, it produces departmental (242 rows) and national (11 rows) scenarios with consistent variable schemas.
+
+### Key methodological elements
+
+1. **Continuous adoption** — Per-farmer conversion intensity along profile-specific sigmoid curves produces smooth saturation trajectories.
+
+2. **Pre-computed individual profiles** — Module 6 receives baseline and QPM profiles from Modules 4 and 5 and is responsible only for assignment and aggregation, not for the underlying nutritional and stunting modelling.
+
+3. **Hierarchical priority assignment** — Realistic biofortification distribution based on household occupation and geography, calibrated to departmental consumption coverage from the gravity-based redistribution.
+
+4. **Dual pathway** — Two parallel stunting methodologies (covariate prediction and meta-analysis) provide a range of plausible impact estimates under different assumptions.
+
+5. **Survey-weighted aggregation** — All metrics use calibrated weights for population-representative estimates.
+
+These pre-computed scenarios enable instant dashboard response while maintaining full methodological transparency. The 18 combinations are exported as parquet files for direct consumption by the Shiny dashboard, which is the product of results layered on top of this methodological backbone.

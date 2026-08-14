@@ -1,0 +1,1429 @@
+---
+title: "Estimate Age in Months from INE Birth Registry Data"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+ENCOVI 2023 records age as integer years (`ppa03`), while the biofortification impact analysis requires age in months on two counts:
+
+1. **Coverage of children aged 6-11 months**: children with `edad == 0` are indistinguishable from those under 6 months, so month-level age is needed to reach the 6-59 month study population.
+2. **Precision in anthropometric modeling**: WHO LMS growth reference tables are indexed by age in months. Integer years carry up to ±5.5 months of imprecision in a range where growth curves have steep gradients.
+
+This script generates a synthetic `edad_meses` variable for all ENCOVI 2023 individuals, using empirical birth distributions from the Guatemala National Statistics Institute (INE) vital statistics registry. Each birth-year cohort (2019-2023) is matched to the corresponding age-in-years group (4 to 0 years). Month assignment uses a greedy quota-filling algorithm that distributes children to birth months so that the survey-weighted (population-represented) distribution matches the observed INE proportions by department and sex.
+
+Main operations:
+
+1. Load INE birth registry data for 2019-2023 (births by month, department, and sex)
+2. Harmonize department names and month labels across all five files
+3. Calculate within-year birth proportions by department and sex
+4. Load ENCOVI 2023 individual data and assign birth-year cohorts
+5. Generate synthetic `edad_meses` using quota-based assignment weighted by survey expansion factors
+6. Enforce biological plausibility for sibling ages within the same household (minimum 9-month separation or twins)
+7. Validate the assignment through distributional diagnostics
+8. Save the updated individual dataset with `edad_meses` for downstream scripts
+
+**Data source**: INE Guatemala, Estadísticas Vitales - Nacimientos por sexo, según mes de ocurrencia y departamento de residencia de la madre (2019-2023).
+
+# Setup
+
+## Load Packages
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  gt,             # Table formatting and presentation
+  tidyverse       # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to keep namespace clean):
+#   scales   - percent_format() in ggplot scales
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+---
+
+# Phase A: Load INE Birth Registry Data
+
+## A1. Birth Registry Source
+
+The INE birth registry for 2019-2023 is provided as a single unified Parquet file, consolidating the five annual vital-statistics releases into one table of births by year, month, department, and sex. The table below summarizes the documentary coverage of this source.
+
+```{r}
+#| label: a1-define-file-paths
+
+# Documentary coverage of the unified INE birth registry source
+file_metadata <- tibble(
+  year = 2019:2023,
+  source = "ine_nacimientos_2019_2023.parquet",
+  coverage = "Births by month, department, and sex"
+)
+```
+
+```{r}
+#| label: tbl-a1-file-metadata
+#| tbl-cap: "INE birth registry source coverage"
+
+# Save data for web resources
+export(
+  file_metadata,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_a1_file_metadata.rds")
+)
+
+file_metadata |>
+  gt() |>
+  tab_header(
+    title = "INE Birth Registry Source",
+    subtitle = "Guatemala vital statistics, births by month, department, and sex"
+  ) |>
+  cols_label(
+    year = "Year",
+    source = "Source File",
+    coverage = "Coverage"
+  ) |>
+  cols_align(align = "center", columns = year) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+## A2. Load and Standardize Birth Data
+
+Read the unified birth registry Parquet (2019-2023, all years combined), restore department labels to ENCOVI accented spelling, and pivot to long format by sex. The Parquet stores births in wide format by sex (`hombres`, `mujeres`) with unaccented department names; both are aligned here to the ENCOVI coding used downstream.
+
+```{r}
+#| label: a2-load-and-standardize
+
+# Map the unaccented department spelling used in the unified Parquet to the
+# accented ENCOVI labels required by the downstream joins on departamento
+depto_encovi_map <- c(
+  "Sacatepequez"  = "Sacatepéquez",
+  "Solola"        = "Sololá",
+  "Totonicapan"   = "Totonicapán",
+  "Suchitepequez" = "Suchitepéquez",
+  "Quiche"        = "Quiché",
+  "Peten"         = "Petén"
+)
+
+# Valid 22 Guatemalan departments (matching ENCOVI coding order)
+deptos_valid <- c(
+  "Guatemala", "El Progreso", "Sacatepéquez", "Chimaltenango",
+  "Escuintla", "Santa Rosa", "Sololá", "Totonicapán", "Quetzaltenango",
+  "Suchitepéquez", "Retalhuleu", "San Marcos", "Huehuetenango", "Quiché",
+  "Baja Verapaz", "Alta Verapaz", "Petén", "Izabal", "Zacapa", "Chiquimula",
+  "Jalapa", "Jutiapa"
+)
+
+# Load all five years from the unified Parquet (schema: anio, mes,
+# departamento, total, hombres, mujeres) and reshape to the long
+# birth_year / mes / departamento / sexo / nacimientos structure
+df_births_all <- read_parquet(
+  here("01_data", "01_raw", "INE_NACIMIENTOS",
+       "ine_nacimientos_2019_2023.parquet")
+) |>
+  # Restore ENCOVI accented department spelling
+  mutate(
+    departamento = recode(departamento, !!!depto_encovi_map),
+    birth_year = anio,
+    hombres = as.numeric(hombres),
+    mujeres = as.numeric(mujeres)
+  ) |>
+  # Verify all departments match ENCOVI coding
+  filter(departamento %in% deptos_valid) |>
+  # Pivot to long format by sex
+  pivot_longer(
+    cols = c(hombres, mujeres),
+    names_to = "sexo_raw",
+    values_to = "nacimientos"
+  ) |>
+  mutate(
+    sexo = if_else(sexo_raw == "hombres", "Hombre", "Mujer")
+  ) |>
+  select(birth_year, mes, departamento, sexo, nacimientos)
+```
+
+## A3. Validate Loaded Data
+
+```{r}
+#| label: tbl-a3-loading-summary
+#| tbl-cap: "Birth data loading summary by year"
+
+tbl_loading_summary <- df_births_all |>
+  summarise(
+    n_records = n(),
+    n_departments = n_distinct(departamento),
+    n_months = n_distinct(mes),
+    total_births = sum(nacimientos, na.rm = TRUE),
+    .by = birth_year
+  )
+
+# Save data for web resources
+export(
+  tbl_loading_summary,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_a3_loading_summary.rds")
+)
+
+tbl_loading_summary |>
+  gt() |>
+  tab_header(
+    title = "Birth Registry Data Summary",
+    subtitle = "INE Guatemala vital statistics (2019-2023)"
+  ) |>
+  cols_label(
+    birth_year = "Year",
+    n_records = "Records",
+    n_departments = "Departments",
+    n_months = "Months",
+    total_births = "Total Births"
+  ) |>
+  fmt_number(columns = c(n_records, total_births), decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "center") |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = n_departments, rows = n_departments != 22)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = n_months, rows = n_months != 12)
+  ) |>
+  tab_footnote(
+    footnote = "Expected: 22 departments x 12 months x 2 sexes = 528 records per year.",
+    locations = cells_column_labels(columns = n_records)
+  ) |>
+  tab_footnote(
+    footnote = "Red cells indicate deviations from expected values.",
+    locations = cells_title(groups = "subtitle")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_loading_summary)
+```
+
+---
+
+# Phase B: Calculate Birth Proportions
+
+## B1. Calculate Within-Year Proportions
+
+For each birth year, department, and sex, calculate the proportion of births in each month relative to the annual total in that stratum. These proportions serve as the probability weights for synthetic month assignment.
+
+```{r}
+#| label: b1-calculate-proportions
+
+df_birth_proportions <- df_births_all |>
+  mutate(
+    total_anual = sum(nacimientos, na.rm = TRUE),
+    .by = c(birth_year, departamento, sexo)
+  ) |>
+  mutate(
+    prop_mes = nacimientos / total_anual
+  ) |>
+  select(birth_year, mes, departamento, sexo, nacimientos, prop_mes)
+```
+
+```{r}
+#| label: tbl-b1-proportion-validation
+#| tbl-cap: "Proportion sum validation by stratum"
+
+# Verify proportions sum to 1 within each stratum
+tbl_proportion_validation <- df_birth_proportions |>
+  summarise(
+    sum_prop = sum(prop_mes, na.rm = TRUE),
+    .by = c(birth_year, departamento, sexo)
+  ) |>
+  summarise(
+    n_strata = n(),
+    min_sum = min(sum_prop),
+    max_sum = max(sum_prop),
+    mean_sum = mean(sum_prop),
+    all_valid = all(abs(sum_prop - 1) < 0.001),
+    .by = birth_year
+  )
+
+# Save data for web resources
+export(
+  tbl_proportion_validation,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_b1_proportion_validation.rds")
+)
+
+tbl_proportion_validation |>
+  gt() |>
+  tab_header(
+    title = "Birth Proportion Validation",
+    subtitle = "Sum of monthly proportions by year (expected = 1.000 per stratum)"
+  ) |>
+  cols_label(
+    birth_year = "Year",
+    n_strata = "Strata (dept x sex)",
+    min_sum = "Min Sum",
+    max_sum = "Max Sum",
+    mean_sum = "Mean Sum",
+    all_valid = "All Valid"
+  ) |>
+  fmt_number(columns = c(min_sum, max_sum, mean_sum), decimals = 4) |>
+  cols_align(align = "center") |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = all_valid, rows = all_valid == TRUE)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_proportion_validation)
+```
+
+## B2. Seasonal Birth Patterns
+
+Visualize birth seasonality across departments, with the uniform distribution as reference line.
+
+```{r}
+#| label: fig-b2-seasonal-patterns
+#| fig-cap: "Monthly birth proportions by department (2019-2023 average)"
+#| fig-width: 10
+#| fig-height: 12
+
+# Average proportions across all 5 years for visualization
+df_avg_proportions <- df_birth_proportions |>
+  summarise(
+    mean_prop = mean(prop_mes, na.rm = TRUE),
+    .by = c(mes, departamento)
+  )
+
+# Reference line: uniform distribution (1/12 = 0.0833)
+uniform_ref <- 1 / 12
+
+# Save data for web resources
+export(
+  df_avg_proportions,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_fig_b2_seasonal_patterns.rds")
+)
+
+df_avg_proportions |>
+  mutate(
+    departamento = fct_reorder(departamento, mean_prop, .fun = sd, .desc = TRUE)
+  ) |>
+  ggplot(aes(x = mes, y = mean_prop)) +
+  geom_hline(
+    yintercept = uniform_ref,
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_line(color = "#1B6CA8", linewidth = 0.6) +
+  geom_point(color = "#1B6CA8", size = 1.3) +
+  facet_wrap(~ departamento, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = 1:12, labels = substr(month.abb, 1, 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Monthly Birth Proportions by Department",
+    subtitle = "Average 2019-2023. Dashed line = uniform distribution (8.33%)",
+    x = "Month",
+    y = "Proportion of Annual Births"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 7, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4", size = 8),
+    panel.grid.minor = element_blank()
+  )
+
+# Cleanup auxiliary objects
+rm(df_avg_proportions, uniform_ref)
+```
+
+```{r}
+#| label: fig-b2-sex-differential
+#| fig-cap: "Male-to-female birth ratio by month (national average 2019-2023)"
+#| fig-width: 9
+#| fig-height: 5
+
+# Sex ratio by month (national level)
+df_sex_ratio <- df_births_all |>
+  summarise(
+    total = sum(nacimientos, na.rm = TRUE),
+    .by = c(mes, sexo)
+  ) |>
+  pivot_wider(names_from = sexo, values_from = total) |>
+  mutate(
+    ratio_mf = Hombre / Mujer,
+    mes_label = factor(mes, levels = 1:12, labels = month.abb)
+  )
+
+# Save data for web resources
+export(
+  df_sex_ratio,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_fig_b2_sex_differential.rds")
+)
+
+df_sex_ratio |>
+  ggplot(aes(x = mes_label, y = ratio_mf)) +
+  geom_hline(
+    yintercept = 1,
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+  geom_segment(
+    aes(xend = mes_label, yend = 1),
+    color = "#1B6CA8",
+    linewidth = 0.8
+  ) +
+  geom_point(color = "#1B6CA8", size = 3) +
+  coord_cartesian(ylim = c(0.99, 1.06)) +
+  labs(
+    title = "Male-to-Female Birth Ratio by Month",
+    subtitle = "National aggregate 2019-2023. Dashed line = parity (1.0)",
+    x = "Month",
+    y = "M/F Ratio"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    panel.grid.minor = element_blank()
+  )
+
+# Cleanup auxiliary objects
+rm(df_sex_ratio)
+```
+
+---
+
+# Phase C: Load ENCOVI Individuals and Assign Cohorts
+
+## C1. Load ENCOVI Individual Data
+
+Load the individual demographic dataset prepared in script 01_01 and the household socioeconomic data to obtain departmental classification.
+
+```{r}
+#| label: c1-load-encovi-individuals
+
+df_individuos <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_01_individuals_demographic.parquet")
+)
+
+# Load household data to obtain departamento (not present in individual table)
+df_hogar <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_01_household_socioeconomic.parquet")
+) |>
+  select(no_hogar, departamento)
+
+# Add departamento to individuals
+df_individuos <- df_individuos |>
+  left_join(df_hogar, by = join_by(no_hogar))
+
+rm(df_hogar)
+```
+
+```{r}
+#| label: tbl-c1-age-distribution-pre
+#| tbl-cap: "Age distribution of children 0-4 years before month assignment"
+
+# Current age distribution for children under 5
+tbl_age_distribution_pre <- df_individuos |>
+  filter(edad >= 0, edad <= 4) |>
+  summarise(
+    n = n(),
+    .by = c(edad, sexo)
+  ) |>
+  pivot_wider(names_from = sexo, values_from = n, values_fill = 0) |>
+  arrange(edad) |>
+  mutate(Total = Hombre + Mujer)
+
+# Save data for web resources
+export(
+  tbl_age_distribution_pre,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_c1_age_distribution_pre.rds")
+)
+
+tbl_age_distribution_pre |>
+  gt() |>
+  tab_header(
+    title = "Children Aged 0-4 Years in ENCOVI 2023",
+    subtitle = "Distribution by age (integer years) and sex before month assignment (sampled children, unweighted)"
+  ) |>
+  cols_label(
+    edad = "Age (years)",
+    Hombre = "Male",
+    Mujer = "Female",
+    Total = "Total"
+  ) |>
+  fmt_number(columns = c(Hombre, Mujer, Total), decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "center") |>
+  grand_summary_rows(
+    fns = list(Total = ~ sum(.)),
+    columns = c(Hombre, Mujer, Total),
+    fmt = ~ fmt_number(., decimals = 0, use_seps = TRUE)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_age_distribution_pre)
+```
+
+## C2. Define Cohort Mapping
+
+ENCOVI 2023 fieldwork was conducted during calendar year 2023. Each child's integer age maps directly to a birth-year cohort: a child aged `n` years was born in `2023 - n`. Within each cohort, the birth month determines the precise age in months through a fixed offset scheme.
+
+The month assignment uses INE birth proportions as sampling weights within each cohort, conditioned on department and sex. This uses the vital statistics registry as the population-level reference for birth timing in Guatemala.
+
+The mapping from integer age to birth-year cohort and age-in-months range:
+
+- `edad == 0` (born in 2023): months 0-11
+- `edad == 1` (born in 2022): months 12-23
+- `edad == 2` (born in 2021): months 24-35
+- `edad == 3` (born in 2020): months 36-47
+- `edad == 4` (born in 2019): months 48-59
+
+```{r}
+#| label: c2-define-cohort-mapping
+
+cohort_map <- tibble(
+  edad = 0:4,
+  birth_year = c(2023, 2022, 2021, 2020, 2019),
+  month_offset = c(0, 12, 24, 36, 48)
+)
+```
+
+```{r}
+#| label: tbl-c2-cohort-mapping
+#| tbl-cap: "Age-to-cohort mapping for synthetic month assignment"
+
+tbl_cohort_mapping <- cohort_map |>
+  mutate(
+    age_range_months = paste0(month_offset, "-", month_offset + 11)
+  )
+
+# Save data for web resources
+export(
+  tbl_cohort_mapping,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_c2_cohort_mapping.rds")
+)
+
+tbl_cohort_mapping |>
+  gt() |>
+  tab_header(
+    title = "Cohort Mapping: ENCOVI Age to INE Birth Year",
+    subtitle = "Each integer age maps to a birth year and 12-month range"
+  ) |>
+  cols_label(
+    edad = "Age (years)",
+    birth_year = "Birth Year",
+    month_offset = "Month Offset",
+    age_range_months = "Age Range (months)"
+  ) |>
+  cols_align(align = "center") |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_cohort_mapping)
+```
+
+---
+
+# Phase D: Synthetic Month Assignment
+
+## D1. Assign Synthetic Age in Months
+
+For each child aged 0-4 years, assign a birth month (1-12) using a greedy quota-filling algorithm. Within each stratum (birth year x department x sex), the algorithm calculates the target population per month from INE proportions and the total survey-weighted population in the stratum. Children are sorted by survey weight (descending) and each child is assigned to the month with the largest remaining quota, subtracting the child's weight from that quota. The weighted (population-represented) distribution therefore follows the INE reference.
+
+A child assigned birth month `m` within a given birth year receives age in months = `month_offset + (12 - m)`. This maps January births to the highest months within the range (oldest in the cohort) and December births to the lowest (youngest in the cohort), preserving chronological ordering within the cohort.
+
+```{r}
+#| label: d1-assign-synthetic-months
+
+set.seed(789)
+
+# Add unique row identifier before filtering to children
+df_individuos <- df_individuos |>
+  mutate(row_id = row_number())
+
+# Identify children requiring month assignment (age 0-4 years)
+df_children <- df_individuos |>
+  filter(edad >= 0, edad <= 4) |>
+  left_join(cohort_map, by = join_by(edad))
+
+# Assigns birth months so the weighted distribution follows INE proportions
+assign_months_weighted <- function(df, by, depto, sx, props_all) {
+  
+  # Get INE proportions for this stratum
+  props <- props_all |>
+    filter(birth_year == by, departamento == depto, sexo == sx) |>
+    arrange(mes)
+  
+  if (nrow(props) == 0 || sum(props$nacimientos) == 0) {
+    # Fallback: uniform assignment if no INE data
+    df$birth_month <- sample(1:12, nrow(df), replace = TRUE)
+    return(df)
+  }
+  
+  # Total population represented in this stratum
+  total_pop <- sum(df$factor, na.rm = TRUE)
+  
+  # Target quota per month (population units)
+  quotas <- props |>
+    mutate(quota_target = total_pop * prop_mes) |>
+    select(mes, quota_target)
+  
+  # Initialize remaining quota
+  remaining <- setNames(quotas$quota_target, quotas$mes)
+  
+  # Sort by weight descending, shuffling ties at random
+  df <- df |>
+    mutate(rand_order = runif(n())) |>
+    arrange(desc(factor), rand_order) |>
+    select(-rand_order)
+  
+  # Greedy assignment: assign each child to the month with largest remaining quota
+  assigned_months <- integer(nrow(df))
+  for (i in seq_len(nrow(df))) {
+    # Find month with maximum remaining quota
+    best_month <- as.integer(names(which.max(remaining)))
+    assigned_months[i] <- best_month
+    # Subtract this child's weight from that month's quota
+    remaining[as.character(best_month)] <- remaining[as.character(best_month)] - df$factor[i]
+  }
+  
+  df$birth_month <- assigned_months
+  return(df)
+}
+
+# Apply weighted assignment by stratum
+df_children_assigned <- df_children |>
+  nest(.by = c(birth_year, departamento, sexo)) |>
+  mutate(
+    data = pmap(
+      list(data, birth_year, departamento, sexo),
+      function(df, by, depto, sx) {
+        assign_months_weighted(df, by, depto, sx, df_birth_proportions)
+      }
+    )
+  ) |>
+  unnest(data) |>
+  # Calculate age in months: offset + (12 - birth_month)
+  # January birth (m=1) -> oldest in cohort -> offset + 11
+  # December birth (m=12) -> youngest in cohort -> offset + 0
+  mutate(
+    edad_meses = month_offset + (12L - birth_month)
+  )
+```
+
+## D2. Enforce Biological Plausibility for Sibling Ages
+
+Within households containing multiple children aged 0-4 years, the independent stratum-based assignment in D1 can produce age-in-months values that are biologically implausible for siblings. Specifically, two children from the same mother cannot be born less than 9 months apart (full gestation period), unless they are twins or multiples (age difference of exactly 0 months).
+
+This post-assignment correction identifies all sibling pairs within each household where the assigned age separation falls in the invalid range (1-8 months) and reassigns the child with the smaller survey weight to a valid birth month. The replacement month is selected as the one with the largest remaining INE quota in that child's stratum (birth year × department × sex), preserving the population-level distributional match as closely as possible.
+
+The correction is iterative within each household: after each reassignment, all sibling pairs are re-evaluated to ensure that fixing one conflict does not introduce another.
+
+```{r}
+#| label: d2-enforce-sibling-separation
+
+# Identify households with multiple children
+hh_counts <- df_children_assigned |>
+  summarise(n_children = n(), .by = no_hogar) |>
+  filter(n_children > 1)
+
+# Work only with multi-child households
+df_multi <- df_children_assigned |>
+  inner_join(hh_counts |> select(no_hogar), by = join_by(no_hogar))
+
+# Remaining quota tracker, recalculated from current assignments
+quota_tracker <- df_children_assigned |>
+  summarise(
+    assigned_pop = sum(factor, na.rm = TRUE),
+    .by = c(birth_year, departamento, sexo, birth_month)
+  ) |>
+  left_join(
+    df_birth_proportions |> select(birth_year, mes, departamento, sexo, prop_mes),
+    by = join_by(birth_year, birth_month == mes, departamento, sexo)
+  )
+
+# Calculate target and remaining quota per stratum-month
+strata_totals <- df_children_assigned |>
+  summarise(
+    total_pop = sum(factor, na.rm = TRUE),
+    .by = c(birth_year, departamento, sexo)
+  )
+
+quota_remaining <- df_birth_proportions |>
+  select(birth_year, mes, departamento, sexo, prop_mes) |>
+  left_join(strata_totals, by = join_by(birth_year, departamento, sexo)) |>
+  mutate(quota_target = total_pop * prop_mes) |>
+  left_join(
+    df_children_assigned |>
+      summarise(assigned_pop = sum(factor, na.rm = TRUE),
+                .by = c(birth_year, departamento, sexo, birth_month)),
+    by = join_by(birth_year, mes == birth_month, departamento, sexo)
+  ) |>
+  mutate(
+    assigned_pop = replace_na(assigned_pop, 0),
+    remaining = quota_target - assigned_pop
+  )
+
+# Iterative correction: process each multi-child household
+correction_log <- list()
+df_corrected <- df_children_assigned
+
+for (hh in hh_counts$no_hogar) {
+  
+  siblings <- df_corrected |>
+    filter(no_hogar == hh) |>
+    arrange(edad_meses)
+  
+  if (nrow(siblings) < 2) next
+  
+  # Check all pairs for violations
+  needs_correction <- TRUE
+  max_iterations <- 20L
+  iter <- 0L
+  
+ while (needs_correction && iter < max_iterations) {
+    iter <- iter + 1L
+    needs_correction <- FALSE
+    
+    siblings <- df_corrected |>
+      filter(no_hogar == hh) |>
+      arrange(edad_meses)
+    
+    for (i in seq_len(nrow(siblings) - 1)) {
+      for (j in (i + 1):nrow(siblings)) {
+        
+        diff_m <- abs(siblings$edad_meses[i] - siblings$edad_meses[j])
+        
+        # Valid if identical (twins) or >= 9 months apart
+        if (diff_m > 0 && diff_m < 9) {
+          
+          # Reassign the child with smaller survey weight, or the older
+          # one when weights are equal
+          if (siblings$factor[i] < siblings$factor[j]) {
+            fix_idx <- i
+            anchor_idx <- j
+          } else if (siblings$factor[i] > siblings$factor[j]) {
+            fix_idx <- j
+            anchor_idx <- i
+          } else {
+            # Equal weights: reassign the older sibling in the pair
+            if (siblings$edad_meses[i] >= siblings$edad_meses[j]) {
+              fix_idx <- i
+              anchor_idx <- j
+            } else {
+              fix_idx <- j
+              anchor_idx <- i
+            }
+          }
+          
+          fix_row_id <- siblings$row_id[fix_idx]
+          fix_by <- siblings$birth_year[fix_idx]
+          fix_depto <- siblings$departamento[fix_idx]
+          fix_sx <- siblings$sexo[fix_idx]
+          fix_offset <- siblings$month_offset[fix_idx]
+          anchor_edad_meses <- siblings$edad_meses[anchor_idx]
+          
+          # All other siblings' edad_meses (excluding the one being fixed)
+          other_siblings_meses <- siblings$edad_meses[-fix_idx]
+          
+          # Candidate months for reassignment (1-12 within the child's cohort)
+          candidates <- tibble(birth_month_candidate = 1:12) |>
+            mutate(
+              edad_meses_candidate = fix_offset + (12L - birth_month_candidate)
+            )
+          
+          # Filter to valid candidates: diff == 0 or diff >= 9 vs ALL other siblings
+          candidates <- candidates |>
+            rowwise() |>
+            mutate(
+              valid = all(
+                sapply(other_siblings_meses, function(other_m) {
+                  d <- abs(edad_meses_candidate - other_m)
+                  d == 0 || d >= 9
+                })
+              )
+            ) |>
+            ungroup() |>
+            filter(valid)
+          
+          if (nrow(candidates) == 0) next
+          
+          # Among valid candidates, pick the one with the largest remaining quota
+          candidates <- candidates |>
+            left_join(
+              quota_remaining |>
+                filter(birth_year == fix_by,
+                       departamento == fix_depto,
+                       sexo == fix_sx) |>
+                select(mes, remaining),
+              by = join_by(birth_month_candidate == mes)
+            ) |>
+            arrange(desc(remaining))
+          
+          new_month <- candidates$birth_month_candidate[1]
+          new_edad_meses <- candidates$edad_meses_candidate[1]
+          
+          # Apply correction
+          row_match <- which(df_corrected$row_id == fix_row_id)
+          df_corrected$birth_month[row_match] <- new_month
+          df_corrected$edad_meses[row_match] <- new_edad_meses
+          
+          # Log the correction
+          correction_log[[length(correction_log) + 1]] <- tibble(
+            no_hogar = hh,
+            row_id = fix_row_id,
+            old_edad_meses = siblings$edad_meses[fix_idx],
+            new_edad_meses = new_edad_meses,
+            anchor_edad_meses = anchor_edad_meses
+          )
+          
+          needs_correction <- TRUE
+          break
+        }
+      }
+      if (needs_correction) break
+    }
+  }
+}
+
+# Summary of corrections applied
+df_corrections <- bind_rows(correction_log)
+
+# Corrected assignment with biological plausibility enforced
+df_children_corrected <- df_corrected |>
+  select(row_id, edad_meses)
+```
+
+
+## D3. Merge Back to Full Individual Dataset
+
+Integrate the synthetic `edad_meses` into the full individual dataset. Non-children (age > 4) and adults receive `edad_meses = edad * 12` as a simple conversion since month precision is not required for them.
+
+```{r}
+#| label: d3-merge-edad-meses
+
+# Join by unique row_id (avoids many-to-many from twins/same-age siblings)
+df_individuos_updated <- df_individuos |>
+  left_join(df_children_corrected, by = join_by(row_id)) |>
+  # For individuals not in 0-4 range, assign edad_meses = edad * 12
+  mutate(
+    edad_meses = if_else(is.na(edad_meses), edad * 12L, edad_meses)
+  ) |>
+  # Remove auxiliary column
+  select(-row_id)
+```
+
+```{r}
+#| label: tbl-d3-assignment-summary
+#| tbl-cap: "Age in months assignment summary"
+
+tbl_assignment_summary <- tibble(
+  Category = c(
+    "Total individuals in ENCOVI",
+    "Children 0-4 years (synthetic assignment)",
+    "Children under 1 year",
+    "Children 6-11 months (synthetic assignment)",
+    "Children 0-5 months (excluded, exclusive breastfeeding assumption)",
+    "Adults and older children (simple conversion)"
+  ),
+  N = c(
+    nrow(df_individuos_updated),
+    sum(df_individuos_updated$edad >= 0 & df_individuos_updated$edad <= 4),
+    sum(df_individuos_updated$edad == 0),
+    sum(df_individuos_updated$edad_meses >= 6 & df_individuos_updated$edad_meses <= 11,
+        na.rm = TRUE),
+    sum(df_individuos_updated$edad_meses >= 0 & df_individuos_updated$edad_meses <= 5,
+        na.rm = TRUE),
+    sum(df_individuos_updated$edad > 4, na.rm = TRUE)
+  )
+)
+
+# Save data for web resources
+export(
+  tbl_assignment_summary,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_d3_assignment_summary.rds")
+)
+
+tbl_assignment_summary |>
+  gt() |>
+  tab_header(
+    title = "Synthetic Age-in-Months Assignment Summary",
+    subtitle = "ENCOVI 2023 individual dataset"
+  ) |>
+  cols_label(
+    Category = "Category",
+    N = "N"
+  ) |>
+  fmt_number(columns = N, decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = N) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      rows = Category == "Children 6-11 months (synthetic assignment)"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      rows = Category == "Children 6-11 months (synthetic assignment)"
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_assignment_summary)
+```
+
+---
+
+# Phase E: Validation
+
+## E1. Distribution of Assigned Months Within Cohorts
+
+Verify that the synthetic month distribution within each age-year cohort reflects the empirical INE birth patterns, not a uniform distribution.
+
+```{r}
+#| label: fig-e1-month-distribution-by-cohort
+#| fig-cap: "Synthetic assignment vs INE expected birth proportions by cohort"
+#| fig-width: 12
+#| fig-height: 8
+
+# Observed proportions: synthetic assignment expanded by survey weights
+df_observed <- df_individuos_updated |>
+  filter(edad >= 0, edad <= 4) |>
+  mutate(
+    birth_month_inferred = 12L - (edad_meses %% 12L),
+    birth_month_inferred = if_else(birth_month_inferred == 0L, 12L,
+                                   birth_month_inferred),
+    factor_int = as.integer(factor)
+  ) |>
+  uncount(weights = factor_int) |>
+  mutate(
+    cohort_label = paste0("Age ", edad, " yr (born ", 2023 - edad, ")"),
+    birth_year = 2023 - edad
+  ) |>
+  summarise(
+    n = n(),
+    .by = c(cohort_label, birth_year, birth_month_inferred)
+  ) |>
+  mutate(
+    prop_observed = n / sum(n),
+    .by = c(cohort_label, birth_year)
+  )
+
+# Expected proportions: INE national averages by birth year (across all deptos and sexes)
+df_expected <- df_birth_proportions |>
+  summarise(
+    total_births = sum(nacimientos, na.rm = TRUE),
+    .by = c(birth_year, mes)
+  ) |>
+  mutate(
+    prop_expected = total_births / sum(total_births),
+    .by = birth_year
+  ) |>
+  inner_join(
+    tibble(birth_year = 2019:2023,
+           cohort_label = paste0("Age ", 4:0, " yr (born ", 2019:2023, ")")),
+    by = join_by(birth_year)
+  )
+
+# Combined plot
+df_fig_cohort <- df_observed |>
+  left_join(
+    df_expected |> select(cohort_label, mes, prop_expected),
+    by = join_by(cohort_label, birth_month_inferred == mes)
+  )
+
+# Save data for web resources
+export(
+  df_fig_cohort,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_fig_e1_month_distribution_by_cohort.rds")
+)
+
+df_fig_cohort |>
+  ggplot(aes(x = birth_month_inferred)) +
+  geom_segment(
+    aes(xend = birth_month_inferred, y = prop_expected, yend = prop_observed),
+    color = "grey70",
+    linewidth = 0.4
+  ) +
+  geom_point(aes(y = prop_observed), color = "#1B6CA8", size = 2) +
+  geom_line(
+    aes(y = prop_expected),
+    color = "#3AAF85",
+    linewidth = 0.7,
+    linetype = "dashed"
+  ) +
+  geom_point(aes(y = prop_expected), color = "#3AAF85", size = 1.5, shape = 4) +
+  facet_wrap(~ cohort_label, ncol = 3, scales = "fixed") +
+  scale_x_continuous(breaks = 1:12, labels = substr(month.abb, 1, 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Synthetic Assignment vs INE Expected Birth Proportions",
+    subtitle = "Blue dots = observed (survey-weighted). Green dashed = INE expected. Grey segments = deviation",
+    x = "Birth Month",
+    y = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4", size = 9),
+    panel.grid.minor = element_blank()
+  )
+
+# Cleanup auxiliary objects
+rm(df_observed, df_expected, df_fig_cohort)
+```
+
+## E2. Age in Months Distribution for Target Population
+
+```{r}
+#| label: fig-e2-edad-meses-distribution
+#| fig-cap: "Distribution of edad_meses for children 0-59 months"
+#| fig-width: 10
+#| fig-height: 6
+
+df_fig_edad_meses <- df_individuos_updated |>
+  filter(edad_meses >= 0, edad_meses <= 59)
+
+# Save data for web resources
+export(
+  df_fig_edad_meses,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_fig_e2_edad_meses_distribution.rds")
+)
+
+df_fig_edad_meses |>
+  ggplot(aes(x = edad_meses)) +
+  geom_histogram(
+    binwidth = 1,
+    fill = "#1B6CA8",
+    color = "white",
+    alpha = 0.7
+  ) +
+  geom_vline(
+    xintercept = 5.5,
+    color = "#E07A5F",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = 2.7, y = Inf,
+    label = "< 6 months\n(excluded)",
+    vjust = 1.5,
+    hjust = 0.5,
+    color = "#E07A5F",
+    size = 3.5,
+    fontface = "italic"
+  ) +
+  annotate(
+    "text",
+    x = 32, y = Inf,
+    label = "6-59 months\n(study population)",
+    vjust = 1.5,
+    hjust = 0.5,
+    color = "#3AAF85",
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  scale_x_continuous(breaks = seq(0, 59, by = 6)) +
+  labs(
+    title = "Distribution of Synthetic Age in Months",
+    subtitle = "ENCOVI 2023 children 0-59 months. Dashed line = 6-month boundary",
+    x = "Age (months)",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    panel.grid.minor = element_blank()
+  )
+
+# Cleanup auxiliary objects
+rm(df_fig_edad_meses)
+```
+
+## E3. Departmental Age Distribution
+
+```{r}
+#| label: fig-e3-department-age-boxplot
+#| fig-cap: "Synthetic edad_meses distribution by department for children 6-59 months"
+#| fig-width: 10
+#| fig-height: 8
+
+df_fig_dept_age <- df_individuos_updated |>
+  filter(edad_meses >= 6, edad_meses <= 59) |>
+  mutate(
+    departamento = fct_reorder(departamento, edad_meses, .fun = median)
+  )
+
+# Save data for web resources
+export(
+  df_fig_dept_age,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_fig_e3_department_age_boxplot.rds")
+)
+
+df_fig_dept_age |>
+  ggplot(aes(x = departamento, y = edad_meses)) +
+  geom_boxplot(
+    fill = "#1B6CA8",
+    alpha = 0.3,
+    color = "azure4",
+    outlier.size = 0.8,
+    outlier.alpha = 0.4
+  ) +
+  coord_flip() +
+  labs(
+    title = "Synthetic Age Distribution by Department",
+    subtitle = "Children 6-59 months, ENCOVI 2023",
+    x = NULL,
+    y = "Age (months)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    axis.text.y = element_text(size = 9),
+    panel.grid.minor = element_blank()
+  )
+
+# Cleanup auxiliary objects
+rm(df_fig_dept_age)
+```
+
+## E4. Weighted Deviation from INE Birth Proportions
+
+Quantify the departure of the synthetic month assignment from the target INE birth proportions after the biological plausibility correction applied in D2. For each department, the mean and maximum absolute deviation between the survey-weighted assigned distribution and the INE reference proportions are calculated across all cohort-month strata. Mean deviation is the primary quality indicator; maximum deviation captures the worst individual stratum and tends to be higher in departments with smaller sample sizes, given the discrete nature of the assignment.
+
+```{r}
+#| label: tbl-e4-weighted-deviation
+#| tbl-cap: "Weighted deviation from INE proportions by department"
+
+tbl_weighted_deviation <- df_individuos_updated |>
+  filter(edad >= 0, edad <= 4) |>
+  mutate(
+    birth_month_inferred = 12L - (edad_meses %% 12L),
+    birth_month_inferred = if_else(birth_month_inferred == 0L, 12L,
+                                   birth_month_inferred),
+    birth_year = 2023L - edad
+  ) |>
+  summarise(
+    pop_weighted = sum(factor, na.rm = TRUE),
+    .by = c(departamento, birth_year, birth_month_inferred)
+  ) |>
+  mutate(
+    prop_weighted = pop_weighted / sum(pop_weighted),
+    .by = c(departamento, birth_year)
+  ) |>
+  left_join(
+    df_birth_proportions |> select(birth_year, mes, departamento, prop_mes),
+    by = join_by(birth_year, birth_month_inferred == mes, departamento)
+  ) |>
+  mutate(abs_dev = abs(prop_weighted - prop_mes)) |>
+  summarise(
+    n_strata = n(),
+    mean_abs_dev = mean(abs_dev, na.rm = TRUE),
+    max_abs_dev = max(abs_dev, na.rm = TRUE),
+    .by = departamento
+  ) |>
+  left_join(
+    df_individuos_updated |>
+      filter(edad >= 0, edad <= 4) |>
+      count(departamento, name = "n_children"),
+    by = join_by(departamento)
+  ) |>
+  arrange(desc(mean_abs_dev))
+
+# Save data for web resources
+export(
+  tbl_weighted_deviation,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_e4_weighted_deviation.rds")
+)
+
+tbl_weighted_deviation |>
+  gt() |>
+  tab_header(
+    title = "Weighted Deviation from INE Birth Proportions",
+    subtitle = "By department, across all cohorts and months"
+  ) |>
+  cols_move(columns = n_children, after = departamento) |>
+  cols_label(
+    departamento = "Department",
+    n_children = "N Children (sample)",
+    n_strata = "Strata (cohort x month)",
+    mean_abs_dev = "Mean |Deviation|",
+    max_abs_dev = "Max |Deviation|"
+  ) |>
+  fmt_number(columns = c(mean_abs_dev, max_abs_dev), decimals = 4) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "center", columns = c(n_children, n_strata, mean_abs_dev, max_abs_dev)) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = mean_abs_dev, rows = mean_abs_dev > 0.02)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = mean_abs_dev, rows = mean_abs_dev <= 0.02)
+  ) |>
+  tab_footnote(
+    footnote = "Green = mean deviation <= 2pp. Red = exceeds 2pp. Higher deviations are expected in departments with smaller sample sizes. Max deviation captures the worst individual stratum (single month x cohort combination).",
+    locations = cells_column_labels(columns = mean_abs_dev)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_weighted_deviation)
+```
+
+## E5. Sibling Age Separation
+
+Report sibling age separations after the biological plausibility correction. Valid sibling pairs have an age difference of exactly 0 months (twins or multiples) or at least 9 months (minimum full gestation period). The table below classifies all sibling pairs by separation category and reports any remaining pairs in the 1-8 month range.
+
+```{r}
+#| label: tbl-e5-sibling-separation
+#| tbl-cap: "Sibling age separation diagnostic after biological plausibility correction"
+
+# Identify siblings in multi-child households
+df_siblings_e5 <- df_individuos_updated |>
+  filter(edad >= 0, edad <= 4) |>
+  select(no_hogar, edad, edad_meses) |>
+  mutate(child_id = row_number())
+
+hogares_multi_e5 <- df_siblings_e5 |>
+  summarise(n_children = n(), .by = no_hogar) |>
+  filter(n_children > 1)
+
+df_pairs_e5 <- df_siblings_e5 |>
+  inner_join(hogares_multi_e5 |> select(no_hogar), by = join_by(no_hogar)) |>
+  inner_join(
+    df_siblings_e5 |> rename_with(~ paste0(.x, "_b")),
+    by = join_by(no_hogar == no_hogar_b),
+    relationship = "many-to-many"
+  ) |>
+  filter(child_id < child_id_b) |>
+  mutate(
+    diff_months = abs(edad_meses - edad_meses_b),
+    separation_class = case_when(
+      diff_months == 0              ~ "Twins (0 months)",
+      diff_months >= 9 & diff_months <= 12 ~ "9-12 months",
+      diff_months > 12 & diff_months <= 24 ~ "13-24 months",
+      diff_months > 24              ~ ">24 months",
+      TRUE                          ~ "Invalid (1-8 months)"
+    )
+  )
+
+# Summary table
+tbl_sibling_separation <- df_pairs_e5 |>
+  summarise(
+    n_pairs = n(),
+    .by = separation_class
+  ) |>
+  mutate(
+    pct = n_pairs / sum(n_pairs),
+    separation_class = factor(
+      separation_class,
+      levels = c("Twins (0 months)", "9-12 months",
+                 "13-24 months", ">24 months", "Invalid (1-8 months)")
+    )
+  ) |>
+  arrange(separation_class)
+
+# Save data for web resources
+export(
+  tbl_sibling_separation,
+  here("01_data", "02_processed",
+       "web_resources", "01_03_tbl_e5_sibling_separation.rds")
+)
+
+tbl_sibling_separation |>
+  gt() |>
+  tab_header(
+    title = "Sibling Age Separation Distribution",
+    subtitle = "All sibling pairs in households with 2+ children aged 0-4 years, after biological plausibility correction"
+  ) |>
+  cols_label(
+    separation_class = "Separation Category",
+    n_pairs = "N Pairs",
+    pct = "Proportion"
+  ) |>
+  fmt_number(columns = n_pairs, decimals = 0) |>
+  fmt_percent(columns = pct, decimals = 1) |>
+  cols_align(align = "left", columns = separation_class) |>
+  cols_align(align = "center", columns = c(n_pairs, pct)) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(
+      columns = n_pairs,
+      rows = separation_class == "Invalid (1-8 months)"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = n_pairs,
+      rows = separation_class != "Invalid (1-8 months)"
+    )
+  ) |>
+  tab_footnote(
+    footnote = paste0(
+      "Corrections applied: ", nrow(df_corrections),
+      " reassignments across ", n_distinct(df_corrections$no_hogar),
+      " households. Constraint: sibling ages must differ by 0 (twins) or ≥ 9 months."
+    ),
+    locations = cells_title(groups = "subtitle")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_siblings_e5, hogares_multi_e5, df_pairs_e5, tbl_sibling_separation)
+```
+
+---
+
+# Phase F: Save Outputs
+
+## F1. Save Updated Individual Dataset
+
+```{r}
+#| label: f1-save-outputs
+
+# Save updated individual dataset with edad_meses
+write_parquet(
+  df_individuos_updated,
+  here("01_data", "02_processed", 
+       "transfer", "01_03_individuals_with_age_months.parquet")
+)
+
+# Save birth proportions table for reference and audit traceability
+write_parquet(
+  df_birth_proportions,
+  here("01_data", "02_processed", 
+       "transfer", "01_03_ine_birth_proportions.parquet")
+)
+```
+
+---
+
+# Notes
+
+## Methodology
+
+**Cohort assignment logic**: Each integer age in ENCOVI is mapped to a single birth year (2023 minus age). This assumes children were interviewed during 2023 and that their reported age reflects completed years. For children interviewed near their birthday, the resulting imprecision is bounded at ±1 month within the cohort.
+
+**Quota-based weighted assignment**: Within each stratum (birth year x department x sex), the algorithm calculates the target population per month from INE birth proportions and the total survey-weighted population in the stratum. Children are sorted by survey weight (descending) and assigned greedily to the month with the largest remaining quota. The weighted distribution of assigned months therefore follows the INE reference proportions. A random tie-breaking component (`runif`) handles children with identical weights.
+
+**Exclusion of "Extranjero" and "Ignorado"**: INE birth records classified as foreign-born or with unknown department are excluded from the proportion calculations. In 2023, the "Ignorado" category contained 10,756 births (3.1% of total), substantially higher than in previous years (< 0.1%). This concentration in 2023 may reflect changes in RENAP registration procedures. ENCOVI assigns every surveyed child to one of the 22 departments, so the proportions are computed on the same departmental universe.
+
+**Temporal reference**: ENCOVI 2023 fieldwork spans the calendar year 2023. Since the exact interview month per individual is unavailable, the birth-month-to-age-in-months conversion assumes a mid-year reference point. The formula `edad_meses = month_offset + (12 - birth_month)` maps January births to the oldest position within the cohort and December births to the youngest, preserving chronological ordering within the cohort.
+
+**Sibling biological plausibility constraint**: A post-processing step identifies sibling pairs within households whose assigned age separation falls in the biologically impossible range of 1-8 months. For each such pair, the child with the smaller survey weight (or the older sibling when weights are equal) is reassigned to the valid month with the largest remaining INE quota in that child's stratum. Valid separations are 0 months (twins or multiples) or at least 9 months (minimum full gestation period). The correction is applied iteratively within each household. The reassignments applied and the households affected are reported in the sibling separation diagnostic; the departmental deviation from INE birth proportions after correction is reported in the weighted deviation table.
+
+## Limitations
+
+**Interview timing assumption**: The lack of individual-level interview dates in ENCOVI means that the cohort assignment (age in years → birth year) is approximate. A child interviewed in January 2023 who reports age 1 could have been born in either 2021 or 2022. This ambiguity affects approximately 1/12 of children at each cohort boundary and cannot be resolved with available data.
+
+**Within-month precision**: The assignment produces age in completed months (integer), not in exact days, matching the monthly resolution of the WHO LMS tables.
+
+**Residual stochasticity**: The month assignment is predominantly deterministic (greedy quota-filling), with a random component limited to tie-breaking among children with identical survey weights within the same stratum. Individual-level assignments are synthetic and should not be interpreted as observed values.
+
+**Twin identification**: The sibling plausibility correction treats any sibling pair assigned to the same birth month (0-month separation) as potential twins. ENCOVI does not record twin status, so this classification is inferred rather than observed: some pairs classified as twins may be non-twin siblings assigned the same month, and actual twins with different integer ages would not be identified as such. The ambiguity affects the pairs reported in the twin category of the sibling separation table.

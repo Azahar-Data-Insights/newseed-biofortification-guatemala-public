@@ -1,0 +1,231 @@
+# Raw data sources manifest
+#
+# Used by 00_01_download_raw_sources.qmd and 00_02_convert_to_parquet.qmd to:
+#   1. Fetch the original files from authoritative sources
+#   2. Verify integrity against expected SHA256 hashes
+#   3. Convert active files to Parquet format
+#   4. Package the originals into 7z archives for audit purposes
+#
+# Conventions:
+#   - All URLs are direct download links to the authoritative source
+#     (canonical landing pages are listed in `landing_url` for each source)
+#   - Hashes are SHA256 of the original file as downloaded on the date
+#     specified in `recorded_on` (one date per source group)
+#   - `active: true` files are unpacked into 01_data/01_raw/{SOURCE}/
+#     and feed the analytical pipeline
+#   - `active: false` files are kept inside the historical 7z only
+#     and are not unpacked unless explicitly requested
+#
+# Manifest version:  2026-05-29
+
+# ---------------------------------------------------------------------
+# ENCOVI 2023 — National Survey of Living Conditions
+# Publisher: Instituto Nacional de Estadistica (INE) Guatemala
+# License:   CC BY-SA 4.0 (Guatemalan government data portal policy)
+#
+# Note: hogares and personas were re-uploaded by INE on 2025-02-18.
+#   hogares adds column Factor3 (factor de expansion de hogares con
+#   consumo × personas). personas adds column Factor2 (factor de
+#   expansion de hogares con agregado de consumo) and renames AÑO→ANO.
+#   Core data columns are identical to the 2024-08-30 upload.
+# ---------------------------------------------------------------------
+encovi_2023:
+  source_label: "ENCOVI_2023"
+  landing_url:  "https://www.ine.gob.gt/pobreza-menu/"
+  citation:     "INE Guatemala. Encuesta Nacional de Condiciones de Vida (ENCOVI) 2023. Microdata. Instituto Nacional de Estadistica, Guatemala."
+  recorded_on:  "2025-11-08"
+  format:       "xlsx"
+  files:
+    - filename: "encovi_2023_c13sa_alimentos_3.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2024/08/30/20240830122038C8M6SpIQkU1dO569us4WzmhiEojxPhwf.xlsx"
+      sha256: "85cf72cd3d425ae190fa9e26d92ecba981d4d3f666d28df962fc46e49f8d1980"
+      size_mb: 71.02
+      active: true
+      description: "Food consumption module (chapter 13, section A, part 3)"
+    - filename: "encovi_2023_c16sbc_produccion.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2024/08/30/20240830121531wYrotaSoTgYH4rrGyOMdnnuhIpHpui7R.xlsx"
+      sha256: "f789dc9d62bf78c6a58b01a3e7c81e0f1481e64b4d7104915343d98c9af66934"
+      size_mb: 6.38
+      active: true
+      description: "Agricultural production module (chapter 16, sections B and C)"
+    - filename: "encovi_2023_c16sa_unidad.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2024/08/30/20240830121643IfNeqVfBO1L31APP5eqiPN59BUnP4ePA.xlsx"
+      sha256: "a0b1ecc84d36532a5174d36ce10bc77899382b8e8383ef763eb607d7c10359cc"
+      size_mb: 0.49
+      active: true
+      description: "Agricultural production unit (chapter 16, section A)"
+    - filename: "encovi_2023_hogares.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2025/02/18/20250218143715PYvVsdamJOx0qMg5xBkLZcbvSzAJoqd1.xlsx"
+      sha256: "b48242a09dce3884fc924b895d51c1a0d8329494cd09e034d9122c13032766f4"
+      size_mb: 4.31
+      active: true
+      description: "Household-level dataset (INE re-upload 2025-02-18, adds Factor3 column)"
+    - filename: "encovi_2023_personas.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2025/02/18/20250218143854aE63D8ky7MoFhXG3MgBOYfWXBzsEFBGD.xlsx"
+      sha256: "60918d0fb208f904ecc39b964fb89890d85730a6f28b9e1d19ce567b62fbc984"
+      size_mb: 103.26
+      active: true
+      description: "Individual-level dataset (INE re-upload 2025-02-18, adds Factor2, renames AÑO→ANO)"
+
+# ---------------------------------------------------------------------
+# SIVESNU - Nutritional Surveillance System
+# Publisher: SESAN / INCAP, accessed via SIINSAN portal
+# License:   Open access (Guatemalan government data portal)
+# Notes:     Single ZIP archive contains years 2013, 2015, 2016, 2017, 2018.
+#            Only 2018 files are unpacked into 01_data/01_raw/SIVESNU_2018/.
+#            2015 files are extracted into the historical 7z but kept
+#            inactive in the pipeline.
+# ---------------------------------------------------------------------
+sivesnu:
+  source_label: "SIVESNU"
+  landing_url:  "https://portal.siinsan.gob.gt/monitoreo-y-evaluacion/"
+  citation:     "SESAN / INCAP. Sistema de Vigilancia Epidemiologica de Salud y Nutricion (SIVESNU). Microdata. Secretaria de Seguridad Alimentaria y Nutricional, Guatemala."
+  recorded_on:  "2025-11-08"
+  format:       "dta"
+  archive_url:  "https://portal.siinsan.gob.gt/wp-content/uploads/BASE-DE-DATOS-SIVESNU.zip"
+  files_2018:
+    - filename: "sivesnu_gt18_hogar_publico.dta"
+      sha256: "e84fce7cd699fd3634d768776af796f296ee8738b18141934c5ed4b5a9c043a5"
+      size_mb: 6.97
+      active: true
+      description: "Household-level survey (2018)"
+    - filename: "sivesnu_gt18_miembros_publico.dta"
+      sha256: "cb9c45c2ee3d8f0a22808ee340f3a777ecbfffd72cc37c2a5953241b627546cc"
+      size_mb: 2.37
+      active: true
+      description: "Household members survey (2018)"
+    - filename: "sivesnu_gt18_mujer_publico.dta"
+      sha256: "58582305df9ffa23ef1ed7ebb13a02c82cdc4a1db7bd476934775b0de04e1b4e"
+      size_mb: 7.41
+      active: true
+      description: "Women's health survey (2018)"
+    - filename: "sivesnu_gt18_nino_publico.dta"
+      sha256: "31492b85bc5d8d81107a6a30b7561d90d2e82367b62a425efba2b676707f19f4"
+      size_mb: 2.97
+      active: true
+      description: "Children's anthropometric survey (2018)"
+  files_2015:
+    - filename: "sivesnu_gt15_hogar_publico.dta"
+      sha256: "4e07bef3b24ea6598ba6654defe4fdf0cca22f1a95ddba2ce4dd9a509ce91870"
+      size_mb: 7.24
+      active: false
+      description: "Household-level survey (2015) - historical only"
+    - filename: "sivesnu_gt15_miembros_publico.dta"
+      sha256: "2856c0f00e4d21f96f6f7c6acca98c61512508e33685a8d87289b34da1ecc432"
+      size_mb: 2.26
+      active: false
+      description: "Household members survey (2015) - historical only"
+    - filename: "sivesnu_gt15_mujer_publico.dta"
+      sha256: "103e968388603e6f288006f6215b92e2b3cb3b5df39c1ba42a016410d5d76e3d"
+      size_mb: 7.78
+      active: false
+      description: "Women's health survey (2015) - historical only"
+    - filename: "sivesnu_gt15_nino_publico.dta"
+      sha256: "ffbd64c0a0c50e8dfed86b8849692ca7c91d5ca153668145fba334196fc803c2"
+      size_mb: 2.75
+      active: false
+      description: "Children's anthropometric survey (2015) - historical only"
+
+# ---------------------------------------------------------------------
+# INE Birth Registry (Estadisticas Vitales)
+# Publisher: Instituto Nacional de Estadistica (INE) Guatemala
+# License:   CC BY-SA 4.0 (Guatemalan government data portal policy)
+# ---------------------------------------------------------------------
+ine_nacimientos:
+  source_label: "INE_NACIMIENTOS"
+  landing_url:  "https://www.ine.gob.gt/vitales/"
+  citation:     "INE Guatemala. Estadisticas Vitales: Nacimientos. Annual reports 2019-2023. Instituto Nacional de Estadistica, Guatemala."
+  recorded_on:  "2026-04-27"
+  format:       "xlsx"
+  files:
+    - filename: "INE_Guatemala_Nacimientos_2019.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2021/09/24/20210924170829QlKHEHYjsnuXyJ0R0nU16Fo9SHmLER0z.xlsx"
+      sha256: "e6569bb34e40ef3d5c72ae7332a88f102ef61e82529439b3880fad520c8c7a68"
+      size_mb: 0.25
+      active: true
+      description: "Vital statistics - births registered in 2019"
+    - filename: "INE_Guatemala_Nacimientos_2020.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2021/09/29/202109291921256F87AhmHSz23w98DinOdgRYLeXivIhIr.xlsx"
+      sha256: "f6d03f6f6d90699afad2b1d46599574448de2d26405fd657b088550848ce87c3"
+      size_mb: 0.4025
+      active: true
+      description: "Vital statistics - births registered in 2020"
+    - filename: "INE_Guatemala_Nacimientos_2021.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2022/08/31/20220831204532NudErojEnmloPqTMhSRutgPsnoFkJOt2.xlsx"
+      sha256: "e83323ce7eb2314008dc0008b3d601051f4304933a29803db3744267ff948861"
+      size_mb: 0.2585
+      active: true
+      description: "Vital statistics - births registered in 2021"
+    - filename: "INE_Guatemala_Nacimientos_2022.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2023/10/03/20231003200820xWnoL8XOFWtEdaj6FS3AtmzgpEXyVyB8.xlsx"
+      sha256: "d0d7d22dde132038c1bde0175751fd9c231dde55412d91a8be54bf09e693a3b9"
+      size_mb: 0.2687
+      active: true
+      description: "Vital statistics - births registered in 2022"
+    - filename: "INE_Guatemala_Nacimientos_2023.xlsx"
+      url: "https://www.ine.gob.gt/sistema/uploads/2024/08/29/20240829172109P8nxydeYs0IhaBHFRqgPDSp5dCeJj5yY.xlsx"
+      sha256: "8cda0cb5c95111852d4a29b4ec8b43b94f6fffadf18f144ea230b3f943c8ddf3"
+      size_mb: 0.2894
+      active: true
+      description: "Vital statistics - births registered in 2023"
+
+# ---------------------------------------------------------------------
+# WHO Child Growth Standards & Growth Reference 5-19
+# Publisher: World Health Organization
+# License:   WHO content publicly accessible for non-commercial use
+# ---------------------------------------------------------------------
+who_growth:
+  source_label: "WHO_GROWTH"
+  landing_url:  "https://www.who.int/tools/child-growth-standards/standards/length-height-for-age"
+  citation:     "World Health Organization. WHO Child Growth Standards: Length/height-for-age. Methods and development. WHO, Geneva, 2006. // de Onis M et al. Development of a WHO growth reference for school-aged children and adolescents. Bull WHO 2007;85:660-7."
+  recorded_on:  "2026-04-27"
+  format:       "xlsx"
+  files:
+    - filename: "lhfa_boys_0_to_2_years_zscores.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/child-growth-standards/indicators/length-height-for-age/lhfa_boys_0-to-2-years_zscores.xlsx?sfvrsn=30e044c_9"
+      sha256: "ccfd8e455141c9a39dd728d99b7d7e080a925b06ea4a4d7592229665713dba54"
+      size_mb: 0.0114
+      active: true
+      description: "WHO standard length/height-for-age z-scores, boys 0-2 years"
+    - filename: "lhfa_boys_2_to_5_years_zscores.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/child-growth-standards/indicators/length-height-for-age/lhfa_boys_2-to-5-years_zscores.xlsx?sfvrsn=17e5ad91_9"
+      sha256: "a44ed06039e0a9dd6920e4a4d928395c541c9732662e49eacd489d2194ccc80d"
+      size_mb: 0.0122
+      active: true
+      description: "WHO standard length/height-for-age z-scores, boys 2-5 years"
+    - filename: "lhfa_girls_0_to_2_years_zscores.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/child-growth-standards/indicators/length-height-for-age/lhfa_girls_0-to-2-years_zscores.xlsx?sfvrsn=e9e66a95_11"
+      sha256: "6757f5eb96b51ab5cdb4828105929c78b1fb3d73b0fd8fa65682ad9f60f8c083"
+      size_mb: 0.0114
+      active: true
+      description: "WHO standard length/height-for-age z-scores, girls 0-2 years"
+    - filename: "lhfa_girls_2_to_5_years_zscores.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/child-growth-standards/indicators/length-height-for-age/lhfa_girls_2-to-5-years_zscores.xlsx?sfvrsn=2ec187b9_11"
+      sha256: "a976c56a6d36885cc32bf77c5539ca066e396ef2adad06011cd71d9eb0f0eb5c"
+      size_mb: 0.0123
+      active: true
+      description: "WHO standard length/height-for-age z-scores, girls 2-5 years"
+    - filename: "lhfa-boys-zscore-expanded-tables.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/child-growth-standards/indicators/length-height-for-age/expandable-tables/lhfa-boys-zscore-expanded-tables.xlsx?sfvrsn=7b4a3428_12"
+      sha256: "c4b1c9029ab9751a5f0888e32f35c7c0287a16d361885cf911ecf23b3f7f6b4f"
+      size_mb: 0.1909
+      active: true
+      description: "WHO expanded length/height-for-age z-score tables, boys 0-5 years"
+    - filename: "lhfa-girls-zscore-expanded-tables.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/child-growth-standards/indicators/length-height-for-age/expandable-tables/lhfa-girls-zscore-expanded-tables.xlsx?sfvrsn=27f1e2cb_10"
+      sha256: "6aa2876319449a6b1f4d825848128902114ff53c67b92b86a0c5140846013059"
+      size_mb: 0.1906
+      active: true
+      description: "WHO expanded length/height-for-age z-score tables, girls 0-5 years"
+    - filename: "hfa-boys-z-who-2007-exp.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/growth-reference-5-19-years/height-for-age-(5-19-years)/hfa-boys-z-who-2007-exp.xlsx?sfvrsn=7fa263d_2"
+      sha256: "d78fa8cafcab77dcb5f03d71506d92bdcb28f89c642816b6bb0eef466b007466"
+      size_mb: 0.0286
+      active: true
+      description: "WHO 2007 height-for-age z-scores reference, boys 5-19 years"
+    - filename: "hfa-girls-z-who-2007-exp.xlsx"
+      url: "https://cdn.who.int/media/docs/default-source/child-growth/growth-reference-5-19-years/height-for-age-(5-19-years)/hfa-girls-z-who-2007-exp.xlsx?sfvrsn=79d310ee_2"
+      sha256: "df07ee16d3d2916569f1d869b7c874d7b880a41321d871215ed0254cb16679b3"
+      size_mb: 0.0285
+      active: true
+      description: "WHO 2007 height-for-age z-scores reference, girls 5-19 years"

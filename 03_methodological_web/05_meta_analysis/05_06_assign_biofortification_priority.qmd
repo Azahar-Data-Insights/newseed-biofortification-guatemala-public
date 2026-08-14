@@ -1,0 +1,586 @@
+---
+title: "Biofortification Priority Assignment"
+subtitle: "Module 5: Meta-analysis"
+---
+
+## Why Assign Biofortification Priority?
+
+Biofortified maize reaches different populations through different
+channels. Children in households that produce and consume their own maize
+are the most direct beneficiaries; children in non-agricultural urban
+households access biofortified varieties through progressively more
+indirect market mechanisms. This module assigns a five-level priority
+hierarchy to each child based on their household's agricultural profile,
+determining the order in which children receive biofortified maize in
+scenario simulations.
+
+### Priority Hierarchy
+
+| Level | Label | Definition |
+|-------|-------|------------|
+| 1 | Maize farm + self-consumption | Produces white maize, retains for own consumption |
+| 2 | Maize farm, no self-consumption | Produces white maize, sells entire harvest |
+| 3 | Non-maize agricultural household | Agricultural production but no white maize |
+| 4 | Rural non-agricultural | Rural household, no reported production |
+| 5 | Urban | Urban household |
+
+The hierarchy is constructed at the household level: children in the same
+household receive the same priority, since biofortified maize enters the
+household food supply as a whole.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Professional table formatting
+  scales,             # Number formatting (percent_format) for barplot
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file (single source of truth)
+source(here("..", "02_code", "00_functions", "00_functions.R"))
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Web resources for visualizations (exported by framework 05_06)
+
+# Phase B — Household vector validation
+tbl_b4_household_vector_validation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_b4_household_vector_validation.rds"),
+  trust = TRUE
+)
+
+tbl_b4_assert_mutual_exclusivity <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_b4_assert_mutual_exclusivity.rds"),
+  trust = TRUE
+)
+
+# Phase C — Completeness check
+tbl_c2_completeness_check <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_c2_completeness_check.rds"),
+  trust = TRUE
+)
+
+# Phase D — Distribution analysis
+tbl_d1_national_distribution_unweighted <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_d1_national_distribution_unweighted.rds"),
+  trust = TRUE
+)
+
+tbl_d2_national_distribution_weighted <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_d2_national_distribution_weighted.rds"),
+  trust = TRUE
+)
+
+tbl_d3_departmental_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_d3_departmental_distribution.rds"),
+  trust = TRUE
+)
+
+fig_d4_priority_distribution_barplot <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_fig_d4_priority_distribution_barplot.rds"),
+  trust = TRUE
+)
+
+tbl_d5_stunting_by_priority <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_d5_stunting_by_priority.rds"),
+  trust = TRUE
+)
+
+# Phase E — Output structure (NEW)
+tbl_e1_output_structure <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "05_06_tbl_e1_output_structure.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Total agricultural households (sum of levels 1, 2, 3 from tbl-b4-household)
+n_total_agri <- tbl_b4_household_vector_validation |>
+  filter(level == "Total agricultural households") |>
+  pull(n_households)
+
+n_level_1 <- tbl_b4_household_vector_validation |>
+  filter(level == "Level 1: Maize + self-consumption") |>
+  pull(n_households)
+
+n_level_2 <- tbl_b4_household_vector_validation |>
+  filter(level == "Level 2: Maize, no self-consumption") |>
+  pull(n_households)
+
+# Analytical cohort size (from tbl-d1)
+n_children_total <- tbl_d1_national_distribution_unweighted |>
+  summarise(n = sum(n_children)) |>
+  pull(n)
+
+# Population structure (weighted % from tbl-d2)
+pct_level_1 <- tbl_d2_national_distribution_weighted |>
+  filter(priority_level == 1L) |>
+  pull(pct_weighted)
+
+pct_level_2 <- tbl_d2_national_distribution_weighted |>
+  filter(priority_level == 2L) |>
+  pull(pct_weighted)
+
+pct_level_3 <- tbl_d2_national_distribution_weighted |>
+  filter(priority_level == 3L) |>
+  pull(pct_weighted)
+
+pct_levels_123 <- pct_level_1 + pct_level_2 + pct_level_3
+```
+
+
+## Data Sources
+
+Three datasets are integrated in the framework: the
+[ENCOVI children with stunting profiles](05_05_calculate_qpm_stunting_impact.qmd),
+the white maize farmer dataset with self-consumption flags built in the
+economic impact module for the 2022 seed, and the raw ENCOVI agricultural
+production module, covering all 82 crop types, which identifies the
+non-agricultural and non-maize agricultural households.
+
+The hierarchy is built on the 2022 seed farmer dataset. Seed generation enters
+the economic projections and the adoption scores, and leaves the
+household-level agricultural profile unchanged: the two variables read here,
+`no_hogar` and `has_household_consumption`, take the same values for the 2022,
+2026 and 2028 seeds. The priority assignment therefore serves every seed
+scenario.
+
+
+## Household Agricultural Classification
+
+Three mutually exclusive household vectors are constructed based on
+agricultural activity. Level 1 identifies maize-producing households that
+retain harvest for consumption; Level 2 identifies maize producers who
+sell everything; Level 3 identifies households with other agricultural
+production but no white maize.
+
+### Vector Validation
+
+```{r}
+#| label: tbl-b4-household-vector-validation
+#| tbl-cap: "Household agricultural vector validation: mutual exclusivity check"
+
+tbl_b4_household_vector_validation |>
+  gt() |>
+  tab_header(
+    title = "Household Agricultural Vector Validation",
+    subtitle = "Mutual exclusivity check: Levels 1 + 2 + 3 = Total agricultural"
+  ) |>
+  cols_label(
+    level = "Level",
+    n_households = "N Households"
+  ) |>
+  fmt_number(columns = n_households, decimals = 0, use_seps = TRUE) |>
+  tab_footnote(
+    footnote = "Counts refer to sampled households in ENCOVI 2023.",
+    locations = cells_column_labels(columns = n_households)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+::: {.callout-note}
+## Mutual Exclusivity
+The three agricultural household vectors sum to the total number of
+agricultural households in the raw production data,
+`r format(n_total_agri, big.mark = ",")`, and their pairwise intersections are
+empty, so the classification covers the agricultural households once each.
+Level 1, maize with self-consumption, holds
+`r format(n_level_1, big.mark = ",")` households against
+`r format(n_level_2, big.mark = ",")` in Level 2, so
+`r round(100 * n_level_1 / (n_level_1 + n_level_2), 1)`% of maize-producing
+households retain part of their harvest.
+:::
+
+```{r}
+#| label: tbl-b4-assert-mutual-exclusivity
+#| tbl-cap: "Mutual exclusivity verification between priority levels"
+
+tbl_b4_assert_mutual_exclusivity |>
+  gt() |>
+  tab_header(
+    title = "Mutual Exclusivity Verification",
+    subtitle = "All intersections should be zero"
+  ) |>
+  cols_label(
+    comparison = "Comparison",
+    n_overlap = "N Overlap",
+    status = "Status"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = everything(), rows = status == "PASS")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(columns = everything(),
+                           rows = str_detect(status, "FAIL"))
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+
+## Priority Assignment
+
+Each child receives a priority level via strict hierarchical precedence: a
+child is assigned to the highest applicable level. Levels 4 and 5 are
+residual categories based on the `area` variable (Rural/Urbana) from the
+ENCOVI household module.
+
+```{r}
+#| label: tbl-c2-completeness-check
+#| tbl-cap: "Assignment completeness verification for all sampled children"
+
+tbl_c2_completeness_check |>
+  gt() |>
+  tab_header(
+    title = "Assignment Completeness Verification",
+    subtitle = "All checks should show 0 (except total children)"
+  ) |>
+  cols_label(
+    check = "Check",
+    value = "Value"
+  ) |>
+  fmt_number(columns = value, decimals = 0, use_seps = TRUE) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+
+## Distribution Analysis
+
+### National Distribution (Unweighted)
+
+```{r}
+#| label: tbl-d1-national-distribution-unweighted
+#| tbl-cap: "Child distribution by biofortification priority level (unweighted sample counts)"
+
+tbl_d1_national_distribution_unweighted |>
+  gt() |>
+  tab_header(
+    title = "Child Distribution by Biofortification Priority Level",
+    subtitle = "Unweighted sample counts — ENCOVI 2023 children aged 6–59 months"
+  ) |>
+  fmt_number(columns = c(n_children, n_households),
+             decimals = 0, use_seps = TRUE) |>
+  fmt_percent(columns = c(pct_children, pct_cumulative), decimals = 1) |>
+  cols_label(
+    priority_level = "Level",
+    priority_label = "Description",
+    n_children = "Children",
+    n_households = "Households",
+    pct_children = "% of Total",
+    pct_cumulative = "Cumulative %"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+### National Distribution (Survey-Weighted)
+
+```{r}
+#| label: tbl-d2-national-distribution-weighted
+#| tbl-cap: "Child distribution by biofortification priority level (survey-weighted population estimates)"
+
+tbl_d2_national_distribution_weighted |>
+  gt() |>
+  tab_header(
+    title = "Child Distribution by Biofortification Priority Level",
+    subtitle = "Survey-weighted population estimates — ENCOVI 2023 children aged 6–59 months"
+  ) |>
+  fmt_number(columns = c(n_weighted, n_weighted_low, n_weighted_upp),
+             decimals = 0, use_seps = TRUE) |>
+  fmt_percent(columns = c(pct_weighted, pct_cumulative), decimals = 1) |>
+  cols_label(
+    priority_level = "Level",
+    priority_label = "Description",
+    n_weighted = "Population Estimate",
+    n_weighted_low = "95% CI Lower",
+    n_weighted_upp = "95% CI Upper",
+    pct_weighted = "% of Total",
+    pct_cumulative = "Cumulative %"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+::: {.callout-important}
+## Population Structure
+At the population level, `r scales::percent(pct_level_1, accuracy = 0.1)`
+of children aged 6-59 months live in households that produce and consume
+their own maize (Level 1). An additional
+`r scales::percent(pct_level_2, accuracy = 0.1)` live in maize-producing
+households without self-consumption (Level 2), and
+`r scales::percent(pct_level_3, accuracy = 0.1)` in non-maize agricultural
+households (Level 3). The first three levels, which carry the most direct
+access to biofortified varieties, cover
+`r scales::percent(pct_levels_123, accuracy = 0.1)` of the child population,
+so around four in five children are reached through the market channels of
+Levels 4 and 5 (see @tbl-d2-national-distribution-weighted).
+:::
+
+### Departmental Distribution
+
+```{r}
+#| label: tbl-d3-departmental-distribution
+#| tbl-cap: "Departmental distribution of children by priority level (survey-weighted)"
+
+tbl_d3_departmental_distribution |>
+  gt() |>
+  tab_header(
+    title = "Departmental Distribution of Children by Priority Level",
+    subtitle = "Survey-weighted percentage within each department"
+  ) |>
+  fmt_percent(columns = starts_with("level_"), decimals = 1) |>
+  cols_label(
+    departamento = "Department",
+    level_1 = "L1: Maize + SC",
+    level_2 = "L2: Maize, no SC",
+    level_3 = "L3: Non-maize Ag.",
+    level_4 = "L4: Rural",
+    level_5 = "L5: Urban"
+  ) |>
+  tab_footnote(
+    footnote = "SC = self-consumption. Ag. = agricultural household.",
+    locations = cells_column_labels(columns = starts_with("level_"))
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+```{r}
+#| label: fig-d4-priority-distribution-barplot
+#| fig-cap: "Distribution of children across biofortification priority levels by department"
+#| fig-alt: >
+#|   Stacked bar chart with one bar per department on the x-axis and the
+#|   survey-weighted proportion of children on the y-axis. Each bar is divided
+#|   into the five priority levels, from maize farm with self-consumption through
+#|   maize farm without self-consumption, non-maize agricultural, rural
+#|   non-agricultural, and urban. Departments are ordered from left to right by
+#|   their combined agricultural household share (Levels 1 to 3). The chart shows
+#|   wide geographic variation: rural maize-dependent departments on the left are
+#|   dominated by the agricultural levels, while urban-dominant departments on the
+#|   right are almost entirely the urban level.
+#| fig-width: 10
+#| fig-height: 8
+
+# Order departments by agricultural household share (Levels 1-3 combined)
+dept_order <- fig_d4_priority_distribution_barplot |>
+  filter(priority_label %in% c(
+    "Maize farm + self-consumption",
+    "Maize farm, no self-consumption",
+    "Non-maize agricultural household"
+  )) |>
+  summarise(pct_agri = sum(pct), .by = departamento) |>
+  arrange(desc(pct_agri)) |>
+  pull(departamento)
+
+fig_d4_priority_distribution_barplot |>
+  mutate(departamento = factor(departamento, levels = dept_order)) |>
+  ggplot(aes(x = departamento, y = pct, fill = priority_label)) +
+  geom_col(width = 0.4) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(
+    values = c(
+      "Maize farm + self-consumption"    = "#2E7D32",
+      "Maize farm, no self-consumption"  = "#66BB6A",
+      "Non-maize agricultural household" = "#A5D6A7",
+      "Rural non-agricultural"           = "#FFB74D",
+      "Urban"                            = "#90A4AE"
+    ),
+    name = "Priority Level"
+  ) +
+  labs(
+    title = "Child Distribution by Biofortification Priority Level",
+    subtitle = "Departments ordered by agricultural household share (Levels 1–3)",
+    x = NULL,
+    y = "Proportion of children (survey-weighted)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "bottom",
+    legend.text = element_text(size = 9),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey40")
+  ) +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+```
+
+The agricultural household share varies widely across departments (see
+@fig-d4-priority-distribution-barplot). It reaches 39.7% in Huehuetenango and
+37.0% in Chiquimula at one end, and falls to 2.0% in Guatemala and 2.2% in El
+Progreso at the other, where Level 5 covers 89.3% and 62.0% of children
+respectively.
+
+### Stunting by Priority Level
+
+```{r}
+#| label: tbl-d5-stunting-by-priority
+#| tbl-cap: "Baseline stunting prevalence by biofortification priority level"
+
+tbl_d5_stunting_by_priority |>
+  gt() |>
+  tab_header(
+    title = "Baseline Stunting Prevalence by Priority Level",
+    subtitle = "Survey-weighted proportion of children with HAZ < -2 SD"
+  ) |>
+  fmt_percent(columns = c(stunting_prev, stunting_prev_low, stunting_prev_upp),
+              decimals = 1) |>
+  fmt_number(columns = n_total, decimals = 0, use_seps = TRUE) |>
+  cols_label(
+    priority_level = "Level",
+    priority_label = "Description",
+    stunting_prev = "Stunting %",
+    stunting_prev_low = "95% CI Lower",
+    stunting_prev_upp = "95% CI Upper",
+    n_total = "Population"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+::: {.callout-note}
+## Stunting by Level
+The separation runs between rural and urban rather than along the five levels
+in order (see @tbl-d5-stunting-by-priority). Levels 1, 3 and 4 sit together at
+65.3%, 62.0% and 66.6%, and Level 5 stands apart at 24.1%. The highest
+prevalence is Level 4, rural non-agricultural households, not Level 1.
+
+Level 2 reads 36.2%, but it rests on 10 sampled children and its confidence
+interval runs from 4.1% to 68.2%, so the point estimate carries little
+information. The hierarchy orders access to biofortified maize; it is not
+ordered by stunting prevalence.
+:::
+
+
+## Output Dataset Structure
+
+The output dataset carries the variables of the
+[QPM stunting impact dataset](05_05_calculate_qpm_stunting_impact.qmd) and adds
+two: `priority_level`, an integer from 1 to 5, and `priority_label`, a factor
+with the descriptive labels. The existing columns pass through unchanged.
+
+```{r}
+#| label: tbl-e1-output-structure
+#| tbl-cap: "Output dataset structure summary"
+
+tbl_e1_output_structure |>
+  gt() |>
+  tab_header(
+    title = "Output Dataset Structure",
+    subtitle = "Priority assignment added to the QPM stunting impact dataset"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(columns = value, decimals = 0, use_seps = TRUE) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+```
+
+
+## Summary
+
+### Key Findings
+
+1. **Complete assignment**: Each of the
+   `r format(n_children_total, big.mark = ",")` children receives a priority
+   classification, with no missing values in `priority_level`, `area` or
+   `no_hogar` (see @tbl-c2-completeness-check and
+   @tbl-d1-national-distribution-unweighted).
+
+2. **Agricultural household share**:
+   `r scales::percent(pct_levels_123, accuracy = 0.1)` of the child
+   population (Levels 1-3) lives in households with direct or indirect
+   agricultural connections to the biofortification supply chain
+   (see @tbl-d2-national-distribution-weighted).
+
+3. **Maize self-consumption dominance**:
+   `r round(100 * n_level_1 / (n_level_1 + n_level_2), 1)`% of
+   maize-producing households retain part of their production for own
+   consumption (Level 1 against Level 2 in
+   @tbl-b4-household-vector-validation), which places most of the direct
+   channel inside the household itself.
+
+4. **Stunting by level**: Levels 1, 3 and 4 carry baseline stunting between
+   62.0% and 66.6% and Level 5 carries 24.1% (see
+   @tbl-d5-stunting-by-priority), so the contrast that shows up is rural
+   against urban rather than a gradient along the hierarchy.
+
+::: {.callout-warning}
+## Limitations
+
+1. **Self-consumption as proxy** — The flag indicates retention of maize
+   production but does not quantify the amount consumed. A household
+   retaining a small fraction receives the same Level 1 priority as one
+   consuming most of its harvest.
+
+2. **Agricultural module coverage** — ENCOVI may undercount subsistence
+   farming, particularly among indigenous communities. Some Level 4-5
+   households may have unregistered agricultural activity.
+
+3. **Static classification** — The hierarchy is built on ENCOVI 2023
+   cross-sectional data, so seasonal variation in agricultural employment
+   falls outside it.
+
+4. **Level 2 sample size** — Level 2 rests on 10 sampled children, and its
+   stunting estimate carries a confidence interval from 4.1% to 68.2%.
+:::
+
+### Application
+
+This priority-enriched dataset is the final input for the scenario
+simulation pipeline (Module 6), which uses the priority hierarchy to
+assign biofortified maize to children in order of decreasing agricultural
+proximity at each production coverage level.

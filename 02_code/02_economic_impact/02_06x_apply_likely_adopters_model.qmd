@@ -1,0 +1,1370 @@
+---
+title: "Application of the Likely Adopters Model (`r params$seed_label`, `r params$subsidy_label`)"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+params:
+  # Seed identification
+  seed_year: "2022"
+  seed_label: "2022 Seed"
+  seed_suffix: "s22"
+  # Subsidy identification
+  subsidy_label: "Current subsidy"
+  subsidy_suffix: "sub00"
+---
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Setup: Load packages, configure environment, resolve parameters
+# =============================================================================
+
+# Clean environment (preserve params injected by Quarto)
+rm(list = setdiff(ls(), "params"))
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  gt,             # Professional table formatting
+  patchwork,      # Plot composition
+  tidyverse       # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select    <- dplyr::select
+filter    <- dplyr::filter
+summarise <- dplyr::summarise
+
+# Set display options
+options(
+  scipen = 999,
+  digits = 4
+)
+
+# Load utility functions from centralized file
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# --- Resolve parameters into local variables -------------------------------
+
+# Seed
+seed_year   <- params$seed_year
+seed_label  <- params$seed_label
+seed_suffix <- params$seed_suffix
+
+# Subsidy
+subsidy_label  <- params$subsidy_label
+subsidy_suffix <- params$subsidy_suffix
+
+# Seed code for plot/table titles (e.g., "S22"). Derived from seed_suffix
+# to keep seed_variants.yml unchanged: no additional field required.
+seed_code <- toupper(seed_suffix)
+
+# Composite file prefix for all output artefacts (parquet + web_resources rds)
+file_prefix <- paste0("02_06_", seed_suffix, "_", subsidy_suffix)
+
+# --- Visual constants -------------------------------------------------------
+ADI_PRIMARY  <- "#2E5266"
+ADI_GREEN    <- "#2E7D32"
+ADI_ACCENT   <- "#7B8B99"
+ADI_AMBER    <- "#E89923"
+ADI_RED      <- "#C0392B"
+SEGMENT_COLORS <- c(
+  "OPV/Criollo" = "#81C784",
+  "Low"         = "#2E7D32",
+  "Mid"         = "#FDD835",
+  "High"        = "#C62828"
+)
+PROFILE_COLORS <- c(
+  "S" = ADI_GREEN,
+  "M" = ADI_AMBER,
+  "L" = ADI_RED
+)
+
+# scenarios/
+ensure_output_dir(here("01_data", "02_processed", "scenarios"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Overview
+
+This script applies the Likely Adopters model determined in script 02_05 to a specific combination of seed variant and subsidy regime: this run targets the **`r seed_label`** under the **`r subsidy_label`** regime.
+
+The model configuration is loaded from a serialised artefact (`02_05_likely_adopters_model_config.rds`), which encapsulates all parameters calibrated against the empirical anchors: segment-priority points, component weights, scoring heuristic breakpoints, age-score factory parameters, risk-aversion driver coefficients, and continuous-adoption curve parameters. The configuration is taken as invariant across the nine seed-by-subsidy combinations: the relationships between farmer characteristics and adoption priority are modelled as a function of the joint distribution of farmer attributes. The script applies the same calibrated configuration to each combination, producing a per-combination scored dataset that downstream modules consume to evaluate the economic impact of biofortified maize at any chosen national production coverage level.
+
+## Conceptual Framework
+
+The application proceeds in four sequential stages. The first stage computes a base composite score by applying the five scoring components defined by the model: segment priority, economic benefit, improvement potential, scale potential, and farmer profile. The second stage computes a risk-aversion penalty as an additive correction to the base score, reflecting the structural reluctance of farmers facing high baseline yield, marginal income increment, large land commitment, and projected income loss. The third stage ranks farmers by the resulting composite-and-risk score, derives each farmer's entry point on the coverage axis, and assigns each farmer to a behavioural profile (small, medium, large) governing the per-farmer conversion curve. The fourth stage exports the enriched per-farmer dataset to be consumed by the M06 scenario engine.
+
+## Final Score Formulation
+
+The final adoption score of farmer `i` is the base composite score net of the risk-aversion penalty:
+
+$$
+\text{adoption_score}(i) = \text{score}_{\text{base}}(i) - w_R \cdot \text{penalty}_R(i)
+$$
+
+where `w_R` is the risk weight and `penalty_R(i)` is the logistic risk-aversion penalty defined in Phase C. The base score is the weighted linear combination of the five component scores defined in Phase B.
+
+## Main Operations
+
+1. Load economic impact data (02_04, `r seed_suffix` + `r subsidy_suffix`), segmentation data (02_03), and the serialised model configuration (02_05).
+2. Derive the per-farmer entry-size profile (`profile`, `entry_coef`, `land_entry_size`).
+3. Apply the five-component scoring system with the calibrated parameters.
+4. Compute the risk-aversion penalty using the calibrated driver variant.
+5. Combine base score and risk penalty into the final adoption score.
+6. Rank farmers by final score and derive each farmer's entry point (`p_entry`).
+7. Export the enriched per-farmer dataset for consumption by the M06 scenario engine.
+
+# Phase A: Data Loading and Integration
+
+This phase loads the per-farmer datasets (economic impact from 02_04, segmentation from 02_03) and the serialised model configuration from 02_05. It then derives the entry-size profile assignment that governs the scale-potential component of the score and the structural risk driver based on land commitment.
+
+## A1. Load Per-Farmer Datasets and Model Configuration
+
+```{r}
+#| label: a1-load-inputs
+
+# =============================================================================
+# A1. Load Economic Impact (02_04), Segmentation (02_03), Model Config (02_05)
+# =============================================================================
+
+df_economic <- read_parquet(
+  here("01_data", "02_processed", "transfer",
+       paste0("02_04_", seed_suffix, "_", subsidy_suffix,
+              "_farmers_economic_impact.parquet"))
+)
+
+df_segmentation <- read_parquet(
+  here("01_data", "02_processed", "transfer",
+       "02_03_farmers_segmentated.parquet")
+)
+
+model_config <- readRDS(
+  here("01_data", "02_processed", "models",
+       "02_05_likely_adopters_model_config.rds")
+)
+```
+
+## A2. Join Datasets
+
+Perform left join using the economic impact data as the base and adding only the variables present in segmentation but not in economic impact. The join keys are the household identifier, farmer identifier, and copy identifier.
+
+```{r}
+#| label: a2-join-datasets
+
+# =============================================================================
+# A2. Join Datasets (avoiding column duplication)
+# =============================================================================
+
+# Define join keys
+join_keys <- c("no_hogar", "farmer_id", "copy_id")
+
+# Identify variables present only in segmentation
+vars_unique_segmentation <- setdiff(names(df_segmentation), names(df_economic))
+
+# Prepare segmentation data: keep only join keys + unique variables
+df_segmentation_unique <- df_segmentation |>
+  select(all_of(c(join_keys, vars_unique_segmentation)))
+
+# Perform left join
+df_farmers_join <- df_economic |>
+  left_join(df_segmentation_unique, by = join_keys)
+
+# Clean up intermediate objects
+rm(df_segmentation_unique, vars_unique_segmentation, join_keys,
+   df_economic, df_segmentation)
+```
+
+## A3. Derive Entry-Size Profile Assignment
+
+Assign each farmer to one of three behavioural profiles (small, medium, large) based on white-maize land area, using the cutoffs and entry coefficients held in `model_config$entry_size`. The `land_entry_size` variable is the per-farmer land commitment at the moment of entry into the ranking; it replaces total maize land as the scale magnitude consumed by the scoring engine's scale-potential component.
+
+```{r}
+#| label: a3-entry-size-profile
+
+# =============================================================================
+# A3. Derive Entry-Size Profile, Coefficient, and Magnitude
+# =============================================================================
+
+entry_cut_S_M <- model_config$entry_size$cut_S_M
+entry_cut_M_L <- model_config$entry_size$cut_M_L
+entry_coef_S  <- model_config$entry_size$coef_S
+entry_coef_M  <- model_config$entry_size$coef_M
+entry_coef_L  <- model_config$entry_size$coef_L
+
+df_farmers_entry <- df_farmers_join |>
+  mutate(
+    profile = case_when(
+      land_wtcorn <  entry_cut_S_M ~ "S",
+      land_wtcorn <  entry_cut_M_L ~ "M",
+      TRUE                          ~ "L"
+    ),
+    entry_coef = case_when(
+      profile == "S" ~ entry_coef_S,
+      profile == "M" ~ entry_coef_M,
+      profile == "L" ~ entry_coef_L
+    ),
+    land_entry_size = land_wtcorn * entry_coef
+  )
+
+rm(df_farmers_join)
+```
+
+---
+
+# Phase B: Base Composite Score
+
+This phase implements the five-component scoring system with the parameters held in `model_config$scoring`. Each component scores the farmer on a `[0, 100]` scale; the composite score is a weighted linear combination of the five component scores using the calibrated weight vector.
+
+## B1. Component Definitions
+
+The five components are summarised below. The segment-priority component uses cardinal points per segment. The economic, improvement, and scale components use percentile-based breakpoints on continuous variables. The age component uses a three-axis parameterisation governed by `peak_center`, `peak_width`, and `profile`.
+
+```{r}
+#| label: tbl-b1-component-summary
+#| tbl-cap: "Score Components and Calibrated Parameters"
+
+tbl_b1_components <- tibble(
+  component  = c("Segment Priority", "Economic Benefit", "Improvement Potential",
+                 "Scale Potential", "Farmer Profile (Age)"),
+  variable   = c("segment_final", "income_increment", "exp_total_per_mz_annual",
+                 "land_entry_size", "farmer_age"),
+  weight     = c(
+    model_config$scoring$component_weights[["segment"]],
+    model_config$scoring$component_weights[["economic"]],
+    model_config$scoring$component_weights[["improvement"]],
+    model_config$scoring$component_weights[["scale"]],
+    model_config$scoring$component_weights[["age"]]
+  ),
+  specification = c(
+    paste0(model_config$scoring$segment_scheme, ": Low=",
+           model_config$scoring$segment_points[["Low"]],
+           ", OPV=", model_config$scoring$segment_points[["OPV"]],
+           ", Mid=", model_config$scoring$segment_points[["Mid"]],
+           ", High=", model_config$scoring$segment_points[["High"]]),
+    model_config$scoring$heuristic_economic$label,
+    model_config$scoring$heuristic_improvement$label,
+    model_config$scoring$heuristic_scale$label,
+    model_config$scoring$heuristic_age$label
+  )
+)
+
+tbl_b1_components |>
+  gt() |>
+  tab_header(
+    title    = "Score components and calibrated parameters",
+    subtitle = paste0("Parameters loaded from model_config (calibrated on ",
+                      model_config$metadata$seed_suffix, " + ",
+                      model_config$metadata$subsidy_suffix, ")")
+  ) |>
+  cols_label(
+    component     = "Component",
+    variable      = "Source Variable",
+    weight        = "Weight",
+    specification = "Specification"
+  ) |>
+  fmt_number(columns = weight, decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_b1_components)
+```
+
+## B2. Construct Score Functions from Configuration
+
+The five score functions are built from the parameters in `model_config$scoring`. The percentile-based functions evaluate breakpoints on the corresponding continuous variable at execution time; the age function is built through `make_score_age()` with the three-axis parameters held in the model configuration.
+
+```{r}
+#| label: b2-build-score-functions
+
+# =============================================================================
+# B2. Construct Score Functions from model_config
+# =============================================================================
+
+# --- Segment Priority Score ------------------------------------------------
+seg_points <- model_config$scoring$segment_points
+
+score_segment_fn <- function(segment) {
+  case_when(
+    segment == "Low"         ~ as.integer(seg_points[["Low"]]),
+    segment == "OPV/Criollo" ~ as.integer(seg_points[["OPV"]]),
+    segment == "Mid"         ~ as.integer(seg_points[["Mid"]]),
+    segment == "High"        ~ as.integer(seg_points[["High"]]),
+    TRUE                     ~ 0L
+  )
+}
+
+# --- Economic Benefit Score ------------------------------------------------
+econ_bp <- model_config$scoring$heuristic_economic$breakpoints
+
+score_economic_fn <- function(x) {
+  q <- quantile(x, probs = econ_bp, na.rm = TRUE)
+  case_when(
+    x >= q[[3]] ~ 100L,
+    x >= q[[2]] ~  75L,
+    x >= q[[1]] ~  50L,
+    x >= 0      ~  25L,
+    TRUE        ~   0L
+  )
+}
+
+# --- Improvement Potential Score (inverse direction) ----------------------
+impr_bp <- model_config$scoring$heuristic_improvement$breakpoints
+
+score_improvement_fn <- function(x) {
+  q <- quantile(x, probs = impr_bp, na.rm = TRUE)
+  case_when(
+    x <= q[[1]] ~ 100L,
+    x <= q[[2]] ~  75L,
+    x <= q[[3]] ~  50L,
+    x <= q[[4]] ~  25L,
+    TRUE        ~   0L
+  )
+}
+
+# --- Scale Potential Score -------------------------------------------------
+scale_bp <- model_config$scoring$heuristic_scale$breakpoints
+
+score_scale_fn <- function(x) {
+  q <- quantile(x, probs = scale_bp, na.rm = TRUE)
+  case_when(
+    x >= q[[3]] ~ 100L,
+    x >= q[[2]] ~  75L,
+    x >= q[[1]] ~  50L,
+    TRUE        ~  25L
+  )
+}
+
+# --- Farmer Age Score (three-axis parameterisation) -----------------------
+score_age_fn <- make_score_age(
+  peak_center = model_config$scoring$heuristic_age$peak_center,
+  peak_width  = model_config$scoring$heuristic_age$peak_width,
+  profile     = model_config$scoring$heuristic_age$profile
+)
+```
+
+## B3. Apply Scoring and Compute Composite
+
+Apply the five score functions to the farmer dataset, then compute the base composite score as the weighted linear combination of the component scores.
+
+```{r}
+#| label: b3-apply-scoring
+
+# =============================================================================
+# B3. Apply Scoring and Compute Base Composite Score
+# =============================================================================
+
+weights <- model_config$scoring$component_weights
+
+df_farmers_scored <- df_farmers_entry |>
+  mutate(
+    s_seg = score_segment_fn(segment_final),
+    s_eco = score_economic_fn(income_increment),
+    s_imp = score_improvement_fn(exp_total_per_mz_annual),
+    s_sca = score_scale_fn(land_entry_size),
+    s_age = score_age_fn(farmer_age),
+    score_base =
+      s_seg * weights[["segment"]]     +
+      s_eco * weights[["economic"]]    +
+      s_imp * weights[["improvement"]] +
+      s_sca * weights[["scale"]]       +
+      s_age * weights[["age"]]
+  )
+
+rm(df_farmers_entry)
+```
+
+## B4. Base Score Distribution by Segment
+
+Validate the base composite score by examining its distribution across the four segments. The expected ordering Low > OPV/Criollo > Mid > High reflects the calibrated segment-priority scheme.
+
+```{r}
+#| label: tbl-b4-base-score-by-segment
+#| tbl-cap: "Base Composite Score Summary by Segment"
+
+tbl_b4 <- df_farmers_scored |>
+  summarise(
+    n_farmers    = n(),
+    score_mean   = mean(score_base,   na.rm = TRUE),
+    score_sd     = sd(score_base,     na.rm = TRUE),
+    score_p25    = quantile(score_base, 0.25, na.rm = TRUE),
+    score_median = median(score_base, na.rm = TRUE),
+    score_p75    = quantile(score_base, 0.75, na.rm = TRUE),
+    .by = segment_final
+  ) |>
+  arrange(desc(score_median))
+
+export(
+  tbl_b4,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_b4_base_score_by_segment.rds"))
+)
+
+tbl_b4 |>
+  gt() |>
+  tab_header(
+    title    = paste0("Base composite score distribution by segment (",
+                      seed_code, ")"),
+    subtitle = "Pre-risk score. Expected ordering: Low > OPV/Criollo > Mid > High"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers     = "N",
+    score_mean    = "Mean",
+    score_sd      = "SD",
+    score_p25     = "P25",
+    score_median  = "Median",
+    score_p75     = "P75"
+  ) |>
+  fmt_number(
+    columns  = c(score_mean, score_sd, score_p25, score_median, score_p75),
+    decimals = 1
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#C8E6C9"),
+    locations = cells_body(rows = segment_final == "Low")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#DCEDC8"),
+    locations = cells_body(rows = segment_final == "OPV/Criollo")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFF9C4"),
+    locations = cells_body(rows = segment_final == "Mid")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = segment_final == "High")
+  ) |>
+  tab_options(
+    table.font.size          = px(12),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_b4)
+```
+
+---
+
+# Phase C: Risk-Aversion Penalty
+
+This phase computes the risk-aversion penalty as an additive correction to the base composite score. The penalty depends on four drivers (baseline yield, income-increment ratio, land entry size, and projected income loss) combined through a logistic transformation bounded in `[0, 100]`. The first three drivers share a unit weight budget governed by the calibrated coefficients `alpha_yield`, `alpha_ratio`, `alpha_land`; the projected-loss driver is added with the structural coefficient `alpha_loss = 1.0`. The driver representation is selected from the calibrated variant: either departmental z-scores (`variant = "z"`) or absolute values normalised via P1-P99 (`variant = "a"`).
+
+The final adoption score subtracts the weighted penalty from the base score:
+
+$$
+\text{adoption\_score}(i) = \text{score}_{\text{base}}(i) - w_R \cdot \text{penalty}_R(i)
+$$
+
+## C1. Compute Risk Drivers (Calibrated Variant Only)
+
+The four drivers are computed for the variant indicated in `model_config$risk$variant`. Computing only the calibrated variant avoids unused columns in the per-farmer dataset and reduces the computational footprint of the script.
+
+```{r}
+#| label: c1-risk-drivers
+
+# =============================================================================
+# C1. Compute Risk Drivers for the Calibrated Variant
+# =============================================================================
+
+risk_variant <- model_config$risk$variant
+
+# --- Common derived variables ---------------------------------------------
+df_farmers_common <- df_farmers_scored |>
+  mutate(
+    income_baseline_proxy  = pmax(value_total_economic, 1e-3),
+    income_increment_ratio = income_increment / income_baseline_proxy,
+    land_entry_log         = log1p(land_entry_size),
+    loss_score             = case_when(
+      income_increment <  -500 ~ 100L,
+      income_increment <  -200 ~  75L,
+      income_increment <     0 ~  50L,
+      TRUE                     ~   0L
+    )
+  )
+
+if (risk_variant == "z") {
+
+  # --- Variant Z: departmental z-scores ----------------------------------
+  df_farmers_drivers <- df_farmers_common |>
+    add_dept_zscore("yield_wtcorn_qq",        "driver_yield") |>
+    add_dept_zscore("income_increment_ratio", "driver_ratio") |>
+    add_dept_zscore("land_entry_log",         "driver_land")  |>
+    add_dept_zscore("loss_score",             "driver_loss")
+
+} else {
+
+  # --- Variant A: absolute values normalised via P1-P99 ------------------
+  weighted_quantiles <- function(x, w, probs) {
+    o   <- order(x)
+    xs  <- x[o]
+    ws  <- w[o]
+    cw  <- cumsum(ws) / sum(ws)
+    map_dbl(probs, ~ xs[which.min(abs(cw - .x))])
+  }
+
+  scale_p1_p99 <- function(x, w) {
+    qs <- weighted_quantiles(x, w, c(0.01, 0.50, 0.99))
+    half_range <- (qs[3] - qs[1]) / 2
+    if (half_range <= 0) return(rep(0, length(x)))
+    (x - qs[2]) / half_range
+  }
+
+  df_farmers_drivers <- df_farmers_common |>
+    mutate(
+      driver_yield = scale_p1_p99(yield_wtcorn_qq,        weight_calibrated),
+      driver_ratio = scale_p1_p99(income_increment_ratio, weight_calibrated),
+      driver_land  = scale_p1_p99(land_entry_log,         weight_calibrated),
+      driver_loss  = scale_p1_p99(loss_score,             weight_calibrated)
+    )
+}
+
+rm(df_farmers_scored, df_farmers_common)
+```
+
+## C2. Compute Penalty and Final Score
+
+Apply the logistic penalty using the calibrated coefficients, then subtract the weighted penalty from the base composite score to produce the final adoption score.
+
+```{r}
+#| label: c2-penalty-and-final-score
+
+# =============================================================================
+# C2. Logistic Penalty and Final Adoption Score
+# =============================================================================
+
+alpha_y    <- model_config$risk$alpha_yield
+alpha_r    <- model_config$risk$alpha_ratio
+alpha_L    <- model_config$risk$alpha_land
+alpha_loss <- model_config$risk$alpha_loss
+beta       <- model_config$risk$beta
+w_R        <- model_config$risk$w_R
+
+df_farmers_full <- df_farmers_drivers |>
+  mutate(
+    z_combo = alpha_y    * driver_yield +
+              alpha_r    * driver_ratio +
+              alpha_L    * driver_land  +
+              alpha_loss * driver_loss,
+    risk_penalty   = 100 / (1 + exp(-beta * z_combo)),
+    adoption_score = score_base - w_R * risk_penalty
+  ) |>
+  select(-z_combo)
+
+rm(df_farmers_drivers)
+```
+
+## C3. Risk Penalty Distribution by Segment
+
+Validate the risk penalty by examining its distribution across segments. The penalty captures the structural reluctance to convert and is expected to be higher among High-segment farmers (large land commitment, occasional negative income increment) than among Low-segment farmers.
+
+```{r}
+#| label: tbl-c3-risk-by-segment
+#| tbl-cap: "Risk Penalty Distribution by Segment"
+
+tbl_c3 <- df_farmers_full |>
+  summarise(
+    n_farmers    = n(),
+    pen_mean     = mean(risk_penalty,   na.rm = TRUE),
+    pen_sd       = sd(risk_penalty,     na.rm = TRUE),
+    pen_p25      = quantile(risk_penalty, 0.25, na.rm = TRUE),
+    pen_median   = median(risk_penalty, na.rm = TRUE),
+    pen_p75      = quantile(risk_penalty, 0.75, na.rm = TRUE),
+    .by = segment_final
+  ) |>
+  arrange(desc(pen_median))
+
+export(
+  tbl_c3,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_c3_risk_by_segment.rds"))
+)
+
+tbl_c3 |>
+  gt() |>
+  tab_header(
+    title    = paste0("Risk penalty distribution by segment (", seed_code, ")"),
+    subtitle = paste0("Variant: ", risk_variant,
+                      "; logistic slope \u03b2 = ", beta,
+                      "; risk weight w_R = ", w_R)
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers     = "N",
+    pen_mean      = "Mean",
+    pen_sd        = "SD",
+    pen_p25       = "P25",
+    pen_median    = "Median",
+    pen_p75       = "P75"
+  ) |>
+  fmt_number(
+    columns  = c(pen_mean, pen_sd, pen_p25, pen_median, pen_p75),
+    decimals = 1
+  ) |>
+  tab_options(
+    table.font.size          = px(12),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_c3)
+```
+
+---
+
+# Phase D: Ranking and Continuous Adoption Setup
+
+This phase ranks farmers by the final adoption score, derives each farmer's entry point into the ranking, and prepares the per-farmer variables consumed by the M06 scenario engine to evaluate the cohort at any chosen national production coverage level. The per-farmer conversion ratio at coverage `p` is computed downstream as `r_i(p) = sigmoid_curve(p, p_entry, floor_profile, k_profile)`, with the profile-specific floor and steepness coefficients held in the model configuration.
+
+## D1. Compute Basal Production and Entry Point
+
+The basal weight of farmer `i` is the product of total production and survey-calibrated weight. The cumulative basal weight divided by the universe total defines the entry point of each farmer, interpreted as the national production coverage level at which the farmer joins the ranking.
+
+```{r}
+#| label: d1-basal-and-entry
+
+# =============================================================================
+# D1. Rank by Final Score, Compute basal_weighted and p_entry
+# =============================================================================
+
+df_farmers_basal <- df_farmers_full |>
+  arrange(desc(adoption_score)) |>
+  mutate(
+    basal_weighted = total_production * weight_calibrated,
+    cum_basal      = cumsum(basal_weighted)
+  )
+
+total_basal <- sum(df_farmers_basal$basal_weighted, na.rm = TRUE)
+
+df_farmers_ranked <- df_farmers_basal |>
+  mutate(
+    p_entry = pmax(0, (cum_basal - basal_weighted) / total_basal)
+  )
+
+rm(df_farmers_full, df_farmers_basal, total_basal)
+```
+
+## D2. Adoption Rank and Adoption Category
+
+Compute the adoption rank (1 = top adopter) and assign each farmer to a presentation category A through E based on the final adoption score. The category is a display label for dashboards and reports; downstream economic computations operate on the continuous score, not on the category.
+
+```{r}
+#| label: d2-rank-category
+
+# =============================================================================
+# D2. Adoption Rank and Adoption Category
+# =============================================================================
+
+df_farmers_final <- df_farmers_ranked |>
+  mutate(
+    adoption_rank = rank(-adoption_score, ties.method = "min"),
+    adoption_category = case_when(
+      adoption_score >= 80 ~ "A: Priority",
+      adoption_score >= 60 ~ "B: High Potential",
+      adoption_score >= 40 ~ "C: Moderate",
+      adoption_score >= 20 ~ "D: Low",
+      TRUE                 ~ "E: Not Recommended"
+    ),
+    adoption_category = factor(
+      adoption_category,
+      levels = c("A: Priority", "B: High Potential", "C: Moderate",
+                 "D: Low", "E: Not Recommended")
+    )
+  )
+
+rm(df_farmers_ranked)
+```
+
+## D3. Continuous Adoption Curves per Profile
+
+The per-farmer conversion ratio at national production coverage `p` follows a profile-specific sigmoid curve anchored at the farmer's entry point. The figure below displays the curve shape for each profile (small, medium, large) under the calibrated parameters, evaluated for a representative entry point at `p_entry = 0`. Profile-specific curves reflect the calibrated floor (conversion ratio at the moment of entry) and steepness (rate at which the ratio approaches 1 as `p` advances).
+
+```{r}
+#| label: fig-d3-continuous-curves
+#| fig-cap: "Calibrated continuous-adoption curves by profile"
+#| fig-width: 9
+#| fig-height: 5
+
+floor_S <- model_config$continuous$floor_S
+floor_M <- model_config$continuous$floor_M
+floor_L <- model_config$continuous$floor_L
+k_S     <- model_config$continuous$k_S
+k_M     <- model_config$continuous$k_M
+k_L     <- model_config$continuous$k_L
+
+p_seq <- seq(0, 1, by = 0.01)
+
+curve_df <- bind_rows(
+  tibble(profile = "S", p = p_seq,
+         r = sigmoid_curve(p_seq, p_entry = 0,
+                           floor_val = floor_S, k = k_S)),
+  tibble(profile = "M", p = p_seq,
+         r = sigmoid_curve(p_seq, p_entry = 0,
+                           floor_val = floor_M, k = k_M)),
+  tibble(profile = "L", p = p_seq,
+         r = sigmoid_curve(p_seq, p_entry = 0,
+                           floor_val = floor_L, k = k_L))
+) |>
+  mutate(profile = factor(profile, levels = c("S", "M", "L")))
+
+export(
+  curve_df,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_fig_d3_continuous_curves.rds"))
+)
+
+ggplot(curve_df, aes(x = p * 100, y = r, color = profile)) +
+  geom_line(linewidth = 1.1) +
+  scale_color_manual(values = PROFILE_COLORS) +
+  labs(
+    title    = paste0("Calibrated continuous-adoption curves by profile (",
+                      seed_code, ")"),
+    subtitle = paste0("floor_S=", floor_S, ", floor_M=", floor_M,
+                      ", floor_L=", floor_L,
+                      " | k_S=", k_S, ", k_M=", k_M, ", k_L=", k_L,
+                      " | reference entry point p_entry = 0"),
+    x        = "National penetration (%)",
+    y        = "Conversion ratio r_i(p)",
+    color    = "Profile"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10, color = ADI_ACCENT),
+    legend.position = "bottom"
+  )
+
+rm(curve_df, p_seq)
+```
+
+---
+
+# Phase E: Cohort and Validation Diagnostics
+
+This phase reports the most informative downstream-facing diagnostics. The first table profiles the adopting cohort at five representative national production coverage points (10%, 25%, 50%, 75%, 100%) under the integrated continuous-adoption model, disaggregated by segment with an overall row. Subsequent diagnostics validate component independence and the calibrated specification, and report the geographic and per-department distribution of priority adopters.
+
+## E1. Cohort Profile at Five Coverage Points
+
+For each national production coverage level, the cohort is defined as the set of farmers whose entry point is at or below `p`. Each cohort member contributes a per-farmer conversion ratio `r_i(p)` evaluated through the calibrated continuous-adoption curve; biofortified land and biofortified production are scaled by `r_i(p)`. Income variables (current, projected, and increment) are reported as survey-weighted medians with interquartile range across the cohort, weighted by `weight_calibrated * r_i(p)`. All monetary values are in Guatemalan Quetzales (Q).
+
+```{r}
+#| label: e1-cohort-helpers
+
+# =============================================================================
+# E1. Cohort Profile - Helper Functions
+# =============================================================================
+
+# Survey-weighted median with IQR helper (display string + median value)
+weighted_median_iqr <- function(values, weights, decimals = 1) {
+  ok <- !is.na(values) & !is.na(weights) & weights > 0
+  if (sum(ok) < 2) {
+    return(tibble(median_val = NA_real_, display = "\u2014"))
+  }
+  v <- values[ok]
+  w <- weights[ok]
+  q <- Hmisc::wtd.quantile(v, weights = w, probs = c(0.25, 0.50, 0.75))
+  fmt <- paste0("%.", decimals, "f")
+  tibble(
+    median_val = q[[2]],
+    display    = paste0(sprintf(fmt, q[[2]]),
+                        " [", sprintf(fmt, q[[1]]),
+                        ", ", sprintf(fmt, q[[3]]), "]")
+  )
+}
+
+# Total weighted land of the universe (denominator for % Land)
+total_land_population <- sum(df_farmers_final$land_wtcorn *
+                             df_farmers_final$weight_calibrated,
+                             na.rm = TRUE)
+
+# Build cohort at coverage p: farmers with p_entry <= p, with conversion
+# ratio r_i(p) and cohort weight (weight_calibrated * r_i)
+cohort_at_p <- function(df, p_target) {
+  admitted_idx <- which(df$p_entry <= p_target)
+  if (length(admitted_idx) == 0) return(NULL)
+
+  df_adm <- df[admitted_idx, , drop = FALSE]
+  r_i <- apply_adoption_curve(
+    p_target, df_adm$p_entry, df_adm$profile,
+    floor_S = floor_S, floor_M = floor_M, floor_L = floor_L,
+    k_S = k_S, k_M = k_M, k_L = k_L
+  )
+  keep <- r_i > 0
+  if (!any(keep)) return(NULL)
+
+  df_adm <- df_adm[keep, , drop = FALSE]
+  r_i    <- r_i[keep]
+
+  df_adm |>
+    mutate(
+      r_i                 = r_i,
+      weight_cohort       = weight_calibrated * r_i,
+      land_biofortified   = land_wtcorn          * r_i,
+      production_biofort  = production_biofortified * r_i,
+      income_biofort      = income_increment     * r_i,
+      income_net_current  = income_net_current,
+      income_net_projected = income_net_current + income_biofort
+    )
+}
+```
+
+```{r}
+#| label: e1-cohort-build
+
+# =============================================================================
+# E1. Cohort Profile - Build Five-Coverage Table
+# =============================================================================
+
+p_profile_points <- c(0.10, 0.25, 0.50, 0.75, 1.00)
+
+build_segment_row <- function(coh, seg, p_target) {
+  coh_seg <- coh |> filter(segment_final == seg)
+  if (nrow(coh_seg) == 0) {
+    return(tibble(
+      p_point = p_target, segment = seg,
+      n_farmers = 0, pct_land = 0,
+      land_display = "\u2014", production_display = "\u2014",
+      income_increment_display = "\u2014",
+      income_net_current_display = "\u2014",
+      income_net_projected_display = "\u2014"
+    ))
+  }
+  n_far <- sum(coh_seg$weight_cohort)
+  pct_l <- sum(coh_seg$land_biofortified * coh_seg$weight_calibrated) /
+           total_land_population * 100
+  l_md  <- weighted_median_iqr(coh_seg$land_biofortified,
+                               coh_seg$weight_calibrated, decimals = 2)
+  p_md  <- weighted_median_iqr(coh_seg$production_biofort,
+                               coh_seg$weight_calibrated, decimals = 1)
+  i_inc <- weighted_median_iqr(coh_seg$income_biofort,
+                               coh_seg$weight_calibrated, decimals = 1)
+  i_cur <- weighted_median_iqr(coh_seg$income_net_current,
+                               coh_seg$weight_calibrated, decimals = 1)
+  i_prj <- weighted_median_iqr(coh_seg$income_net_projected,
+                               coh_seg$weight_calibrated, decimals = 1)
+  tibble(
+    p_point                      = p_target,
+    segment                      = seg,
+    n_farmers                    = round(n_far),
+    pct_land                     = pct_l,
+    land_display                 = l_md$display,
+    production_display           = p_md$display,
+    income_increment_display     = i_inc$display,
+    income_net_current_display   = i_cur$display,
+    income_net_projected_display = i_prj$display
+  )
+}
+
+cohort_profile_median <- map_dfr(p_profile_points, function(p_target) {
+  coh <- cohort_at_p(df_farmers_final, p_target)
+  if (is.null(coh)) {
+    return(tibble(
+      p_point = p_target,
+      segment = c("OPV/Criollo", "Low", "Mid", "High", "Overall"),
+      n_farmers = 0, pct_land = 0,
+      land_display = "\u2014", production_display = "\u2014",
+      income_increment_display = "\u2014",
+      income_net_current_display = "\u2014",
+      income_net_projected_display = "\u2014"
+    ))
+  }
+  seg_rows <- map_dfr(c("OPV/Criollo", "Low", "Mid", "High"),
+                      ~ build_segment_row(coh, .x, p_target))
+
+  # Overall row (all segments combined)
+  n_far_all <- sum(coh$weight_cohort)
+  pct_l_all <- sum(coh$land_biofortified * coh$weight_calibrated) /
+               total_land_population * 100
+  l_all  <- weighted_median_iqr(coh$land_biofortified,
+                                coh$weight_calibrated, decimals = 2)
+  p_all  <- weighted_median_iqr(coh$production_biofort,
+                                coh$weight_calibrated, decimals = 1)
+  i_inc_all <- weighted_median_iqr(coh$income_biofort,
+                                   coh$weight_calibrated, decimals = 1)
+  i_cur_all <- weighted_median_iqr(coh$income_net_current,
+                                   coh$weight_calibrated, decimals = 1)
+  i_prj_all <- weighted_median_iqr(coh$income_net_projected,
+                                   coh$weight_calibrated, decimals = 1)
+  overall_row <- tibble(
+    p_point                      = p_target,
+    segment                      = "Overall",
+    n_farmers                    = round(n_far_all),
+    pct_land                     = pct_l_all,
+    land_display                 = l_all$display,
+    production_display           = p_all$display,
+    income_increment_display     = i_inc_all$display,
+    income_net_current_display   = i_cur_all$display,
+    income_net_projected_display = i_prj_all$display
+  )
+  bind_rows(seg_rows, overall_row)
+})
+
+export(
+  cohort_profile_median,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e1_cohort_medians.rds"))
+)
+```
+
+```{r}
+#| label: tbl-e1-cohort-medians
+#| tbl-cap: "Cohort Characteristics at Five Penetration Points (Medians)"
+
+cohort_profile_median |>
+  mutate(
+    segment_label        = factor(segment,
+                                  levels = c("OPV/Criollo", "Low", "Mid", "High",
+                                             "Overall")),
+    metric_total         = formatC(n_farmers, big.mark = ",", format = "d"),
+    metric_pct_land      = sprintf("%.2f%%", pct_land),
+    metric_land          = land_display,
+    metric_production    = production_display,
+    metric_inc           = income_increment_display,
+    metric_net_current   = income_net_current_display,
+    metric_net_projected = income_net_projected_display,
+    p_label              = paste0(formatC(p_point * 100, format = "d"), "%")
+  ) |>
+  select(p_point, p_label, segment_label,
+         metric_total, metric_pct_land,
+         metric_land, metric_production,
+         metric_inc, metric_net_current, metric_net_projected) |>
+  pivot_longer(
+    cols      = starts_with("metric_"),
+    names_to  = "metric_key",
+    values_to = "metric_value"
+  ) |>
+  mutate(
+    metric_label = recode(metric_key,
+      metric_total         = "Total Farmers",
+      metric_pct_land      = "% Land",
+      metric_land          = "Land (mz) [Median, IQR]",
+      metric_production    = "Production (qq) [Median, IQR]",
+      metric_inc           = "Net income increment (Q) [Median, IQR]",
+      metric_net_current   = "Net income \u2014 current (Q) [Median, IQR]",
+      metric_net_projected = "Net income \u2014 projected (Q) [Median, IQR]"
+    ),
+    metric_label = factor(metric_label, levels = c(
+      "Total Farmers",
+      "% Land",
+      "Land (mz) [Median, IQR]",
+      "Production (qq) [Median, IQR]",
+      "Net income \u2014 current (Q) [Median, IQR]",
+      "Net income \u2014 projected (Q) [Median, IQR]",
+      "Net income increment (Q) [Median, IQR]"
+    ))
+  ) |>
+  select(p_point, p_label, segment_label, metric_label, metric_value) |>
+  pivot_wider(
+    names_from  = segment_label,
+    values_from = metric_value
+  ) |>
+  arrange(p_point, metric_label) |>
+  select(p_label, metric_label, `OPV/Criollo`, Low, Mid, High, Overall) |>
+  gt(groupname_col = "p_label") |>
+  tab_header(
+    title    = paste0("Cohort characteristics at five penetration points (",
+                      seed_code, ")"),
+    subtitle = "Survey-weighted medians [P25, P75] of the adopter cohort, disaggregated by segment. All monetary values in Quetzales (Q)."
+  ) |>
+  cols_label(
+    metric_label  = "",
+    `OPV/Criollo` = "OPV/Criollo",
+    Low           = "Low",
+    Mid           = "Mid",
+    High          = "High",
+    Overall       = "Overall"
+  ) |>
+  tab_style(
+    style    = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style    = cell_text(weight = "bold", style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_style(
+    style    = list(cell_text(weight = "bold"),
+                    cell_fill(color = "#F5F5F5")),
+    locations = cells_body(columns = Overall)
+  ) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size  = px(11)
+  )
+
+rm(cohort_profile_median, total_land_population)
+```
+
+## E2. Component Score Correlation Matrix
+
+The five component scores should capture distinct dimensions of farmer characteristics. The correlation matrix verifies component independence: low pairwise correlations indicate non-redundant signals; high correlations would suggest that two components carry overlapping information and the composite weighting is double-counting.
+
+```{r}
+#| label: fig-e2-correlation-matrix
+#| fig-cap: "Correlation Matrix of Component Scores"
+#| fig-width: 6
+#| fig-height: 5
+
+cor_matrix <- df_farmers_final |>
+  select(s_seg, s_eco, s_imp, s_sca, s_age) |>
+  rename(
+    Segment     = s_seg,
+    Economic    = s_eco,
+    Improvement = s_imp,
+    Scale       = s_sca,
+    Age         = s_age
+  ) |>
+  cor(use = "complete.obs")
+
+cor_long <- as.data.frame(cor_matrix) |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "cor")
+
+export(
+  cor_long,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_fig_e2_correlation_matrix.rds"))
+)
+
+ggplot(cor_long, aes(x = var1, y = var2, fill = cor)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", cor)), color = "black", size = 4) +
+  scale_fill_gradient2(
+    low      = "#C62828",
+    mid      = "white",
+    high     = "#2E7D32",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Correlation"
+  ) +
+  labs(
+    title    = paste0("Component score correlation matrix (", seed_code, ")"),
+    subtitle = "Pearson correlation across the five scoring components",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    panel.grid         = element_blank()
+  )
+
+rm(cor_matrix, cor_long)
+```
+
+## E3. Calibrated Model Specification
+
+The applied model specification is summarised below, reading directly from the `model_config` artefact. This table is the auditable counterpart of the determination summary produced by script 02_05.
+
+```{r}
+#| label: tbl-e3-specification
+#| tbl-cap: "Applied Likely Adopters Model Specification"
+
+tbl_e3 <- tibble(
+  block = c(
+    "Metadata", "Metadata",
+    "Scoring", "Scoring", "Scoring", "Scoring", "Scoring", "Scoring",
+    "Risk", "Risk", "Risk", "Risk",
+    "Continuous", "Continuous", "Continuous",
+    "Entry size", "Entry size"
+  ),
+  parameter = c(
+    "Calibration seed/subsidy",
+    "Calibration date",
+    "Segment scheme",
+    "Component weights",
+    "Economic breakpoints",
+    "Improvement breakpoints",
+    "Scale breakpoints",
+    "Age parameters",
+    "Driver variant",
+    "Driver coefficients (yield, ratio, land)",
+    "Logistic slope \u03b2",
+    "Risk weight w_R",
+    "Profile cutoffs (S/M, M/L) (mz)",
+    "Profile floors (S, M, L)",
+    "Profile steepness (k_S, k_M, k_L)",
+    "Entry cutoffs (S/M, M/L) (mz)",
+    "Entry coefficients (S, M, L)"
+  ),
+  value = c(
+    paste0(model_config$metadata$seed_suffix, " + ",
+           model_config$metadata$subsidy_suffix),
+    as.character(model_config$metadata$calibration_date),
+    paste0(model_config$scoring$segment_scheme, " (Low=",
+           model_config$scoring$segment_points[["Low"]],
+           ", OPV=", model_config$scoring$segment_points[["OPV"]],
+           ", Mid=", model_config$scoring$segment_points[["Mid"]],
+           ", High=", model_config$scoring$segment_points[["High"]], ")"),
+    paste0("seg=",
+           round(model_config$scoring$component_weights[["segment"]], 3),
+           ", econ=",
+           round(model_config$scoring$component_weights[["economic"]], 3),
+           ", impr=",
+           round(model_config$scoring$component_weights[["improvement"]], 3),
+           ", scale=",
+           round(model_config$scoring$component_weights[["scale"]], 3),
+           ", age=",
+           round(model_config$scoring$component_weights[["age"]], 3)),
+    paste0("(",
+           paste(model_config$scoring$heuristic_economic$breakpoints,
+                 collapse = ", "), ")"),
+    paste0("(",
+           paste(model_config$scoring$heuristic_improvement$breakpoints,
+                 collapse = ", "), ")"),
+    paste0("(",
+           paste(model_config$scoring$heuristic_scale$breakpoints,
+                 collapse = ", "), ")"),
+    paste0("peak_center=",
+           model_config$scoring$heuristic_age$peak_center,
+           ", peak_width=",
+           model_config$scoring$heuristic_age$peak_width,
+           ", profile=",
+           model_config$scoring$heuristic_age$profile),
+    model_config$risk$variant,
+    paste0("(", model_config$risk$alpha_yield, ", ",
+           model_config$risk$alpha_ratio, ", ",
+           model_config$risk$alpha_land, ")"),
+    sprintf("%.2f", model_config$risk$beta),
+    sprintf("%.2f", model_config$risk$w_R),
+    paste0("(", model_config$continuous$cut_S_M, ", ",
+           model_config$continuous$cut_M_L, ")"),
+    paste0("(", model_config$continuous$floor_S, ", ",
+           model_config$continuous$floor_M, ", ",
+           model_config$continuous$floor_L, ")"),
+    paste0("(", model_config$continuous$k_S, ", ",
+           model_config$continuous$k_M, ", ",
+           model_config$continuous$k_L, ")"),
+    paste0("(", model_config$entry_size$cut_S_M, ", ",
+           model_config$entry_size$cut_M_L, ")"),
+    paste0("(", model_config$entry_size$coef_S, ", ",
+           model_config$entry_size$coef_M, ", ",
+           model_config$entry_size$coef_L, ")")
+  )
+)
+
+export(
+  tbl_e3,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e3_specification.rds"))
+)
+
+tbl_e3 |>
+  gt(groupname_col = "block") |>
+  tab_header(
+    title    = paste0("Applied Likely Adopters model specification (",
+                      seed_code, ")"),
+    subtitle = "Parameters read from 02_05_likely_adopters_model_config.rds"
+  ) |>
+  cols_label(
+    parameter = "Parameter",
+    value     = "Value"
+  ) |>
+  tab_style(
+    style    = cell_text(weight = "bold", style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_e3)
+```
+
+## E4. Geographic Distribution of Priority Adopters
+
+The geographic distribution reports the share of priority adopters (categories A and B) by department, weighted by `weight_calibrated`. The expanded farmer counts use survey weights to represent the national population.
+
+```{r}
+#| label: tbl-e4-geographic
+#| tbl-cap: "Geographic Distribution of Priority Adopters (Categories A and B)"
+
+tbl_e4 <- df_farmers_final |>
+  mutate(is_priority = adoption_category %in%
+                       c("A: Priority", "B: High Potential")) |>
+  summarise(
+    n_total    = sum(weight_calibrated, na.rm = TRUE),
+    n_priority = sum(weight_calibrated * is_priority, na.rm = TRUE),
+    .by = departamento
+  ) |>
+  mutate(
+    pct_priority = if_else(n_total > 0, n_priority / n_total * 100, 0),
+    pct_national = n_priority / sum(n_priority) * 100
+  ) |>
+  arrange(desc(n_priority))
+
+export(
+  tbl_e4,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e4_geographic.rds"))
+)
+
+tbl_e4 |>
+  gt() |>
+  tab_header(
+    title    = paste0("Geographic distribution of priority adopters (",
+                      seed_code, ")"),
+    subtitle = "Survey-weighted counts of farmers in categories A and B"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_total      = "Total farmers (weighted)",
+    n_priority   = "Priority farmers (weighted)",
+    pct_priority = "% Priority within dept.",
+    pct_national = "% Share of national priority"
+  ) |>
+  fmt_number(columns = c(n_total, n_priority),
+             decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = c(pct_priority, pct_national), decimals = 2) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_e4)
+```
+
+## E5. Score Distribution by Department
+
+The departmental score distribution reports the survey-weighted distribution of the final adoption score across departments. The percentile summary surfaces geographic heterogeneity in adoption potential.
+
+```{r}
+#| label: tbl-e5-score-by-dept
+#| tbl-cap: "Final Adoption Score Distribution by Department"
+
+tbl_e5 <- df_farmers_final |>
+  summarise(
+    n_farmers    = sum(weight_calibrated, na.rm = TRUE),
+    score_mean   = weighted.mean(adoption_score, weight_calibrated,
+                                 na.rm = TRUE),
+    score_p25    = as.numeric(Hmisc::wtd.quantile(adoption_score,
+                                                  weights = weight_calibrated,
+                                                  probs = 0.25)),
+    score_median = as.numeric(Hmisc::wtd.quantile(adoption_score,
+                                                  weights = weight_calibrated,
+                                                  probs = 0.50)),
+    score_p75    = as.numeric(Hmisc::wtd.quantile(adoption_score,
+                                                  weights = weight_calibrated,
+                                                  probs = 0.75)),
+    .by = departamento
+  ) |>
+  arrange(desc(score_median))
+
+export(
+  tbl_e5,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e5_score_by_dept.rds"))
+)
+
+tbl_e5 |>
+  gt() |>
+  tab_header(
+    title    = paste0("Final adoption score distribution by department (",
+                      seed_code, ")"),
+    subtitle = "Survey-weighted distribution of the final adoption score"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers    = "Farmers (weighted)",
+    score_mean   = "Mean",
+    score_p25    = "P25",
+    score_median = "Median",
+    score_p75    = "P75"
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = c(score_mean, score_p25, score_median, score_p75),
+             decimals = 1) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(tbl_e5)
+```
+
+---
+
+# Phase F: Export Per-Farmer Dataset
+
+Export the enriched per-farmer dataset consumed by the M06 scenario engine. The exported parquet retains all variables produced by 02_04 and 02_03 (economic impact, segmentation, sociodemographics, monetary subsidy decomposition) and adds the per-farmer variables produced by the Likely Adopters application: profile assignment, entry coefficient, entry-size land magnitude, the four risk drivers (calibrated variant only), the risk penalty, basal weighted production, entry point, final adoption score, ranking, and presentation category.
+
+The global parameters of the continuous-adoption model (per-profile floors, steepness coefficients, and cutoffs) are not duplicated in the parquet: the canonical source remains `02_05_likely_adopters_model_config.rds`. Downstream modules load both artefacts and reconstruct the per-farmer conversion ratio `r_i(p) = sigmoid_curve(p, p_entry, floor_profile, k_profile)` at any chosen production coverage level.
+
+```{r}
+#| label: f1-export-parquet
+
+# =============================================================================
+# F1. Export Final Per-Farmer Dataset
+# =============================================================================
+
+df_farmers_final |>
+  select(-s_seg, -s_eco, -s_imp, -s_sca, -s_age,
+         -income_baseline_proxy, -income_increment_ratio,
+         -land_entry_log, -loss_score,
+         -score_base, -cum_basal) |>
+  write_parquet(
+    here("01_data", "02_processed", "scenarios",
+         paste0(file_prefix, "_farmers_adoption_scores.parquet"))
+  )
+```
+
+# Notes
+
+## Model Source
+
+The parameters applied in this script are loaded from `01_data/02_processed/models/02_05_likely_adopters_model_config.rds`, the serialised model configuration produced by script 02_05. The configuration is taken as invariant across the nine seed-by-subsidy combinations handled by the framework: the relationships between farmer characteristics and adoption priority are modelled as a function of the joint distribution of farmer attributes. The single calibration produced by 02_05 on the s22 + sub00 baseline configuration is therefore applied identically to all nine combinations.
+
+## Final Score Composition
+
+The final adoption score combines a base composite score from the five-component weighted scoring system (Phase B) and a logistic risk-aversion penalty (Phase C). The base score captures farmer priority across segment, economic benefit, improvement potential, scale, and age. The risk penalty captures the structural reluctance to convert under high baseline yield, marginal income increment, large land commitment, and projected income loss. The penalty is subtracted from the base score with the calibrated weight `w_R`, producing a single per-farmer adoption score that downstream modules consume as the canonical ranking variable.
+
+## Continuous Adoption
+
+The per-farmer entry point `p_entry` encodes the national production coverage level at which the farmer joins the ranking. Combined with the profile assignment (`profile`) and the global continuous-adoption parameters (per-profile floors and steepness coefficients held in the model configuration), `p_entry` permits the reconstruction of the per-farmer conversion ratio `r_i(p)` at any chosen coverage level. M06 modules compute cohort-level outputs (biofortified production, biofortified land, income increment) by aggregating per-farmer quantities weighted by `weight_calibrated * r_i(p)` across the admitted cohort at each coverage level of interest.
+
+## Survey Weighting
+
+All population-level statistics in the diagnostic tables (geographic distribution, departmental scores, cohort medians) use the survey-calibrated weights from `weight_calibrated`, so that estimates represent the national white-maize farmer population.
+
+## Reproducibility
+
+The script performs no stochastic operations: all parameters are loaded from the serialised model configuration and all transformations are deterministic functions of the input data.
+
+## Terminology
+
+The segment label `OPV/Criollo` identifies farmers planting open-pollinated or
+saved seed. Published outputs refer to this group as **non-hybrid**; the
+two terms denote the same segment.

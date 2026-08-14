@@ -1,0 +1,43 @@
+# =============================================================================
+# Pathway Variants Configuration
+# =============================================================================
+#
+# Single source of truth for the nutritional impact pathways used in
+# Module 6 scenario precomputation. A pathway encodes the methodological
+# approach applied to estimate stunting outcomes from biofortified maize
+# consumption.
+#
+# Pathways:
+#   - pco (Covariate):     GAM-based stunting model applied to synthetic
+#                          child population (Script 04_09 output).
+#   - pma (Meta-Analysis): Gunaratna et al. (2010) effect size applied
+#                          to ENCOVI children population (Script 05_06
+#                          output).
+#
+# The orchestrators for 06_02 and 06_03 form the full execution grid as
+# the Cartesian product of seed_variants.yml × pathway_variants.yml,
+# avoiding duplication of either dimension in a combined grid file.
+#
+# The `description` field is for human reference only and is not passed
+# to the parametrized scripts. Scripts receive only `pathway` and
+# `pathway_label` as parameters; the pathway-specific subtitle and other
+# contextual strings are constructed inline within each script from
+# these two fields.
+#
+# =============================================================================
+
+variants:
+
+  - pathway:       "pco"
+    pathway_label: "Covariate"
+    description: >
+      GAM-based stunting model applied to the synthetic child population
+      derived from SIVESNU (Script 04_09). Estimates stunting impact per
+      child via the marginal effect of the nutritional index on ZLEN.
+
+  - pathway:       "pma"
+    pathway_label: "Meta-Analysis"
+    description: >
+      Gunaratna et al. (2010) meta-analysis effect size (9% increase in
+      height growth velocity for QPM consumers) applied to the ENCOVI
+      children population (Script 05_06).

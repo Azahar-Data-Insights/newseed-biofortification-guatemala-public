@@ -1,0 +1,1203 @@
+---
+title: "Continuous Stunting Model"
+subtitle: "Module 4: Covariate Prediction"
+---
+
+## Overview
+
+The continuous Z-score model predicts the **magnitude** of height-for-age
+deviation (HAZ) from the WHO reference. Modeling HAZ directly rather than the
+binary stunting classification (stunted = HAZ < -2) preserves the full
+distributional information about child growth, since the WHO threshold is a
+direct transformation of the same z-score. The continuous outcome serves two
+purposes:
+
+1. **Distributional analysis** — Understand how far children fall below growth
+   standards, not just whether they cross the −2 SD threshold.
+2. **Impact quantification** — Estimate the expected Z-score improvement from
+   biofortification, enabling comparison with other nutritional interventions.
+
+This approach is particularly valuable for biofortification impact assessment
+because improvements in nutrient intake may shift children's Z-scores without
+necessarily crossing the stunting threshold. Capturing these sub-threshold
+improvements provides a more complete picture of intervention effects.
+
+The binary stunting classification is derived afterwards by thresholding both
+the observed and the predicted z-scores at −2, which lets us evaluate the
+continuous model as a binary classifier of stunting status without fitting a
+separate logistic regression.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by
+# framework 04_06).
+
+# --- Phase A: Data preparation ---
+tbl_a3_normalization_params <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_a3_normalization_params.rds"),
+  trust = TRUE
+)
+
+tbl_a5_multicollinearity <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_a5_multicollinearity.rds"),
+  trust = TRUE
+)
+
+# --- Phase B: Model specification ---
+tbl_b2_formula_audit <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_b2_formula_audit.rds"),
+  trust = TRUE
+)
+
+fig_b5_observed_predicted <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_fig_b5_observed_predicted.rds"),
+  trust = TRUE
+)
+
+# --- Phase C: Residual diagnostics ---
+fig_c1_residuals_histogram <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_fig_c1_residuals_histogram.rds"),
+  trust = TRUE
+)
+
+fig_c2_residuals_fitted <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_fig_c2_residuals_fitted.rds"),
+  trust = TRUE
+)
+
+tbl_c3_performance_metrics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_c3_performance_metrics.rds"),
+  trust = TRUE
+)
+
+# --- Phase D: Binary stunting classification (derived) ---
+tbl_d1_prevalence <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_d1_prevalence.rds"),
+  trust = TRUE
+)
+
+tbl_d2_confusion_matrix <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_d2_confusion_matrix.rds"),
+  trust = TRUE
+)
+
+tbl_d3_classification_metrics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_d3_classification_metrics.rds"),
+  trust = TRUE
+)
+
+tbl_d4_auc_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_d4_auc_summary.rds"),
+  trust = TRUE
+)
+
+fig_d4_roc_curve <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_fig_d4_roc_curve_data.rds"),
+  trust = TRUE
+)
+
+# --- Variable importance ---
+fig_d_variable_importance <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_fig_d_variable_importance.rds"),
+  trust = TRUE
+)
+
+# --- Phase E: Performance summary ---
+tbl_e2_performance_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_e2_performance_summary.rds"),
+  trust = TRUE
+)
+
+# --- Phase G: GAM for impact simulation ---
+fig_f3_gam_effect <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_fig_f3_gam_effect.rds"),
+  trust = TRUE
+)
+
+fig_f4_marginal_effect <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_fig_f4_marginal_effect.rds"),
+  trust = TRUE
+)
+
+tbl_f5_gam_verification <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_f5_gam_verification.rds"),
+  trust = TRUE
+)
+
+tbl_f2_gam_fit_coverage <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_06_tbl_f2_gam_fit_coverage.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Performance metrics
+rsq_value <- tbl_c3_performance_metrics |>
+  filter(Metric == "R²") |>
+  pull(Value)
+
+n_obs_model <- tbl_c3_performance_metrics |>
+  filter(Metric == "Observations") |>
+  pull(Value)
+
+# Binary classification headline cifras
+prev_observed_weighted <- tbl_d1_prevalence |>
+  filter(Metric == "Observed stunting prevalence (survey-weighted)") |>
+  pull(Value)
+
+prev_predicted_weighted <- tbl_d1_prevalence |>
+  filter(Metric == "Predicted stunting prevalence (survey-weighted)") |>
+  pull(Value)
+
+# AUC
+auc_value <- tbl_d4_auc_summary |>
+  filter(Metric == "AUC (survey-weighted)") |>
+  pull(Value)
+
+sensitivity_who <- tbl_d4_auc_summary |>
+  filter(Metric == "Sensitivity at WHO threshold") |>
+  pull(Value)
+
+specificity_who <- tbl_d4_auc_summary |>
+  filter(Metric == "Specificity at WHO threshold") |>
+  pull(Value)
+
+# Formula audit counts
+n_formula_terms <- nrow(
+  tbl_b2_formula_audit |>
+    filter(action %in% c("gam_inferred", "forced_linear", "kept_categorical"))
+)
+
+n_dropped_correlation <- sum(tbl_b2_formula_audit$action == "dropped_correlation")
+
+# GAM ratio at stunted median
+gam_ratio_stunted <- tbl_f5_gam_verification |>
+  filter(Category == "Ratio GAM/Linear at Stunted Median") |>
+  pull(Value)
+```
+
+
+## Data Preparation
+
+### Training Data and Normalization Parameters
+
+The model uses the prepared SIVESNU dataset from the previous module. The
+nutritional index components are normalized using z-score parameters
+(mean and SD) calculated on the outlier-treated training data; these
+parameters are exported and reused downstream in scenario simulation, so that
+biofortified values are projected onto the exact same scale as the training
+data.
+
+
+### Outlier Treatment
+
+Outlier treatment is directional and stratified by household food insecurity.
+Children are grouped into terciles of the FIES Rasch score, the measure of food
+access collected directly in SIVESNU and documented in
+[FIES Food Security Score](04_04_calculate_fies_food_security_score.qmd).
+Within the most food-insecure tercile, upper outliers are pulled down to the
+stratum median; within the most food-secure tercile, lower outliers are pulled
+up to the stratum median. The intermediate tercile is left untouched.
+
+An intake estimate that is extreme relative to a household's observed food
+access carries the uncertainty of the transfer model prediction that produced
+it. Bounding those values limits their influence on the z-score normalization
+parameters, which set the scale of the composite index.
+
+::: {.callout-note}
+## Stratifying Variable
+The stratification uses food access, which is observed independently of the
+anthropometric outcome. The outcome itself takes no part in the treatment, so
+the corrected values carry no imprint of the height-for-age z-scores the model
+goes on to predict.
+:::
+
+
+### Nutritional Index Construction
+
+The composite nutritional index combines six bioavailable nutrient
+measurements into a single predictor using z-score normalization with equal
+weights:
+
+| Component | Units | Role |
+|-----------|-------|------|
+| Iron (absorbed) | mg/day | Micronutrient — biofortification target |
+| Zinc (TAZ, Miller equation) | mg/day | Micronutrient — biofortification target |
+| Protein (PDCAAS-adjusted) | g/day | Macronutrient quality — biofortification target |
+| Lysine | mg/day | Amino acid quality |
+| Tryptophan | mg/day | Amino acid quality |
+| Energy | kcal/day | Overall caloric adequacy |
+
+::: {.callout-note}
+## Why a Composite Index?
+Individual nutrients are highly correlated — children with adequate iron
+intake typically have adequate zinc, protein, and energy intake. Including
+all six nutrients as separate predictors would cause multicollinearity,
+attenuating coefficient estimates and reducing sensitivity to biofortification
+effects. The composite index captures overall nutrient adequacy while
+maintaining a single coefficient that responds predictably to nutrient
+improvements.
+:::
+
+```{r}
+#| label: tbl-a3-normalization-params
+#| tbl-cap: "Z-score normalization parameters for nutritional index components"
+
+tbl_a3_normalization_params |>
+  gt() |>
+  tab_header(
+    title = "Nutritional Index: Z-Score Normalization Parameters",
+    subtitle = "Calculated from outlier-treated SIVESNU training data"
+  ) |>
+  fmt_number(columns = c(Mean, SD), decimals = 4) |>
+  cols_label(
+    Component = "Nutrient Component",
+    Mean = "Mean (μ)",
+    SD = "Std. Dev. (σ)"
+  ) |>
+  cols_align(align = "left", columns = Component) |>
+  cols_align(align = "right", columns = c(Mean, SD)) |>
+  tab_source_note(
+    source_note = "Parameters saved to: 04_06_ni_zscore_normalization_params.rds"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Multicollinearity Assessment
+
+Before model fitting, we assess the correlation between the nutritional index
+and every Boruta-selected predictor present in the dataset. Variables highly
+correlated with the index (|r| > 0.45) could attenuate its coefficient
+through multicollinearity, reducing the model's sensitivity to nutritional
+changes in simulation scenarios. The table below shows the ten predictors most
+correlated with the nutritional index; those exceeding the threshold are
+dropped from the model formula in the next phase. Mandatory predictors,
+including `nutritional_index` itself, bypass this filter.
+
+```{r}
+#| label: tbl-a5-multicollinearity
+#| tbl-cap: "Correlation of Boruta-selected predictors with nutritional_index"
+
+tbl_a5_multicollinearity |>
+  head(10) |>
+  gt() |>
+  tab_header(
+    title = "Multicollinearity with Nutritional Index",
+    subtitle = "Top 10 correlated predictors (exclusion threshold: |r| > 0.45)"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    correlation = "Correlation (r)",
+    exclude = "Exclude"
+  ) |>
+  fmt_number(columns = correlation, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = exclude, rows = exclude == "Yes")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(columns = exclude, rows = exclude == "No")
+  ) |>
+  tab_source_note(
+    source_note = "Variables flagged 'Yes' are dropped from the model formula in Phase B."
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Model Specification
+
+### Predictor Structure
+
+The model formula is constructed **data-driven** from the current state of the
+pipeline. No predictor list is hard-coded in this script; every term is the
+result of upstream selection and a univariate GAM evaluation:
+
+- **Starting set**: the Boruta-selected variables exported by the previous module.
+- **Correlation filter**: variables flagged as `Exclude = Yes` in the
+  multicollinearity table are dropped to preserve the sensitivity of
+  `nutritional_index` in simulation scenarios.
+- **Mandatory inclusion**: `nutritional_index` is always kept, bypassing the
+  correlation filter.
+- **Polynomial degree**: for every numeric predictor, a univariate GAM is
+  fitted against `zlen` and its effective degrees of freedom (edf) translate
+  into the nearest admissible polynomial degree in {1, 2, 3}. Principal
+  components (`pc_*`) are treated as linear by design, since polynomials on
+  a linear combination of variables are not semantically meaningful.
+
+Univariate GAM fits are parallelized through a local mirai pool for efficient
+execution.
+
+
+### Formula Construction Audit
+
+The table below traces, variable by variable, the decision made by the formula
+builder. Two columns deserve special attention:
+
+**Action**: the bucket the variable falls into.
+
+- `dropped_correlation`: Boruta-selected but dropped because its correlation with `nutritional_index` exceeds the exclusion threshold (`|r| > 0.45`). Flagged in pink.
+- `forced_linear`: variables forced to linear (polynomial degree 1) by the `linear_only` argument. Principal components are handled this way. Flagged in blue.
+- `gam_inferred`: numeric variables whose polynomial degree (1, 2 or 3) was determined from the effective degrees of freedom of a univariate GAM fitted against the outcome.
+- `kept_categorical`: factor variables, entered as categorical terms in the formula (no polynomial applicable).
+
+**GAM Status**: the outcome of the univariate GAM evaluation.
+
+- `ok`: the GAM fitted cleanly and the polynomial degree was assigned from its edf.
+- `forced`: the variable bypassed the GAM (listed in `linear_only`); degree fixed at 1.
+- `categorical`: the variable is a factor; the GAM is not applicable.
+- `fit_failed`: the GAM call aborted (typically because a numeric predictor has too few distinct values for the spline basis). Degree falls back to 1. Variables that are conceptually categorical but stored as numeric codes (e.g. binary 1/2 codings) end up here; their treatment as linear is functionally equivalent to their categorical counterpart and does not affect the model.
+- `edf_unavailable`: the GAM fitted but returned a non-finite edf. Degree falls back to 1. Rare.
+
+```{r}
+#| label: tbl-b2-formula-audit
+#| tbl-cap: "Audit trail of formula construction decisions"
+
+tbl_b2_formula_audit |>
+  arrange(action, desc(!is.na(edf)), variable) |>
+  gt() |>
+  tab_header(
+    title = "Formula Construction Audit",
+    subtitle = "Data-driven from Boruta + correlation filter + GAM edf"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    source   = "Source",
+    action   = "Action",
+    degree   = "Polynomial Degree",
+    edf      = "GAM edf",
+    status   = "GAM Status"
+  ) |>
+  fmt_number(columns = edf, decimals = 3) |>
+  sub_missing(columns = c(degree, edf), missing_text = "—") |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(rows = action == "dropped_correlation")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3E0"),
+    locations = cells_body(rows = action == "dropped_not_in_data")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = action == "forced_linear")
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Model Fitting
+
+We use survey-weighted linear regression (Gaussian family) to predict
+continuous z-scores. The survey design accounts for SIVESNU's cluster sampling
+with child-level weights (`pesonino`), so the coefficient estimates refer to the
+national population of children aged 6–59 months.
+
+
+### Model Discrimination
+
+Good model performance appears as points clustering around the diagonal,
+indicating predicted values closely match observed Z-scores. Systematic
+deviations from the diagonal would suggest model misspecification or missing
+predictors.
+
+```{r}
+#| label: fig-b5-observed-predicted
+#| fig-cap: "Observed vs predicted Z-scores"
+#| fig-alt: >
+#|   Scatter plot with predicted height-for-age z-score on the x-axis and
+#|   observed z-score on the y-axis, overlaid with a dashed diagonal reference
+#|   line of perfect agreement. Points cluster in a broad cloud around the
+#|   diagonal without systematic curvature or drift, indicating the survey-
+#|   weighted linear model captures the overall relationship with no obvious
+#|   misspecification, though scatter around the line reflects residual
+#|   variability.
+#| fig-width: 7
+#| fig-height: 5
+
+ggplot(fig_b5_observed_predicted, aes(x = .fitted, y = zlen)) +
+  geom_point(alpha = 0.4, color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "#3AAF85") +
+  labs(
+    title = "Observed vs Predicted HAZ",
+    subtitle = "Survey-weighted linear regression model",
+    x = "Predicted Z-score",
+    y = "Observed Z-score"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+
+## Model Evaluation
+
+### Residual Diagnostics
+
+Linear regression assumes residuals are approximately normal and
+homoscedastic. The histogram should show a symmetric distribution centered at
+zero, while the residuals vs. fitted plot should display random scatter
+without systematic patterns. A flat loess smooth is what the linear
+specification predicts for the residual structure.
+
+```{r}
+#| label: fig-c1-residuals-histogram
+#| fig-cap: "Distribution of model residuals"
+#| fig-alt: >
+#|   Histogram of model residuals (observed minus predicted z-score) on the
+#|   x-axis and count on the y-axis, with a dashed vertical line at zero. The
+#|   bars form a single symmetric bell-shaped mound centred on zero, consistent
+#|   with the approximately normal, unbiased residuals that linear regression
+#|   assumes.
+#| fig-width: 7
+#| fig-height: 5
+
+ggplot(fig_c1_residuals_histogram, aes(x = .resid)) +
+  geom_histogram(bins = 40, fill = "#3AAF85", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Distribution of Residuals",
+    subtitle = "Should be approximately normal and centered at zero",
+    x = "Residual (Observed - Predicted)",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+```{r}
+#| label: fig-c2-residuals-fitted
+#| fig-cap: "Residuals vs fitted values"
+#| fig-alt: >
+#|   Scatter plot with predicted z-score on the x-axis and residual on the
+#|   y-axis, a dashed horizontal reference line at zero, and a loess smooth
+#|   curve through the points. The points spread in a roughly even band around
+#|   zero and the smooth stays close to flat, showing random scatter without
+#|   systematic pattern and supporting the homoscedasticity and linearity
+#|   assumptions.
+#| fig-width: 7
+#| fig-height: 5
+
+ggplot(fig_c2_residuals_fitted, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.4, color = "gray50") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#E53935") +
+  geom_smooth(method = "loess", se = FALSE, color = "#3AAF85", linewidth = 0.8) +
+  labs(
+    title = "Residuals vs Fitted Values",
+    subtitle = "Should show random scatter without systematic patterns",
+    x = "Predicted Z-score",
+    y = "Residual"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+
+### Performance Metrics
+
+```{r}
+#| label: tbl-c3-performance-metrics
+#| tbl-cap: "Model performance metrics"
+
+tbl_c3_performance_metrics |>
+  gt() |>
+  tab_header(
+    title = "HAZ Linear Regression Model Performance",
+    subtitle = "Survey-weighted linear regression with polynomial terms"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Binary Stunting Classification
+
+The continuous HAZ model produces predictions on the height-for-age z-score
+scale. Stunting is defined by the WHO threshold HAZ < −2. By dichotomising
+both the observed and the predicted z-scores at this threshold, the continuous
+model is evaluated as a binary classifier of stunting status.
+
+All metrics in this section are survey-weighted (`pesonino`) so that they
+reflect the population of children aged 6–59 months in Guatemala rather than
+the unweighted sample.
+
+### Derived Stunting Prevalence
+
+```{r}
+#| label: tbl-d1-prevalence
+#| tbl-cap: "Observed vs predicted stunting prevalence"
+
+tbl_d1_prevalence |>
+  gt() |>
+  tab_header(
+    title = "Stunting Prevalence: Observed vs Predicted",
+    subtitle = "WHO threshold HAZ < −2"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Survey-Weighted Confusion Matrix
+
+```{r}
+#| label: tbl-d2-confusion-matrix
+#| tbl-cap: "Survey-weighted confusion matrix at WHO threshold HAZ < −2"
+
+tbl_d2_confusion_matrix |>
+  select(stunting_observed, stunting_predicted, weighted_count) |>
+  pivot_wider(
+    names_from = stunting_predicted,
+    values_from = weighted_count,
+    values_fill = 0
+  ) |>
+  rename(`Observed \\ Predicted` = stunting_observed) |>
+  gt() |>
+  tab_header(
+    title = "Survey-Weighted Confusion Matrix",
+    subtitle = "Cell values are weighted counts (population estimates)"
+  ) |>
+  fmt_number(
+    columns = c(Stunted, `Not stunted`),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_align(align = "left", columns = `Observed \\ Predicted`) |>
+  cols_align(align = "right", columns = c(Stunted, `Not stunted`)) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      columns = Stunted,
+      rows = `Observed \\ Predicted` == "Stunted"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      columns = `Not stunted`,
+      rows = `Observed \\ Predicted` == "Not stunted"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(
+      columns = `Not stunted`,
+      rows = `Observed \\ Predicted` == "Stunted"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(
+      columns = Stunted,
+      rows = `Observed \\ Predicted` == "Not stunted"
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### Classification Metrics
+
+```{r}
+#| label: tbl-d3-classification-metrics
+#| tbl-cap: "Survey-weighted classification metrics at WHO threshold"
+
+tbl_d3_classification_metrics |>
+  gt() |>
+  tab_header(
+    title = "Survey-Weighted Classification Metrics",
+    subtitle = "Binary stunting classification at threshold HAZ < −2"
+  ) |>
+  cols_align(align = "left", columns = c(Metric, Interpretation)) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric %in% c("Sensitivity (Recall)", "Specificity"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric %in% c("Sensitivity (Recall)", "Specificity"))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+### ROC Curve and AUC
+
+```{r}
+#| label: tbl-d4-auc-summary
+#| tbl-cap: "Survey-weighted AUC and operating point comparison"
+
+tbl_d4_auc_summary |>
+  gt() |>
+  tab_header(
+    title = "ROC Analysis Summary",
+    subtitle = "Survey-weighted AUC and operating point comparison"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "AUC (survey-weighted)")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "AUC (survey-weighted)")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-d4-roc-curve
+#| fig-cap: "Survey-weighted ROC curve for stunting classification"
+#| fig-alt: >
+#|   ROC curve with false positive rate (1 minus specificity) on the x-axis and
+#|   true positive rate (sensitivity) on the y-axis, plotted against a dashed
+#|   diagonal chance line. The curve bows above the diagonal toward the top-left
+#|   corner, giving an area under the curve reported in the annotation, which
+#|   indicates good discrimination between stunted and non-stunted children. Two
+#|   marked operating points show the WHO threshold (HAZ below minus 2) and the
+#|   Youden-optimal cutoff.
+#| fig-width: 8
+#| fig-height: 6
+
+# Identify operating points from the ROC curve
+roc_curve_annotated <- fig_d4_roc_curve |>
+  as_tibble() |>
+  mutate(
+    distance_to_threshold = abs(threshold - 2),
+    youden_j = TPR - FPR
+  )
+
+operating_point_who <- roc_curve_annotated |>
+  slice_min(distance_to_threshold, n = 1, with_ties = FALSE)
+
+operating_point_youden <- roc_curve_annotated |>
+  slice_max(youden_j, n = 1, with_ties = FALSE)
+
+# Extract AUC numeric from the summary table for annotation
+auc_numeric <- tbl_d4_auc_summary |>
+  filter(Metric == "AUC (survey-weighted)") |>
+  pull(Value) |>
+  as.numeric()
+
+ggplot(fig_d4_roc_curve, aes(x = FPR, y = TPR)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed",
+              color = "azure4", linewidth = 0.4) +
+  geom_path(color = "#1B6CA8", linewidth = 1) +
+  geom_point(
+    data = operating_point_who,
+    aes(x = FPR, y = TPR),
+    color = "#3AAF85", size = 3
+  ) +
+  geom_point(
+    data = operating_point_youden,
+    aes(x = FPR, y = TPR),
+    color = "#E53935", size = 3
+  ) +
+  annotate(
+    "text",
+    x = operating_point_who$FPR + 0.04,
+    y = operating_point_who$TPR - 0.04,
+    label = "WHO threshold\n(HAZ < −2)",
+    size = 3.2, color = "azure4", hjust = 0
+  ) +
+  annotate(
+    "text",
+    x = operating_point_youden$FPR + 0.04,
+    y = operating_point_youden$TPR + 0.04,
+    label = "Youden optimum",
+    size = 3.2, color = "azure4", hjust = 0
+  ) +
+  annotate(
+    "text",
+    x = 0.65, y = 0.15,
+    label = paste0("AUC = ", round(auc_numeric, 3)),
+    size = 4.5, color = "#1B6CA8", fontface = "bold"
+  ) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0.005, 0.005)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0.005, 0.005)) +
+  coord_equal() +
+  labs(
+    title = "Survey-Weighted ROC Curve",
+    subtitle = "Binary stunting classification (HAZ < −2)",
+    x = "False Positive Rate (1 − Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+::: {.callout-note}
+## Scope of Evaluation
+All metrics in this section are computed in-sample on
+the training data and represent an upper bound on the model's true
+classification performance. The metrics are survey-weighted using `pesonino`
+so that they reflect the population of children aged 6–59 months in Guatemala.
+The WHO threshold (HAZ < −2) is the operationally relevant cutoff for
+stunting classification; the Youden-optimal threshold is reported as a
+reference for the maximum classification capacity available from the
+predicted scores.
+:::
+
+## Model Performance Summary
+
+```{r}
+#| label: tbl-e2-performance-summary
+#| tbl-cap: "Final model performance summary"
+
+tbl_e2_performance_summary |>
+  gt() |>
+  tab_header(
+    title = "HAZ Continuous Model Performance",
+    subtitle = "Survey-weighted linear regression with polynomial terms"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_row_group(
+    label = "Model Fit",
+    rows = Metric %in% c("R²", "RMSE", "MAE")
+  ) |>
+  tab_row_group(
+    label = "Model Configuration",
+    rows = Metric == "Observations Used"
+  ) |>
+  tab_style(
+    style = cell_text(style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## GAM Effect Model for Impact Simulation
+
+The survey-weighted linear regression provides population-level predictions,
+but biofortification impact may vary across the nutritional distribution.
+Children with lower baseline nutrition might benefit more from nutrient
+improvements than those already well-nourished.
+
+To capture this heterogeneity, we fit a **Generalized Additive Model (GAM)**
+that estimates local marginal effects — how much the z-score changes per unit
+increase in the nutritional index at different points in the distribution —
+conditional on child age and sex.
+
+::: {.callout-note}
+## Biofortification-Specific Index
+Impact simulation uses a nutritional index built from the four nutrients whose
+intake biofortified maize modifies:
+
+- **Iron** (absorbed)
+- **Zinc** (TAZ from Miller equation)
+- **Lysine**
+- **Tryptophan**
+
+Biofortified varieties raise the lysine and tryptophan content of the grain,
+and that amino acid profile is what sets the protein quality of a maize-based
+diet. Representing the mechanism through the two amino acids assigns the change
+to the quantities that carry it and gives each nutrient a single point of entry
+into the index.
+
+$$NI_{bio}^{nomaiz} = \frac{1}{4} \times (Fe_{absorbed,z} + Zn_{absorbed,z} + Lys_{z} + Trp_{z})$$
+:::
+
+::: {.callout-important}
+## Non-Maize Basis
+The index is built exclusively from the **non-maize** sources of the calibrated
+block. The full model above uses the six-component `nutritional_index`; the two
+are independent objects.
+
+The basis is a question of identification. In these data the observable
+variation in maize-source nutrients is variation in *maize quantity*, and maize
+dependency is a marker of household resources: within the same socioeconomic
+stratum, a diet more skewed to maize accompanies a lower height-for-age
+z-score. The non-maize channel carries nutrients that arrive without that
+marker, and its association with the outcome is positive and of a magnitude
+consistent with the external evidence.
+
+Quality Protein Maize does not change how much maize a child eats; it changes
+the nutrient content of the maize already eaten. The increment is therefore
+treated downstream as additional nutrient arriving in the non-maize pool,
+which rests on the assumption that a milligram of iron acts the same whatever
+food carried it. Bioavailability is handled separately through the iron
+fraction and the Miller model, so that assumption applies to the quantity and
+not to its absorption.
+
+Two consequences follow. The axis has **its own normalization parameters**,
+computed here and exported separately, so that the scripts rebuilding the index
+from a child's own non-maize intake work in the units the smooth was estimated
+in. And the **Chispitas contribution sits inside the axis**: it was added to
+non-maize iron and zinc in
+[Chispitas Supplementation](04_02_integrate_chispitas_supplementation.qmd),
+and its departmental equivalent is added to the synthetic population, so the
+channel is present on both sides by construction.
+:::
+
+::: {.callout-warning}
+## Scope of the Estimate
+The smooth loses statistical significance once socioeconomic covariates enter
+the specification. The fitted slope is a descriptive dose-response, not an
+identified causal effect.
+:::
+
+
+### GAM Effect Curve
+
+The smooth curve shows how predicted Z-score changes across the nutritional
+index distribution. The stunting threshold (HAZ = −2) is marked for reference.
+
+```{r}
+#| label: fig-f3-gam-effect
+#| fig-cap: "Effect of biofortification-specific nutritional index on HAZ"
+#| fig-alt: >
+#|   Line chart with the biofortification-responsive nutritional index on the
+#|   x-axis and predicted height-for-age z-score on the y-axis, showing a GAM
+#|   smooth curve inside a shaded 95% confidence band. The curve rises as the
+#|   nutritional index increases, so better nutrient adequacy predicts higher
+#|   z-scores. A dashed horizontal line marks the stunting threshold at HAZ
+#|   equals minus 2 for reference.
+#| fig-width: 8
+#| fig-height: 5
+
+ggplot(fig_f3_gam_effect, aes(x = nutritional_index_bio_nomaiz, y = zlen_pred)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "grey70") +
+  geom_line(color = "#3AAF85", linewidth = 1.2) +
+  geom_hline(yintercept = -2, linetype = "dashed", color = "#E53935",
+             linewidth = 0.8) +
+  annotate(
+    "text",
+    x = max(fig_f3_gam_effect$nutritional_index_bio_nomaiz) - 1,
+    y = -1.85,
+    label = "Stunting threshold (HAZ = −2)",
+    color = "#E53935", size = 3
+  ) +
+  labs(
+    title = "Effect of Nutritional Index on HAZ",
+    subtitle = "GAM smooth with 95% CI — 4-component non-maize index",
+    x = "Nutritional Index (Biofortification-Responsive)",
+    y = "Predicted HAZ"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+
+### Marginal Effect Analysis
+
+The derivative of the GAM smooth shows how the marginal effect of nutrition on
+the z-score varies across the distribution. The dashed reference line shows the
+linear-model coefficient for comparison.
+
+```{r}
+#| label: fig-f4-marginal-effect
+#| fig-cap: "Marginal effect of NI on HAZ across the distribution"
+#| fig-alt: >
+#|   Line chart with the biofortification-responsive nutritional index on the
+#|   x-axis and the marginal effect (derivative of HAZ with respect to the
+#|   index) on the y-axis, showing the GAM derivative with a shaded 95%
+#|   confidence band and a dashed horizontal line at the constant linear-model
+#|   coefficient. The GAM curve is essentially flat across the whole index
+#|   range and sits just above the linear coefficient, so the marginal effect
+#|   estimated by the smooth is close to constant.
+#| fig-width: 8
+#| fig-height: 5
+
+# Linear-model reference coefficient is captured in tbl_f5_gam_verification
+coef_linear <- tbl_f5_gam_verification |>
+  filter(Category == "Linear Model Coefficient (NI)") |>
+  pull(Value) |>
+  as.numeric()
+
+ggplot(fig_f4_marginal_effect, aes(x = nutritional_index_bio_nomaiz, y = .derivative)) +
+  geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci),
+              alpha = 0.2, fill = "grey70") +
+  geom_line(color = "#3AAF85", linewidth = 1.2) +
+  geom_hline(yintercept = coef_linear, linetype = "dashed",
+             color = "#E53935", linewidth = 0.8) +
+  annotate(
+    "text",
+    x = min(fig_f4_marginal_effect$nutritional_index_bio_nomaiz) + 0.5,
+    y = coef_linear + 0.1,
+    label = paste0("Linear coef = ", round(coef_linear, 3)),
+    color = "#E53935", size = 3
+  ) +
+  labs(
+    title = "Marginal Effect of NI on HAZ",
+    subtitle = "GAM derivative with 95% CI vs linear model coefficient",
+    x = "Nutritional Index (Biofortification-Responsive)",
+    y = "Marginal Effect (dHAZ/dNI)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+::: {.callout-note}
+## Shape of the Smooth
+On this axis the estimated marginal effect is close to constant: the derivative
+stays between 0.284 and 0.285 across an index range spanning −1.7 to 3.9, and
+its ratio to the linear coefficient at the stunted median is
+`r gam_ratio_stunted`. The specification admits curvature and the fitted smooth
+returns little of it, so the GAM and the linear coefficient give nearly the same
+marginal effect at every point of the distribution.
+:::
+
+
+### GAM Model Verification
+
+```{r}
+#| label: tbl-f5-gam-verification
+#| tbl-cap: "GAM model verification and comparison with linear specification"
+
+tbl_f5_gam_verification |>
+  gt() |>
+  tab_header(
+    title = "GAM Model Verification",
+    subtitle = "4-component non-maize NI (Fe, Zn, lysine, tryptophan) — GAM vs linear"
+  ) |>
+  tab_row_group(label = "Model Fit", rows = 1:2) |>
+  tab_row_group(label = "Coefficient Comparison", rows = 3:4) |>
+  tab_row_group(label = "NI Distribution by Stunting Status", rows = 5:6) |>
+  tab_row_group(label = "Impact at Target Population", rows = 7:8) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Category == "Ratio GAM/Linear at Stunted Median")
+  ) |>
+  tab_source_note(
+    source_note = "The ratio compares the GAM marginal effect at the stunted median against the constant linear coefficient."
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-f2-gam-fit-coverage
+#| tbl-cap: "Complete-case coverage of the GAM variables"
+
+tbl_f2_gam_fit_coverage |>
+  gt() |>
+  tab_header(
+    title = "GAM Fit Coverage",
+    subtitle = "Observations available for the outcome, the index and the adjustment terms"
+  ) |>
+  fmt_number(columns = c(Observed, Total), decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = Percent, decimals = 1) |>
+  cols_label(
+    Variable = "Variable",
+    Observed = "Observed",
+    Total = "Total",
+    Percent = "% Complete"
+  ) |>
+  cols_align(align = "left", columns = Variable) |>
+  cols_align(align = "right", columns = c(Observed, Total, Percent)) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Summary
+
+### Model Overview
+
+This module developed a survey-weighted continuous HAZ model with a
+**data-driven formula** (`r n_formula_terms` final terms; `r n_dropped_correlation`
+predictors dropped by the correlation filter), and a complementary GAM for
+impact simulation:
+
+| Model | Purpose | Key Feature |
+|-------|---------|-------------|
+| Survey-weighted linear regression | Population prediction | Data-driven formula with polynomial degrees inferred from univariate GAMs |
+| Binary classification (derived) | Stunting status evaluation | HAZ-thresholded at −2; survey-weighted ROC AUC = `r auc_value` |
+| GAM with biofortification index | Impact simulation | Non-maize index with age and sex adjustment; GAM/linear ratio `r gam_ratio_stunted` at the stunted median |
+
+### Key Results
+
+- **In-sample R²**: `r rsq_value` over `r n_obs_model` observations.
+- **Observed vs predicted stunting prevalence** (survey-weighted): `r prev_observed_weighted` vs `r prev_predicted_weighted`.
+- **Classification performance at WHO threshold**: sensitivity `r sensitivity_who`, specificity `r specificity_who`.
+- **Discrimination**: survey-weighted ROC AUC = `r auc_value`.
+
+### Application in Impact Simulation
+
+For each child in the [synthetic population](04_07_generate_synthetic_population.qmd),
+the GAM-based simulation:
+
+1. Calculates the new non-maize index post-biofortification:
+   $NI_{new} = NI_{baseline} + \Delta NI$
+2. Evaluates the GAM at both index values, holding age and sex at their
+   observed values: $f(NI_{baseline})$ and $f(NI_{new})$
+3. Takes the z-score change as the difference of the two fitted values:
+   $\Delta HAZ = f(NI_{new}) - f(NI_{baseline})$
+4. Classifies new stunting status: stunted if $(HAZ_{baseline} + \Delta HAZ) < -2$
+
+Taking the difference of fitted values, rather than a first-order term, lets the
+estimate follow the curvature of the smooth across the whole interval the index
+traverses.
+
+::: {.callout-warning}
+## Limitations
+
+1. **Impact simulation scope** — The GAM is intended for aggregate impact
+   estimation, not individual-level HAZ prediction.
+
+2. **Extrapolation uncertainty** — Confidence intervals widen at distribution
+   extremes where data is sparse.
+
+3. **Proportionality assumption** — Impact estimates assume biofortification
+   affects index components proportionally to established biofortification
+   factors.
+
+4. **In-sample classification metrics** — Sensitivity, specificity, and AUC
+   are computed on the training data and represent an upper bound on
+   out-of-sample performance.
+:::

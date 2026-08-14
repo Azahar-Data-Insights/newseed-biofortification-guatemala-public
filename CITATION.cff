@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Biofortified Maize Impact Assessment Framework for Guatemala"
+authors:
+  - family-names: "Sánchez Tormo"
+    given-names: "Julia María"
+    orcid: "https://orcid.org/0000-0001-9341-8737"
+    affiliation: "Azahar Data Insights"
+  - family-names: "Palomo Llinares"
+    given-names: "Rubén"
+    orcid: "https://orcid.org/0000-0002-1890-4337"
+    affiliation: "Azahar Data Insights"
+  - family-names: "Soto Méndez"
+    given-names: "María José"
+    orcid: "https://orcid.org/0000-0002-1012-4715"
+    affiliation: "Fundación Iberoamericana de Nutrición (FINUT)"
+  - family-names: "Adams"
+    given-names: "Katherine P."
+    orcid: "https://orcid.org/0000-0002-1060-2473"
+    affiliation: "Semilla Nueva"
+  - family-names: "Bowen"
+    given-names: "Curt"
+    affiliation: "Semilla Nueva"
+type: software
+license: AGPL-3.0
+version: 4.0.0
+date-released: 2026-08-14
+repository-code: "https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public"
+keywords:
+  - biofortification
+  - stunting
+  - Guatemala
+  - child nutrition
+  - maize
+  - zinc
+  - iron
+  - quality protein
+  - modeled impacts

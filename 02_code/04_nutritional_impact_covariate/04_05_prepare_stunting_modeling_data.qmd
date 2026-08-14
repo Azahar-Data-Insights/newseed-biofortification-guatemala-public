@@ -1,0 +1,3364 @@
+---
+title: "Prepare Stunting Modeling Data"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script prepares the SIVESNU 2018 dataset for stunting prediction modeling by integrating multiple data sources, performing systematic variable selection, and applying dimensionality reduction techniques for correlated variable blocks.
+
+## Target Population
+
+Children aged 6-59 months with valid anthropometric outcomes. Children under 6 months are excluded as they should be exclusively breastfed according to WHO guidelines, making dietary intake patterns non-comparable.
+
+## Data Integration
+
+The script merges the base dataset (containing nutrient intake estimates and FIES scores from previous pipeline steps) with additional SIVESNU 2018 tables:
+
+- **Child table** (`sivesnu_gt18_nino_publico`): Anthropometric outcomes (HFA, ZLEN), vaccination profile, health controls, fortified food consumption, disease history, child development indicators, and dental health
+- **Household table** (`sivesnu_gt18_hogar_publico`): Household assets, infrastructure, cooking fuel, altitude
+- **Women's table** (`sivesnu_gt18_mujer_publico`): Maternal characteristics (education, age, physiological state)
+- **Members table** (`sivesnu_gt18_miembros_publico`): Household occupation classification
+
+## Variable Selection Pipeline
+
+The script implements a systematic, audit-ready variable selection process:
+
+1. **Dictionary Audit**: Recode out-of-domain values to NA based on the operational SIVESNU data dictionary
+2. **Missing Values Analysis**: Exclude variables with >35% missing values
+
+3. **Near-Zero Variance**: Exclude variables with insufficient variation
+
+4. **Multiple Imputation**: Logical imputations followed by Random Forest imputation for remaining missing values
+
+5. **Block PCA**: Dimensionality reduction for conceptually related variable groups that do not require individual interpretability
+
+6. **Correlation Filter**: Remove redundant variables (r > 0.85)
+
+7. **Boruta Feature Selection**: Random Forest-based importance assessment on the continuous outcome
+
+8. **VIF Verification**: Assess multicollinearity across the selected predictors (VIF) and prune the high-VIF ones by Boruta importance
+
+
+## Block PCA Strategy
+
+To maximize information from correlated variable groups while reducing dimensionality, Principal Component Analysis is applied to the following conceptual blocks:
+
+| Block | Variables | Rationale |
+|-------|-----------|-----------|
+| Vaccination profile | bcg, hepb_*, polio_*, penta_*, rota_*, neumo_*, spr, dpt_*, anti_influenza | High collinearity among vaccines; individual interpretation not required |
+| Wealth index | material_*, bienes_*, vivienda_*, agua_*, cocina_* | Standard DHS/ENSMI wealth index construction |
+| Child health controls | control_* | Correlated health monitoring variables |
+| Fortified food consumption | fortif_* | Multiple fortification indicators |
+| Chispitas supplementation | chispitas_* | Behavioral and access information (complementary to the nutrient adjustment) |
+| Recent illness | tos_*, diarrea_*, fiebre_* | Morbidity indicators |
+| Child development | DI_* | Development milestone indicators |
+| Dental health | dientes_* | Oral hygiene indicators |
+
+
+
+# Setup
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Environment setup
+# =============================================================================
+
+# Clean environment
+rm(list = ls())
+
+# Unload all non-base packages to avoid conflicts
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  janitor,            # Data cleaning utilities
+  haven,              # Manage Stata files
+  naniar,             # Missing data visualization and analysis
+  caret,              # Variable selection utilities (nearZeroVar, findCorrelation)
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  gt,                 # Professional table formatting
+  patchwork,          # Multi-panel plot composition
+  glue,               # String interpolation
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to minimize memory footprint)
+# missRanger — missRanger() via impute_rf_parallel() for RF-based imputation
+# Boruta     — Boruta() with getImpRfZ for RF-based feature selection
+# scales     — percent() for number formatting
+# car        - advance VIF model performance
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set options
+options(
+  scipen = 999,
+  digits = 4,
+  dplyr.summarise.inform = FALSE
+)
+
+# Load custom functions
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# models/
+ensure_output_dir(here("01_data", "02_processed", "models"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Preparation
+
+This phase loads all required datasets, audits the SIVESNU tables against the operational data dictionary, and integrates them with the base dataset. We load the complete variable set from each SIVESNU 2018 table without pre-filtering, allowing the systematic variable selection pipeline to determine which variables to retain. The audit runs on each SIVESNU source table independently before the merge, recoding out-of-domain values to NA so that downstream stages operate on data whose semantic domain is fully under control.
+
+## A1. Load Main Dataset
+
+Load the base dataset from the previous pipeline step, which contains nutrient intake estimates, bioavailability adjustments, and FIES Rasch scores.
+
+```{r}
+#| label: a1-load-main-data
+
+# =============================================================================
+# Load base dataset from previous pipeline step
+# Contains: nutritional estimates, bioavailability adjustments, FIES scores
+# =============================================================================
+
+df_base <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "04_04_sivesnu_fies_rasch.parquet")
+)
+```
+
+## A2. Load SIVESNU raw data
+
+### A2.1 Load Child Data
+
+Load the complete SIVESNU 2018 child table containing anthropometric outcomes, vaccination profile, health controls, fortified food consumption, illness history, child development indicators, and dental health variables.
+
+```{r}
+#| label: a2-load-child-data
+
+# =============================================================================
+# Load SIVESNU 2018 child table - ALL variables
+# Contains: outcomes, vaccination, controls, fortification, illness,
+# child development, dental health
+# =============================================================================
+
+sivesnu_nino <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018",
+       "sivesnu_gt18_nino_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats() |>
+  mutate(across(where(is.character), str_trim))
+```
+
+### A2.2 Load Household Data
+
+Load the complete SIVESNU 2018 household table containing assets, infrastructure characteristics, cooking fuel type, GPS altitude, housing materials, and water/sanitation access variables.
+
+```{r}
+#| label: a2-load-household-data
+
+# =============================================================================
+# Load SIVESNU 2018 household table - ALL variables
+# Contains: assets, infrastructure, cooking fuel, altitude, housing materials
+# =============================================================================
+
+sivesnu_hogar <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018",
+       "sivesnu_gt18_hogar_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats() |>
+  mutate(across(where(is.character), str_trim))
+```
+
+### A2.3 Load Maternal Data
+
+Load the complete SIVESNU 2018 women's table containing maternal education, age, physiological state, and reproductive history variables.
+
+```{r}
+#| label: a2-load-maternal-data
+
+# =============================================================================
+# Load SIVESNU 2018 women's table - ALL variables
+# Contains: maternal education, age, physiological state, reproductive history
+# =============================================================================
+
+sivesnu_mujer <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018",
+       "sivesnu_gt18_mujer_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats() |>
+  mutate(across(where(is.character), str_trim))
+```
+
+### A2.4 Load Household Members Data
+
+Load the SIVESNU 2018 household members table for occupation extraction and classification.
+
+```{r}
+#| label: a2-load-members-data
+
+# =============================================================================
+# Load SIVESNU 2018 members table - for occupation extraction
+# Contains: household member characteristics, occupation
+# =============================================================================
+
+sivesnu_miembros <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018",
+       "sivesnu_gt18_miembros_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats() |>
+  mutate(across(where(is.character), str_trim))
+```
+
+## A3. SIVESNU Tables Audit
+
+This section audits each SIVESNU 2018 source table independently against the operational data dictionary. The audit runs before the merge so each variable is validated against the universe declared for its specific source table, avoiding ambiguity from variables that share names across tables (e.g. `fies1` in `hogar` codes responses as `1/2/98` while a derived `fies1` from upstream pipeline uses `0/1`).
+
+The dictionary covers the four SIVESNU 2018 tables. Variables of type `id`, `date`, and `text` are passed through unchanged. The audit applies a domain-only validation rule: values outside the declared universe are recoded to NA. Empty strings are normalized to NA before the comparison.
+
+### A3.1 Load Data Dictionary
+
+```{r}
+#| label: a3-load-dictionary
+
+# =============================================================================
+# Load operational SIVESNU data dictionary
+# Path: 02_code/_config/sivesnu_data_dictionary.csv
+# =============================================================================
+
+data_dictionary <- load_data_dictionary(
+  here("02_code", "_config", "sivesnu_data_dictionary.csv")
+)
+```
+
+### A3.2 Audit Child Table
+
+```{r}
+#| label: a3-audit-nino
+
+# =============================================================================
+# Audit nino table against dictionary entries for source_table == "nino"
+# =============================================================================
+
+audit_nino_result <- audit_variables_against_dictionary(
+  data = sivesnu_nino,
+  data_dictionary = data_dictionary,
+  source_table = "nino"
+)
+
+sivesnu_nino_audited <- audit_nino_result$data
+```
+
+### A3.3 Audit Household Table
+
+```{r}
+#| label: a3-audit-hogar
+
+# =============================================================================
+# Audit hogar table against dictionary entries for source_table == "hogar"
+# =============================================================================
+
+audit_hogar_result <- audit_variables_against_dictionary(
+  data = sivesnu_hogar,
+  data_dictionary = data_dictionary,
+  source_table = "hogar"
+)
+
+sivesnu_hogar_audited <- audit_hogar_result$data
+```
+
+### A3.4 Audit Maternal Table
+
+```{r}
+#| label: a3-audit-mujer
+
+# =============================================================================
+# Audit mujer table against dictionary entries for source_table == "mujer"
+# =============================================================================
+
+audit_mujer_result <- audit_variables_against_dictionary(
+  data = sivesnu_mujer,
+  data_dictionary = data_dictionary,
+  source_table = "mujer"
+)
+
+sivesnu_mujer_audited <- audit_mujer_result$data
+```
+
+### A3.5 Audit Members Table
+
+```{r}
+#| label: a3-audit-miembros
+
+# =============================================================================
+# Audit miembros table against dictionary entries for source_table == "miembros"
+# =============================================================================
+
+audit_miembros_result <- audit_variables_against_dictionary(
+  data = sivesnu_miembros,
+  data_dictionary = data_dictionary,
+  source_table = "miembros"
+)
+
+sivesnu_miembros_audited <- audit_miembros_result$data
+```
+
+### A3.6 Audit Summary
+
+The summary aggregates audit outcomes across the four tables. Categories are:
+
+- **Clean**: variable in the dictionary, no values out of domain
+- **Recoded**: variable in the dictionary, values outside the declared domain were replaced with NA
+- **Passthrough**: variable of type `id`, `date`, or `text`, not subject to domain audit
+- **Not in dictionary**: variable present in the data but absent from the dictionary, passed through unchanged and flagged for review
+
+```{r}
+#| label: tbl-a3-audit-summary
+#| tbl-cap: "Audit outcome summary aggregated across the four SIVESNU tables"
+
+# =============================================================================
+# Aggregate audit outcomes from the four source-table audits
+# =============================================================================
+
+audit_incidents_all <- bind_rows(
+  audit_nino_result$incidents_summary,
+  audit_hogar_result$incidents_summary,
+  audit_mujer_result$incidents_summary,
+  audit_miembros_result$incidents_summary
+)
+
+audit_summary <- audit_incidents_all |>
+  summarise(
+    .by = source_table,
+    n_clean = sum(audit_status == "clean"),
+    n_recoded = sum(audit_status == "recoded"),
+    n_passthrough = sum(audit_status == "passthrough"),
+    n_not_in_dict = sum(audit_status == "not_in_dictionary"),
+    values_recoded = sum(n_recoded * (audit_status == "recoded"))
+  ) |>
+  arrange(source_table)
+
+# Export data for web resources
+export(audit_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_a3_audit_summary.rds"))
+
+audit_summary |>
+  gt() |>
+  tab_header(
+    title = "Variable Audit Summary by Source Table",
+    subtitle = "Outcome distribution after audit against operational dictionary"
+  ) |>
+  fmt_number(columns = c(n_clean, n_recoded, n_passthrough, n_not_in_dict, values_recoded),
+             use_seps = TRUE, decimals = 0) |>
+  cols_label(
+    source_table = "Table",
+    n_clean = "Clean",
+    n_recoded = "Recoded",
+    n_passthrough = "Passthrough",
+    n_not_in_dict = "Not in dict.",
+    values_recoded = "Values recoded"
+  ) |>
+  cols_align(align = "left", columns = source_table) |>
+  cols_align(align = "right", columns = c(n_clean, n_recoded, n_passthrough, n_not_in_dict, values_recoded)) |>
+  tab_source_note(
+    md("**Audit rule:** values outside the declared domain (factor levels for categorical, [min, max] for numeric) are replaced with NA. Variables flagged 'Not in dict.' should be reviewed for inclusion.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+### A3.7 Variables With Recoding Incidents
+
+This table lists variables where the audit recoded at least one value, sorted by number of values replaced. Variables not in the dictionary appear in a separate block at the end and are highlighted for review.
+
+```{r}
+#| label: tbl-a3-audit-incidents
+#| tbl-cap: "Per-variable audit incidents across the four SIVESNU tables"
+
+# =============================================================================
+# Per-variable detail of audit incidents (recoded + not_in_dictionary)
+# =============================================================================
+
+audit_incidents_detail <- audit_incidents_all |>
+  filter(audit_status %in% c("recoded", "not_in_dictionary")) |>
+  arrange(desc(n_recoded), source_table, variable) |>
+  select(source_table, variable, type, n_total, n_pre_na, n_recoded, n_post_na, pct_recoded, audit_status)
+
+# Export data for web resources
+export(audit_incidents_detail, here("01_data", "02_processed", "web_resources", "04_05_tbl_a3_audit_incidents.rds"))
+
+audit_incidents_detail |>
+  gt() |>
+  tab_header(
+    title = "Per-Variable Audit Incidents",
+    subtitle = "Variables with out-of-domain recodings and variables absent from the dictionary"
+  ) |>
+  fmt_number(columns = c(n_total, n_pre_na, n_recoded, n_post_na), use_seps = TRUE, decimals = 0) |>
+  fmt_number(columns = pct_recoded, decimals = 2, pattern = "{x}%") |>
+  sub_missing(missing_text = "—") |>
+  cols_label(
+    source_table = "Table",
+    variable = "Variable",
+    type = "Type",
+    n_total = "N Total",
+    n_pre_na = "NA (pre)",
+    n_recoded = "Recoded",
+    n_post_na = "NA (post)",
+    pct_recoded = "% Recoded",
+    audit_status = "Status"
+  ) |>
+  cols_align(align = "left", columns = c(source_table, variable, type, audit_status)) |>
+  cols_align(align = "right", columns = c(n_total, n_pre_na, n_recoded, n_post_na, pct_recoded)) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = variable)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffffcc"),
+    locations = cells_body(rows = audit_status == "not_in_dictionary")
+  ) |>
+  tab_source_note(
+    md("**Recoded:** variable in the dictionary, the indicated count of values fell outside the declared domain and was replaced with NA.<br>**Not in dictionary:** variable present in the data but absent from the operational dictionary, passed through unchanged.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+## A4. Merge Datasets
+
+This section integrates the audited SIVESNU tables with the base dataset. The merge strategy addresses the challenge of linking records across tables that lack unique child identifiers.
+
+### Merge Strategy
+
+The integration follows a hierarchical approach:
+
+1. **Household-level joins** (hogar, mujer, miembros): Direct join by `nboletahogar`
+2. **Child-level join** (nino): Fuzzy matching using `nboletahogar` + `conglomerado` + age tolerance (±1 year) + sex matching
+
+This approach handles households with multiple children by using demographic characteristics to identify the correct child record.
+
+### A4.1 Prepare Household Occupation
+
+Extract and classify household occupation from the audited members table. For households with multiple members reporting different occupations, we prioritize agricultural occupations relevant to maize consumption patterns.
+
+Priority hierarchy:
+1. **Cereal farmer**: Dedicated to basic grains or mixed crops including grains
+2. **Other farmer**: Without land, family land, or dedicated to vegetables only
+3. **Agricultural worker**: Day laborer in agriculture
+4. **Other**: Non-agricultural occupations
+
+```{r}
+#| label: a4-prepare-occupation
+
+# =============================================================================
+# Prepare household occupation from audited members table
+# Deduplicate to one occupation per household using priority hierarchy
+# =============================================================================
+
+sivesnu_ocupacion <- sivesnu_miembros_audited |>
+  filter(!is.na(ocupacion) & ocupacion != "") |>
+  mutate(
+    ocupacion_cat = case_when(
+      str_detect(ocupacion, regex("granos básicos", ignore_case = TRUE)) ~ "Cereal farmer",
+      str_detect(ocupacion, regex("hortalizas.*frutas.*granos|frutas.*granos", ignore_case = TRUE)) ~ "Cereal farmer",
+      str_detect(ocupacion, regex("sin tierra|tierra familiar", ignore_case = TRUE)) ~ "Other farmer",
+      str_detect(ocupacion, regex("hortalizas", ignore_case = TRUE)) ~ "Other farmer",
+      str_detect(ocupacion, regex("jornalero", ignore_case = TRUE)) ~ "Agricultural worker",
+      TRUE ~ "Other"
+    ),
+    ocupacion_priority = case_when(
+      ocupacion_cat == "Cereal farmer" ~ 1L,
+      ocupacion_cat == "Other farmer" ~ 2L,
+      ocupacion_cat == "Agricultural worker" ~ 3L,
+      TRUE ~ 4L
+    )
+  ) |>
+  slice_min(ocupacion_priority, n = 1, by = nboletahogar, with_ties = FALSE) |>
+  select(nboletahogar, ocupacion_hogar = ocupacion_cat)
+```
+
+### A4.2 Merge Household-Level Tables
+
+Join household, maternal, and occupation data to the base dataset using `nboletahogar` as the key. These are one-to-one or many-to-one relationships at the household level.
+
+```{r}
+#| label: a4-merge-household-level
+
+# =============================================================================
+# Merge audited household-level tables to base dataset
+# Join order: hogar -> mujer -> ocupacion
+# =============================================================================
+
+df_merged <- df_base |>
+  left_join(
+    sivesnu_hogar_audited,
+    by = "nboletahogar",
+    suffix = c("", "_hogar")
+  ) |>
+  left_join(
+    sivesnu_mujer_audited,
+    by = "nboletahogar",
+    suffix = c("", "_mujer")
+  ) |>
+  left_join(
+    sivesnu_ocupacion,
+    by = "nboletahogar"
+  )
+```
+
+### A4.3 Merge Child-Level Table
+
+Join child anthropometric outcomes and characteristics using a fuzzy matching strategy. Since there is no unique child identifier across tables, we match on:
+
+- `nboletahogar`: Household identifier
+- `conglomerado`: Survey cluster
+- Age tolerance: ±1 year between base and child table
+- Sex matching: Same sex code between tables
+
+This approach handles households with multiple children by using demographic constraints to identify the correct match.
+
+```{r}
+#| label: a4-merge-child-level
+
+# =============================================================================
+# Merge audited child table with fuzzy matching on demographics
+# Handles many-to-many relationship for households with multiple children
+# =============================================================================
+
+# Prepare audited child dataset with homogenized sex coding
+sivesnu_nino_match <- sivesnu_nino_audited |>
+  mutate(
+    sexo_nino_coded = case_when(
+      sexonino == 1 ~ "Hombre",
+      sexonino == 2 ~ "Mujer",
+      TRUE ~ NA_character_
+    )
+  )
+
+df_child_merged <- df_merged |>
+  left_join(
+    sivesnu_nino_match,
+    by = c("nboletahogar", "conglomerado"),
+    relationship = "many-to-many",
+    suffix = c("", "_nino")
+  ) |>
+  filter(
+    sexo == sexo_nino_coded | is.na(sexo_nino_coded),
+    abs(edad_an - edad_an_nino) <= 1 | is.na(edad_an_nino)
+  ) |>
+  distinct(nboletahogar, conglomerado, edad_an, sexo, .keep_all = TRUE) |>
+  select(-sexo_nino_coded)
+```
+
+### A4.4 Merge Validation
+
+Validate the merge process by examining record counts and match rates at each integration stage. The base dataset already contains the target population (children 6-59 months), so no additional age filtering is required.
+
+```{r}
+#| label: tbl-a4-merge-validation
+#| tbl-cap: "Merge process validation summary"
+
+# =============================================================================
+# Validate merge results
+# =============================================================================
+
+n_base <- nrow(df_base)
+n_merged <- nrow(df_merged)
+n_unique_base <- df_base |>
+  distinct(nboletahogar, conglomerado, edad_an, sexo) |>
+  nrow()
+n_child_merged <- nrow(df_child_merged)
+n_with_outcomes <- df_child_merged |>
+  filter(!is.na(hfa) & !is.na(zlen)) |>
+  nrow()
+
+merge_validation <- tibble(
+  Stage = c(
+    "Base dataset (from 04_04)",
+    "Unique children in base",
+    "After household-level merges (hogar, mujer, ocupacion)",
+    "After child-level merge with deduplication",
+    "With valid outcomes (HFA & ZLEN)"
+  ),
+  Records = c(
+    n_base,
+    n_unique_base,
+    n_merged,
+    n_child_merged,
+    n_with_outcomes
+  )
+) |>
+  mutate(
+    Change = Records - lag(Records),
+    Pct_of_base = scales::percent(Records / n_base, accuracy = 0.1)
+  )
+
+# Export data for web resources
+export(merge_validation, here("01_data", "02_processed", "web_resources", "04_05_tbl_a4_merge_validation.rds"))
+
+merge_validation |>
+  gt() |>
+  tab_header(
+    title = "Phase A: Data Integration Summary",
+    subtitle = "Record counts at each merge stage (audited tables)"
+  ) |>
+  fmt_number(columns = Records, use_seps = TRUE, decimals = 0) |>
+  fmt_number(columns = Change, use_seps = TRUE, decimals = 0) |>
+  sub_missing(missing_text = "—") |>
+  cols_label(
+    Stage = "Integration Stage",
+    Records = "N Records",
+    Change = "Change",
+    Pct_of_base = "% of Base"
+  ) |>
+  cols_align(align = "left", columns = Stage) |>
+  cols_align(align = "right", columns = c(Records, Change, Pct_of_base)) |>
+  tab_source_note(
+    md("**Note:** Base dataset duplicates (same nboletahogar/conglomerado/edad_an/sexo) are resolved during child-level merge. Source tables are audited individually before this merge.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+```{r}
+#| label: a4-phase-a-cleanup
+
+# =============================================================================
+# Phase A: Clean up auxiliary objects
+# =============================================================================
+
+rm(n_base, n_merged, n_unique_base, n_child_merged, n_with_outcomes,
+   sivesnu_nino_match, merge_validation,
+   data_dictionary, audit_nino_result, audit_hogar_result,
+   audit_mujer_result, audit_miembros_result,
+   audit_incidents_all, audit_summary, audit_incidents_detail)
+```
+
+
+---
+
+# Phase B: Variable Exclusion Definitions
+
+This phase defines the variable categories that will be handled specially during the selection pipeline. Variables are classified into four groups:
+
+1. **Header variables**: Survey metadata and identifiers (excluded from modeling, retained for traceability)
+2. **Outcome variables**: HFA and ZLEN (the prediction targets)
+3. **Design exclusions**: Variables excluded by methodological design (redundant with outcomes, intermediate calculations)
+4. **Preservation variables**: Required for biofortified maize assignment (participate in selection but always retained)
+
+## B1. Define Header Variables
+
+Survey metadata and identifiers that must be retained for traceability but excluded from the predictive modeling process.
+
+```{r}
+#| label: b1-define-header-vars
+
+# =============================================================================
+# Header variables: Survey metadata and identifiers
+# Excluded from modeling, retained for data traceability
+# =============================================================================
+
+variables_header <- c(
+  # Survey identifiers
+  "nboletahogar",
+  "conglomerado",
+  "boletanino",
+  "notabletan",
+  "nlinea",
+  "boletamujer",
+  # Survey weights
+  "pesonino"
+)
+```
+
+## B2. Define Outcome Variables
+
+The prediction targets for stunting modeling. Both the binary and the continuous outcome columns are retained in the dataset; modeling runs on the continuous outcome.
+
+```{r}
+#| label: b2-define-outcome-vars
+
+# =============================================================================
+# Outcome variables: Prediction targets
+# HFA = Height-for-Age classification (stunted/not stunted)
+# ZLEN = Height-for-Age z-score (continuous)
+# =============================================================================
+
+variables_outcome <- c(
+  "hfa",
+  "zlen"
+)
+```
+
+## B3. Define Design Exclusions
+
+Variables excluded by methodological design. These fall into several categories:
+
+- **Redundant with outcome**: Other anthropometric z-scores and classifications derived from the same measurements
+- **Direct inputs to outcome**: Raw height/weight measurements used to calculate HFA/ZLEN
+- **Intermediate calculations**: Nutrient variables from earlier pipeline steps that have been superseded
+- **Measurement metadata**: Equipment codes, timestamps, and measurement quality flags
+
+```{r}
+#| label: b3-define-design-exclusions
+
+# =============================================================================
+# Design exclusions: Variables excluded by methodological design
+# =============================================================================
+
+variables_excluded_design <- c(
+  
+ # --- Survey identifiers and metadata ---
+  "nboletahogar",
+  "boletanino",
+  "boletamujer",
+  "notabletan",
+  "nlinea",
+  "conglomerado",
+  "nlinea_informante",
+  "ult_nac_nlinea",
+  "pen_nac_nlinea",
+  "ter_nac_nlinea",
+  
+  # --- Interview dates (all table variants) ---
+  "fecha_entrevista",
+  "fecha_entrevista_mujer",
+  "fecha_entrevista_nino",
+  "fecha_entrevista_hogar",
+  
+  # --- Interview times (all table variants) ---
+  "hora_inicial1", "hora_inicial2", "hora_inicial3",
+  "hora_final1", "hora_final2", "hora_final3",
+  "hora_inicial1_mujer", "hora_inicial2_mujer", "hora_inicial3_mujer",
+  "hora_final1_mujer", "hora_final2_mujer", "hora_final3_mujer",
+  "hora_inicial1_hogar", "hora_inicial2_hogar", "hora_inicial3_hogar",
+  "hora_final1_hogar", "hora_final2_hogar", "hora_final3_hogar",
+  
+  # --- Interview result codes (all table variants) ---
+  "resultado_entrevista1", "resultado_entrevista2", "resultado_entrevista3",
+  "resultado_entrevista_otro1", "resultado_entrevista_otro2", "resultado_entrevista_otro3",
+  "resultado_entrevista1_mujer", "resultado_entrevista2_mujer", "resultado_entrevista3_mujer",
+  "resultado_entrevista_otro1_mujer", "resultado_entrevista_otro2_mujer", "resultado_entrevista_otro3_mujer",
+  "resultado_entrevista1_nino", "resultado_entrevista2_nino", "resultado_entrevista3_nino",
+  "resultado_entrevista_otro1_nino", "resultado_entrevista_otro2_nino", "resultado_entrevista_otro3_nino",
+  "resultado_entrevista1_hogar", "resultado_entrevista2_hogar", "resultado_entrevista3_hogar",
+  "resultado_entrevista_otro1_hogar", "resultado_entrevista_otro2_hogar", "resultado_entrevista_otro3_hogar",
+  
+  # --- Interview language (all table variants) ---
+  "idioma_entrevista",
+  "idioma_entrevista_otro",
+  "idioma_entrevista_mujer",
+  "idioma_entrevista_nino",
+  "idioma_entrevista_hogar",
+  "idioma_entrevista_otro_mujer",
+  "idioma_entrevista_otro_nino",
+  "idioma_entrevista_otro_hogar",
+  
+  # --- Measurement dates (control visits) ---
+  "control_fecha_peso_penultimo",
+  "control_fecha_peso_ultimo",
+  "control_fecha_talla_penultimo",
+  "control_fecha_talla_ultimo",
+  
+  # --- Measurement times ---
+  "talla_hora",
+  "peso_hora",
+  "muac_hora",
+  "cintura_hora",
+  
+  # --- Measurement equipment codes ---
+  "muac_equipo",
+  "talla_equipo",
+  "peso_equipo",
+  
+  # --- Laboratory codes ---
+  "codigo_tecnico_lab",
+  "codigo_lab",
+  
+  # --- Redundant anthropometric outcomes ---
+  "zwei",
+  "zwfl", 
+  "zbmi",
+  "wfa",
+  "wfh",
+  "cbmi",
+  
+  # --- Direct inputs to outcome calculation ---
+  "talla_cm",
+  "peso_kg",
+  "peso_resultado_medicion",
+  "peso_resultado_medicion_nino",
+  "alturaindnino",
+  
+  # --- Variables derived from child height (circular with ZLEN) ---
+  "talla_pequena",
+  "imc",
+  
+  # --- Age redundancy (edad_an is retained as primary) ---
+  "edad_mes",
+  "edad_dias",
+  "edadmeses",
+  "edad_grupos",
+  "edad_nino_filtro",
+  
+  # --- Other measurement metadata ---
+  "control_linea_graficas",
+  "control_puntos_graficas",
+  "muac_cm",
+  
+  # --- Transformed variables (originals superseded) ---
+  "n_cuartos_og", 
+  "miembros_hogar_og",
+  
+  # --- FIES raw items (Rasch score is retained as composite) ---
+  "fies1", "fies2", "fies3", "fies4", "fies5", "fies6", "fies7", "fies8", 
+  "fies_raw_score"
+)
+```
+
+## B4. Define Preservation Variables
+
+Variables required for downstream processes that must be retained in the final dataset regardless of selection results. These are split into two categories:
+
+1. **Assignment variables**: child demographics used as adjustment terms in the stunting models, and the geographic and socioeconomic variables required for biofortified maize hierarchical assignment
+2. **Nutrient variables**: The nutrient intake estimates that will be modified in biofortification simulations
+
+Both categories participate in the selection pipeline (to assess predictive value) but are always retained in the final dataset.
+
+```{r}
+#| label: b4-define-assignment-vars
+
+# =============================================================================
+# Assignment variables: child demographics for model adjustment and the
+# variables required for biofortified maize hierarchical assignment
+# Participate in selection but always retained regardless of results
+# =============================================================================
+
+variables_preserve_assignment <- c(
+  # Child demographics: adjustment terms in the stunting models (04_06)
+  "edad_mes_nino",
+  "sexonino",
+  # Geographic stratification
+  "ruralurbano",
+  "departamento",
+  # Altitude: retained for the Department x Altitude interaction in the
+  # stunting models (04_06 / 04_07). Highland departments in Guatemala
+  # display distinct nutritional and stunting profiles tied to altitude,
+  # an effect the interaction is designed to capture.
+  "gps_altitud",
+  # Occupation classification (created in A3.1)
+  "ocupacion_hogar",
+  # Food security score
+  "fies_rasch_score"
+)
+```
+
+## B5. Define Nutrient Variables
+
+Nutrient intake estimates from the pipeline that represent the core variables for biofortification simulation. These variables:
+
+1. **Must be excluded from selection**: They are the variables we will modify in simulations, not predictors
+2. **Must be retained in final dataset**: Required for the biofortification impact modeling
+
+The nutrient variables include:
+- **Iron (Fe)**: Total intake, absorption factors, absorbed amounts, Chispitas-adjusted
+- **Zinc (Zn)**: Total intake, fractional absorption, absorbed amounts, Chispitas-adjusted  
+- **Protein**: Total PDCAAS-adjusted intake and components
+- **Amino acids**: Lysine and tryptophan (limiting amino acids in maize)
+- **Energy**: Total kilocalories
+- **Source breakdown**: Maize vs non-maize contributions
+- **Raw transfer-model predictions** (`*_raw`): the uncalibrated output of the 04_01 transfer models, before the FIES adjustment, the quantile mapping and the maize-source alignment. Retained purely for diagnostics and excluded from selection for the same reason as the calibrated block.
+
+```{r}
+#| label: b5-define-nutritional-vars
+
+# =============================================================================
+# Nutritional variables: Core variables for biofortification simulation
+# Excluded from selection pipeline, always retained in final dataset
+# =============================================================================
+
+variables_nutritional <- c(
+  # --- Iron ---
+  "fe_mg_maiz",
+  "fe_mg_nomaiz",
+  "fe_mg_total",
+  "fe_absorption_factor",
+  "fe_absorbed_mg",
+  "fe_chispitas_effective_mg",
+  
+ 
+  # --- Zinc ---
+  "zn_mg_maiz",
+  "zn_mg_nomaiz",
+  "zn_mg_total",
+  "taz_mg",
+  "zn_fractional_absorption",
+  "zn_chispitas_effective_mg",
+  
+  # --- Protein ---
+  "prot_g_maiz",
+  "prot_g_nomaiz",
+  "prot_g_total",
+  
+  # --- Amino acids ---
+  "lys_mg_maiz",
+  "lys_mg_nomaiz",
+  "lys_mg_total",
+  "trp_mg_maiz",
+  "trp_mg_nomaiz",
+  "trp_mg_total",
+  
+  # --- Energy ---
+  "ene_kcal_maiz",
+  "ene_kcal_nomaiz",
+  "ene_kcal_total",
+  
+  # --- Plant percentage ---
+  "per_vegetales",
+  "per_vegetales_estratificado",
+
+  # --- Chispitas supplementation ---
+  "receives_chispitas",
+  "adherence_factor_final",
+
+  # --- Raw transfer-model predictions (from 04_01) ---
+  # Uncalibrated model output, preserved for diagnostics. They must be
+  # excluded from selection for the same reason as the calibrated block
+  # (they are simulation-side quantities, not predictors) and are additionally
+  # near-collinear with their calibrated counterparts.
+  "fe_mg_maiz_raw",
+  "fe_mg_nomaiz_raw",
+  "zn_mg_maiz_raw",
+  "zn_mg_nomaiz_raw",
+  "prot_g_maiz_raw",
+  "prot_g_nomaiz_raw",
+  "lys_mg_maiz_raw",
+  "lys_mg_nomaiz_raw",
+  "trp_mg_maiz_raw",
+  "trp_mg_nomaiz_raw",
+  "ene_kcal_maiz_raw",
+  "ene_kcal_nomaiz_raw"
+)
+```
+
+## B6. Prepare Candidate Variables
+
+Create the working dataset for the selection pipeline by:
+
+1. Filtering to records with valid outcomes (HFA and ZLEN)
+2. Identifying candidate variables (all columns except header, outcomes, and design exclusions)
+3. Retaining preservation variables for downstream assignment
+
+```{r}
+#| label: b6-prepare-candidates
+
+# =============================================================================
+# Prepare candidate variables for selection pipeline
+# =============================================================================
+
+# Filter to valid outcomes
+df_modeling <- df_child_merged |>
+  filter(!is.na(hfa) & !is.na(zlen))
+
+# Identify all variables to exclude from candidate pool
+# Note: Nutritional variables are excluded from selection (they are simulation targets)
+#       Assignment variables PARTICIPATE in selection (we want to assess their predictive value)
+variables_exclude_from_candidates <- c(
+  variables_header,
+  variables_outcome,
+  variables_excluded_design,
+  variables_nutritional
+)
+
+# Get candidate variable names (everything else, including assignment vars)
+variables_candidate <- setdiff(
+  names(df_modeling),
+  variables_exclude_from_candidates
+)
+```
+
+### Candidate Variables Summary
+
+Overview of variables entering the selection pipeline.
+
+```{r}
+#| label: tbl-b6-candidates-summary
+#| tbl-cap: "Candidate variables for selection pipeline"
+
+# =============================================================================
+# Summary of candidate variables
+# =============================================================================
+
+# Report counts
+n_total_cols <- ncol(df_modeling)
+n_excluded <- length(intersect(variables_exclude_from_candidates, names(df_modeling)))
+n_candidates <- length(variables_candidate)
+
+candidates_summary <- tibble(
+  Category = c(
+    "Total columns in modeling dataset",
+    "Header variables (excluded)",
+    "Outcome variables (excluded)",
+    "Design exclusions (excluded)",
+    "Candidate variables for selection"
+  ),
+  Count = c(
+    n_total_cols,
+    length(intersect(variables_header, names(df_modeling))),
+    length(intersect(variables_outcome, names(df_modeling))),
+    length(intersect(variables_excluded_design, names(df_modeling))),
+    n_candidates
+  )
+)
+
+# Export data for web resources
+export(candidates_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_b6_candidates_summary.rds"))
+
+candidates_summary |>
+  gt() |>
+  tab_header(
+    title = "Phase B: Candidate Variable Summary",
+    subtitle = glue("Dataset filtered to {nrow(df_modeling)} records with valid outcomes")
+  ) |>
+  fmt_number(columns = Count, use_seps = TRUE, decimals = 0) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = Count) |>
+  tab_row_group(
+    label = "Exclusions",
+    rows = 2:4
+  ) |>
+  tab_row_group(
+    label = "Final",
+    rows = c(1, 5)
+  ) |>
+  row_group_order(groups = c("Final", "Exclusions")) |>
+  tab_source_note(
+    md(glue("**Preservation variables in candidate pool:** {sum(variables_preserve_assignment %in% variables_candidate)} of {length(variables_preserve_assignment)}"))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+```{r}
+#| label: b6-phase-b-cleanup
+
+# =============================================================================
+# Phase B: Clean up auxiliary objects
+# =============================================================================
+
+rm(n_total_cols, n_excluded, n_candidates, candidates_summary)
+```
+
+
+---
+
+# Phase C: Initial Variable Filtering
+
+This phase applies systematic filters to reduce the candidate variable pool before imputation and selection. The filtering follows a sequential approach:
+
+1. **Missing Values Analysis**: Exclude variables with >35% missing values (threshold based on Van Buuren, 2018; Madley-Dowd et al., 2019)
+2. **Near-Zero Variance**: Exclude variables with insufficient variation for predictive modeling
+3. **Define PCA Blocks**: Identify conceptually related variable groups for dimensionality reduction
+
+Variables that pass these filters proceed to imputation (Phase D) and subsequent selection steps.
+
+## C1. Missing Values Analysis
+
+Identify and exclude variables with excessive missing values (>35%). This threshold balances data quality with information retention, considering that Random Forest-based imputation can handle moderate missingness effectively when variables are correlated (Van Buuren, 2018).
+
+```{r}
+#| label: c1-calculate-missing
+
+# =============================================================================
+# Calculate missing value rates for candidate variables
+# =============================================================================
+
+# Extract candidate variables only
+df_candidates <- df_modeling |>
+  select(all_of(variables_candidate))
+
+# Calculate missing statistics for each variable
+df_missing <- df_candidates |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) |>
+  mutate(
+    n_total = nrow(df_candidates),
+    pct_missing = n_missing / n_total,
+    exclude_missing = pct_missing > 0.35
+  ) |>
+  arrange(desc(pct_missing))
+```
+
+```{r}
+#| label: tbl-c1-missing-summary
+#| tbl-cap: "Missing values analysis summary"
+
+# =============================================================================
+# Summary table of missing value analysis
+# =============================================================================
+
+# Calculate summary statistics
+missing_summary <- df_missing |>
+  summarise(
+    `Total variables` = n(),
+    `Complete (0% missing)` = sum(pct_missing == 0),
+    `Low missing (0-10%)` = sum(pct_missing > 0 & pct_missing <= 0.10),
+    `Moderate missing (10-35%)` = sum(pct_missing > 0.10 & pct_missing <= 0.35),
+    `High missing (>35%)` = sum(pct_missing > 0.35)
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "Category",
+    values_to = "Count"
+  )
+
+# Export data for web resources
+export(missing_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_c1_missing_summary.rds"))
+
+missing_summary |>
+  gt() |>
+  tab_header(
+    title = "Missing Values Analysis",
+    subtitle = "Distribution of candidate variables by missing rate"
+  ) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = Count) |>
+  tab_style(
+    style = cell_fill(color = "#ffcccc"),
+    locations = cells_body(rows = Category == "High missing (>35%)")
+  ) |>
+  tab_source_note(
+    md("**Threshold:** Variables with >35% missing will be excluded from selection pipeline")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+```{r}
+#| label: c1-apply-missing-filter
+
+# =============================================================================
+# Apply missing value filter to candidate variables
+# =============================================================================
+
+# Get variables to exclude
+variables_exclude_missing <- df_missing |>
+  filter(exclude_missing) |>
+  pull(variable)
+
+# Update candidate list
+variables_post_missing <- setdiff(variables_candidate, variables_exclude_missing)
+```
+
+## C2. Near-Zero Variance Analysis
+
+Identify and exclude variables with near-zero variance. Variables with very low variance provide minimal discriminatory power for predictive modeling.
+
+The function identifies problematic variables based on:
+- **Frequency ratio**: Ratio of most common to second most common value (default threshold: 19)
+- **Percent unique**: Percentage of unique values relative to sample size (default threshold: 10%)
+
+```{r}
+#| label: c2-calculate-nzv
+
+# =============================================================================
+# Calculate near-zero variance statistics for post-missing variables
+# =============================================================================
+
+# Extract post-missing candidate variables
+df_post_missing <- df_modeling |>
+  select(all_of(variables_post_missing))
+
+# Calculate NZV metrics
+nzv_results <- nearZeroVar(df_post_missing, saveMetrics = TRUE) |>
+  as_tibble(rownames = "variable") |>
+  arrange(desc(freqRatio))
+```
+
+```{r}
+#| label: tbl-c2-nzv-summary
+#| tbl-cap: "Near-zero variance analysis summary"
+
+# =============================================================================
+# Summary table of NZV analysis
+# =============================================================================
+
+nzv_summary <- nzv_results |>
+  summarise(
+    `Total variables analyzed` = n(),
+    `Zero variance` = sum(zeroVar),
+    `Near-zero variance` = sum(nzv & !zeroVar),
+    `Adequate variance` = sum(!nzv)
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "Category",
+    values_to = "Count"
+  )
+
+# Export data for web resources
+export(nzv_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_c2_nzv_summary.rds"))
+
+nzv_summary |>
+  gt() |>
+  tab_header(
+    title = "Near-Zero Variance Analysis",
+    subtitle = "Distribution of variables by variance characteristics"
+  ) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = Count) |>
+  tab_style(
+    style = cell_fill(color = "#ffcccc"),
+    locations = cells_body(rows = Category %in% c("Zero variance", "Near-zero variance"))
+  ) |>
+  tab_source_note(
+    md("**Criteria:** freqRatio > 19 and percentUnique < 10%")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+```{r}
+#| label: c2-apply-nzv-filter
+
+# =============================================================================
+# Apply NZV filter to candidate variables
+# =============================================================================
+
+# Get variables to exclude
+variables_exclude_nzv <- nzv_results |>
+  filter(nzv) |>
+  pull(variable)
+
+# Update candidate list
+variables_post_nzv <- setdiff(variables_post_missing, variables_exclude_nzv)
+```
+
+## C3. Phase C Summary
+
+Summary of the initial filtering phase, showing variable counts at each stage of the quality filters.
+
+```{r}
+#| label: tbl-c3-phase-c-summary
+#| tbl-cap: "Phase C filtering summary"
+
+# =============================================================================
+# Summary table for Phase C - Variable quality filtering results
+# =============================================================================
+
+phase_c_summary <- tibble(
+  Stage = c(
+    "Initial candidate variables",
+    "Excluded by missing filter (>35%)",
+    "Remaining after missing filter",
+    "Excluded by NZV filter",
+    "Final candidate variables for modeling"
+  ),
+  Count = c(
+    length(variables_candidate),
+    length(variables_exclude_missing),
+    length(variables_post_missing),
+    length(variables_exclude_nzv),
+    length(variables_post_nzv)
+  )
+)
+
+# Export data for web resources
+export(phase_c_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_c3_phase_c_summary.rds"))
+
+phase_c_summary |>
+  gt() |>
+  tab_header(
+    title = "Phase C: Variable Quality Filtering",
+    subtitle = "Sequential application of missing value and variance filters"
+  ) |>
+  fmt_number(columns = Count, use_seps = TRUE, decimals = 0) |>
+  cols_align(align = "left", columns = Stage) |>
+  cols_align(align = "right", columns = Count) |>
+  tab_row_group(
+    label = md("*Missing Values Filter*"),
+    rows = 1:3
+  ) |>
+  tab_row_group(
+    label = md("*Near-Zero Variance Filter*"),
+    rows = 4:5
+  ) |>
+  row_group_order(groups = c("*Missing Values Filter*", "*Near-Zero Variance Filter*")) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Stage == "Final candidate variables for modeling")
+  ) |>
+  tab_source_note(
+    md("**Thresholds:** Missing >35% excluded; NZV per caret::nearZeroVar defaults")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+```{r}
+#| label: c3-phase-c-cleanup
+
+# =============================================================================
+# Phase C: Clean up auxiliary objects
+# =============================================================================
+
+rm(missing_summary, nzv_results, nzv_summary, df_candidates,
+   df_post_missing, phase_c_summary)
+```
+
+---
+
+# Phase D: Missing Value Imputation
+
+This phase imputes remaining missing values in candidate variables using Random Forest-based imputation. This approach:
+
+1. Handles mixed data types (continuous and categorical)
+2. Preserves variable relationships and correlations
+3. Performs well with moderate missingness (<35% per variable)
+
+The imputation is applied only to candidate variables that passed the Phase C filters. Header, outcome, and nutrient variables are preserved unchanged.
+
+## D1. Assess Missing Patterns
+
+Examine the distribution and patterns of missing values in the filtered candidate variables before imputation.
+
+```{r}
+#| label: d1-pre-imputation-missing
+
+# =============================================================================
+# Assess missing patterns in post-filter candidate variables
+# =============================================================================
+
+# Create dataset with only candidate variables for imputation
+df_to_impute <- df_modeling |>
+  select(all_of(variables_post_nzv))
+
+# Calculate missing summary
+missing_pre_imputation <- df_to_impute |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) |>
+  mutate(
+    pct_missing = n_missing / nrow(df_to_impute)
+  ) |>
+  arrange(desc(pct_missing))
+```
+
+```{r}
+#| label: tbl-d1-pre-imputation
+#| tbl-cap: "Missing values summary before imputation"
+
+# =============================================================================
+# Summary table of missing patterns pre-imputation
+# =============================================================================
+
+# Summarize by category
+n_complete <- sum(missing_pre_imputation$n_missing == 0)
+n_with_missing <- sum(missing_pre_imputation$n_missing > 0)
+total_missing_cells <- sum(missing_pre_imputation$n_missing)
+total_cells <- nrow(df_to_impute) * ncol(df_to_impute)
+pct_total_missing <- total_missing_cells / total_cells
+
+pre_imputation_summary <- tibble(
+  Metric = c(
+    "Total candidate variables",
+    "Variables with no missing",
+    "Variables with missing values",
+    "Total cells in matrix",
+    "Total missing cells",
+    "Overall missing rate"
+  ),
+  Value = c(
+    as.character(length(variables_post_nzv)),
+    as.character(n_complete),
+    as.character(n_with_missing),
+    format(total_cells, big.mark = ","),
+    format(total_missing_cells, big.mark = ","),
+    scales::percent(pct_total_missing, accuracy = 0.1)
+  )
+)
+
+# Export data for web resources
+export(pre_imputation_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_d1_pre_imputation.rds"))
+
+pre_imputation_summary |>
+  gt() |>
+  tab_header(
+    title = "Pre-Imputation Missing Values Assessment",
+    subtitle = "Candidate variables after Phase C filtering"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_source_note(
+    md("**Method:** Random Forest-based imputation")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+## D2. Random Forest Imputation
+
+Apply Random Forest-based multivariate imputation. This method iteratively trains random forests on observed values to predict missing values, preserving complex variable relationships and providing out-of-bag error estimates for imputation quality.
+
+Implementation uses the `impute_rf_parallel()` utility function, which wraps `missRanger` with a multi-threaded `ranger` engine and returns imputed values alongside out-of-bag error estimates (OOBE for continuous variables, PFC for categorical).
+
+```{r}
+#| label: d2-run-imputation
+#| warning: false
+
+# =============================================================================
+# Prepare data matrix for Random Forest imputation
+# =============================================================================
+
+# Convert character variables to factors for ranger compatibility
+df_for_imputation <- df_to_impute |>
+  mutate(across(where(is.character), as.factor))|>
+  mutate(across(where(is.factor), droplevels)) |>
+  # Convert to data frame
+  as.data.frame()
+
+# Record variable types for validation
+var_types_pre <- tibble(
+  variable = names(df_for_imputation),
+  type_pre = map_chr(df_for_imputation, ~ class(.)[1])
+)
+
+# =============================================================================
+# Run Random Forest imputation
+# =============================================================================
+# Uses impute_rf_parallel() (00_functions.R, section 6), which wraps
+# missRanger with a multi-threaded ranger engine and returns a list
+# containing ximp (imputed tibble) and OOBerror (OOBE, PFC).
+
+set.seed(789) 
+
+imputation_result <- impute_rf_parallel(
+  data = df_for_imputation,
+  maxiter = 5,
+  ntree = 50,
+  verbose = FALSE
+)
+
+# Extract imputed data
+df_imputed <- imputation_result$ximp |>
+  as_tibble()
+
+# Extract error estimates
+oob_error <- imputation_result$OOBerror
+```
+
+```{r}
+#| label: tbl-d2-imputation-results
+#| tbl-cap: "Random Forest imputation results"
+
+# =============================================================================
+# Summary of imputation results
+# =============================================================================
+
+# Label each reported error metric
+error_names <- names(oob_error)
+if (is.null(error_names)) {
+  error_names <- c("OOBE (continuous)", "PFC (categorical)")
+}
+
+# Report each metric only when a variable of that type required imputation
+n_continuous <- imputation_result$n_continuous
+n_categorical <- imputation_result$n_categorical
+
+oobe_display <- if (n_continuous > 0) {
+  as.character(round(oob_error["OOBE"], 4))
+} else {
+  "N/A"
+}
+oobe_assessment <- if (n_continuous > 0) {
+  if_else(oob_error["OOBE"] < 0.5, "Acceptable", "Review required")
+} else {
+  "No continuous variables required imputation"
+}
+
+pfc_display <- if (n_categorical > 0) {
+  as.character(round(oob_error["PFC"], 4))
+} else {
+  "N/A"
+}
+pfc_assessment <- if (n_categorical > 0) {
+  if_else(oob_error["PFC"] < 0.2, "Acceptable", "Review required")
+} else {
+  "No categorical variables required imputation"
+}
+
+imputation_results_summary <- tibble(
+  Metric = c(
+    "Variables imputed",
+    "Observations",
+    error_names
+  ),
+  Value = c(
+    as.character(ncol(df_imputed)),
+    as.character(nrow(df_imputed)),
+    oobe_display,
+    pfc_display
+  ),
+  Assessment = c(
+    "—",
+    "—",
+    oobe_assessment,
+    pfc_assessment
+  )
+)
+
+# Export data for web resources
+export(imputation_results_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_d2_imputation_results.rds"))
+
+imputation_results_summary |>
+  gt() |>
+  tab_header(
+    title = "Random Forest Imputation Results",
+    subtitle = "Out-of-bag error estimates"
+  ) |>
+  cols_label(
+    Metric = "Metric",
+    Value = "Value",
+    Assessment = "Quality Assessment"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  cols_align(align = "left", columns = Assessment) |>
+  tab_source_note(
+    md("**OOBE:** out-of-bag error across continuous variables, the square root of the variance-weighted mean of per-variable unexplained variance (threshold: 0.5)<br>**PFC:** Proportion Falsely Classified (categorical variables, threshold: 0.2)")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+## D2b. Completion of Residual Missing Values
+
+The Random Forest imputation engine can leave a residual `NaN` for a small subset of rows when the out-of-bag prediction collapses inside a terminal node with zero within-leaf variance. This affects continuous discrete-scale predictors.
+
+Downstream analyses (block PCA, correlation filter, Boruta, VIF) operate on a complete predictor matrix, so residual missing values are completed with a variable-specific rule:
+
+- **Numeric / integer variables**: median of the observed values, which preserves the support of discrete-scale ordinal variables.
+- **Factor variables**: mode of the observed values.
+
+The count of values completed by each rule is reported in the table below.
+
+```{r}
+#| label: tbl-d2b-completion-summary
+#| tbl-cap: "Residual missing value completion after Random Forest imputation"
+
+# --- Identify residual missing values ---
+residual_summary <- df_imputed |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_completed") |>
+  filter(n_completed > 0) |>
+  mutate(
+    rule = vapply(
+      variable,
+      function(v) {
+        x <- df_imputed[[v]]
+        if (is.numeric(x)) "Median" else "Mode"
+      },
+      character(1)
+    )
+  ) |>
+  arrange(desc(n_completed))
+
+# --- Apply completion rules ---
+mode_value <- function(x) {
+  observed <- x[!is.na(x)]
+  tab <- table(observed)
+  names(tab)[which.max(tab)]
+}
+
+df_imputed <- df_imputed |>
+  mutate(across(
+    where(is.numeric),
+    ~ if_else(is.na(.), median(., na.rm = TRUE), .)
+  )) |>
+  mutate(across(
+    where(is.factor),
+    ~ {
+      mv <- mode_value(.)
+      replace(., is.na(.), mv)
+    }
+  ))
+
+# --- Build summary with post-completion integrity row -----------------------
+n_residual_after <- sum(is.na(df_imputed))
+
+completion_report <- residual_summary |>
+  bind_rows(
+    tibble(
+      variable    = "\u2014 Residual NAs after completion \u2014",
+      n_completed = n_residual_after,
+      rule        = if_else(n_residual_after == 0L,
+                            "Integrity check: passed",
+                            "Integrity check: review required")
+    )
+  )
+
+# --- Export summary for web resources ---
+export(
+  completion_report,
+  here("01_data", "02_processed", "web_resources", "04_05_tbl_d2b_completion_summary.rds")
+)
+
+# --- Present summary as GT table ---
+completion_report |>
+  gt() |>
+  tab_header(
+    title = "Residual Missing Value Completion",
+    subtitle = "Values completed by variable-specific rule after RF imputation"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_completed = "N Completed",
+    rule = "Completion Rule"
+  ) |>
+  fmt_number(
+    columns = n_completed,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: passed"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: review required"
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean auxiliary objects
+rm(residual_summary, completion_report, n_residual_after)
+```
+
+## D3. Post-Imputation Validation
+
+Validate the imputation results by:
+
+1. Confirming no missing values remain in candidate variables
+2. Checking that variable types are preserved
+3. Comparing distributions of imputed vs. observed values for key variables
+
+```{r}
+#| label: tbl-d3-validation-imputation
+#| tbl-cap: "Post-imputation validation summary"
+
+# =============================================================================
+# Confirm no missing values remain after imputation
+# =============================================================================
+
+# Calculate post-imputation missing
+missing_post_imputation <- df_imputed |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  )
+
+n_vars_still_missing <- sum(missing_post_imputation$n_missing > 0)
+total_missing_post <- sum(missing_post_imputation$n_missing)
+
+# =============================================================================
+# Validation summary table
+# =============================================================================
+
+# Check type preservation
+var_types_post <- tibble(
+  variable = names(df_imputed),
+  type_post = map_chr(df_imputed, ~ class(.)[1])
+)
+
+type_comparison <- var_types_pre |>
+  left_join(var_types_post, by = "variable") |>
+  mutate(type_preserved = type_pre == type_post)
+
+n_type_mismatches <- sum(!type_comparison$type_preserved)
+
+validation_imputation <- tibble(
+  Check = c(
+    "Variables with remaining missing",
+    "Total remaining missing cells",
+    "Variable type mismatches",
+    "Imputation status"
+  ),
+  Result = c(
+    as.character(n_vars_still_missing),
+    as.character(total_missing_post),
+    as.character(n_type_mismatches),
+    if (n_vars_still_missing == 0 & n_type_mismatches == 0) "✓ PASSED" else "✗ ISSUES DETECTED"
+  )
+)
+
+# Export data for web resources
+export(validation_imputation, here("01_data", "02_processed", "web_resources", "04_05_tbl_d3_validation_imputation.rds"))
+
+validation_imputation |>
+  gt() |>
+  tab_header(
+    title = "Post-Imputation Validation",
+    subtitle = "Quality checks on imputed dataset"
+  ) |>
+  cols_align(align = "left", columns = Check) |>
+  cols_align(align = "right", columns = Result) |>
+  tab_style(
+    style = cell_fill(color = "#ccffcc"),
+    locations = cells_body(rows = Check == "Imputation status" & Result == "✓ PASSED")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffcccc"),
+    locations = cells_body(rows = Check == "Imputation status" & Result == "✗ ISSUES DETECTED")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+```{r}
+#| label: d3-update-modeling-data
+
+# =============================================================================
+# Update modeling dataset with imputed candidate variables
+# =============================================================================
+
+# Get non-candidate columns from original df_modeling
+non_candidate_vars <- setdiff(names(df_modeling), variables_post_nzv)
+
+# Combine: non-candidate (original) + candidate (imputed)
+df_modeling_imputed <- df_modeling |>
+  select(all_of(non_candidate_vars)) |>
+  bind_cols(df_imputed)
+```
+
+## D4. Phase D Summary
+
+Summary of the imputation phase showing the transition from incomplete to complete data for candidate variables.
+
+```{r}
+#| label: tbl-d4-phase-d-summary
+#| tbl-cap: "Phase D imputation summary"
+
+# =============================================================================
+# Summary table for Phase D
+# =============================================================================
+
+# Calculate summary statistics
+n_vars_imputed <- length(variables_post_nzv)
+n_obs <- nrow(df_modeling_imputed)
+
+phase_d_summary <- tibble(
+  Stage = c(
+    "Candidate variables entering imputation",
+    "Observations",
+    "Missing cells before imputation",
+    "Missing cells after imputation"
+  ),
+  Value = c(
+    as.character(n_vars_imputed),
+    as.character(n_obs),
+    format(sum(is.na(df_modeling |> select(all_of(variables_post_nzv)))), big.mark = ","),
+    format(sum(is.na(df_modeling_imputed |> select(all_of(variables_post_nzv)))), big.mark = ",")
+  )
+)
+
+# Export data for web resources
+export(phase_d_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_d4_phase_d_summary.rds"))
+
+phase_d_summary |>
+  gt() |>
+  tab_header(
+    title = "Phase D: Imputation Summary",
+    subtitle = "Random Forest-based missing value imputation"
+  ) |>
+  cols_align(align = "left", columns = Stage) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_source_note(
+    md("Imputation method: Random Forest (impute_rf_parallel via missRanger/ranger)")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(14)
+  )
+```
+
+```{r}
+#| label: d4-phase-d-cleanup
+
+# =============================================================================
+# Phase D: Clean up auxiliary objects
+# =============================================================================
+
+rm(imputation_result,
+   var_types_pre, var_types_post, type_comparison, oob_error, error_names,
+   n_continuous, n_categorical,
+   oobe_display, oobe_assessment, pfc_display, pfc_assessment,
+   n_complete, n_with_missing, total_cells, total_missing_cells,
+   pct_total_missing, n_type_mismatches, n_vars_still_missing,
+   total_missing_post, missing_post_imputation, missing_pre_imputation,
+   n_vars_imputed, n_obs, non_candidate_vars,
+   pre_imputation_summary, imputation_results_summary, validation_imputation,
+   phase_d_summary)
+```
+
+---
+
+# Phase E: Block PCA
+
+This phase applies Principal Component Analysis to conceptually related variable groups, reducing dimensionality while preserving the majority of variance within each block. Variables that do not belong to any block will be evaluated individually in the subsequent selection pipeline.
+
+## Block PCA Strategy
+
+Blocks are defined based on:
+
+- **Conceptual coherence**: Variables measuring related constructs
+- **Expected collinearity**: High correlation within block justifies dimensionality reduction
+- **Interpretability trade-off**: Individual variable interpretation is sacrificed for composite scores
+
+Component retention criteria:
+
+- Eigenvalue > 1 (Kaiser criterion)
+- Cumulative variance explained > 80%
+- Minimum 1 component per block
+
+Variables required for biofortified maize assignment participate in PCA but are also preserved as individual columns in the final dataset.
+
+## E1. Define PCA Blocks
+
+Define conceptually related variable groups for Block PCA dimensionality reduction. Blocks are defined using pattern matching on variable names, restricted to variables that survived the missing values and NZV filters.
+
+Each block will be reduced to principal components that capture the majority of variance, while preserving interpretability at the block level.
+
+```{r}
+#| label: e1-define-pca-blocks
+
+# =============================================================================
+# Define PCA blocks based on variable name patterns
+# Only include variables that passed missing and NZV filters
+# =============================================================================
+
+# Helper function to extract block variables
+get_block_vars <- function(patterns, var_pool) {
+  var_pool[str_detect(var_pool, regex(paste(patterns, collapse = "|"), ignore_case = TRUE))]
+}
+
+# Define blocks with their patterns
+# Note: Dental block uses specific child-only patterns to exclude maternal variables
+pca_block_definitions <- list(
+  
+  vaccination = list(
+    description = "Child vaccination profile",
+    patterns = c("^bcg", "^hepb_", "^polio_", "^penta_", "^rota_", 
+                 "^neumo_", "^spr$", "^dpt_", "^anti_influenza")
+  ),
+  
+  wealth = list(
+    description = "Household wealth indicators",
+    patterns = c("^material_", "^bienes_", "^vivienda_", "^agua_", 
+                 "^cocina_", "^servicio_", "^tenencia_")
+  ),
+  
+  child_controls = list(
+    description = "Child health check-ups",
+    patterns = c("^control_")
+  ),
+  
+  fortification = list(
+    description = "Fortified food consumption",
+    patterns = c("^fortif_")
+  ),
+  
+  chispitas = list(
+    description = "Chispitas supplementation behavior",
+    patterns = c("^chispitas_")
+  ),
+  
+  illness = list(
+    description = "Recent illness indicators",
+    patterns = c("^tos_", "^diarrea_", "^fiebre_")
+  ),
+  
+  child_development = list(
+    description = "Child development milestones",
+    patterns = c("^di_")
+  ),
+  
+  dental_child = list(
+    description = "Child dental health",
+    # Child-specific patterns only (excludes maternal dientes_lav_*, dientes_nervioso, etc.)
+    patterns = c("^dientes_limpia", "^dientes_cepillo$", "^dientes_pasta$", 
+                 "^dientes_hilo$", "^dientes_palillos$", "^dientes_bicarb$",
+                 "^dientes_otro$", "^dientes_otro_esp$", "^dientes_consulta_an$",
+                 "^dientes_consulta_hosp$", "^dientes_consulta_cs$", 
+                 "^dientes_consulta_lab$", "^dientes_consulta_clin$",
+                 "^dientes_consulta_otro$", "^dientes_extraccion$", 
+                 "^dientes_rellenos$", "^dientes_coronitas$", "^dientes_limpieza$",
+                 "^dientes_salud_bucal$", "^dientes_prob_hablar$")
+  )
+)
+
+# Extract variables for each block from post-NZV pool
+pca_blocks <- map(pca_block_definitions, function(block_def) {
+  vars <- get_block_vars(block_def$patterns, variables_post_nzv)
+  list(
+    description = block_def$description,
+    patterns = block_def$patterns,
+    variables = vars,
+    n_variables = length(vars)
+  )
+})
+```
+
+```{r}
+#| label: tbl-e1-pca-blocks
+#| tbl-cap: "PCA block definitions and variable counts"
+
+# =============================================================================
+# Summary table of PCA blocks
+# =============================================================================
+
+df_blocks_summary <- map_dfr(names(pca_blocks), function(block_name) {
+  block <- pca_blocks[[block_name]]
+  tibble(
+    Block = block_name,
+    Description = block$description,
+    `N Variables` = block$n_variables,
+    `Sample Variables` = if (block$n_variables > 0) {
+      paste(head(block$variables, 3), collapse = ", ")
+    } else {
+      "—"
+    }
+  )
+})
+
+# Export data for web resources
+export(df_blocks_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_e1_pca_blocks.rds"))
+
+df_blocks_summary |>
+  gt() |>
+  tab_header(
+    title = "PCA Block Definitions",
+    subtitle = "Variable groups for dimensionality reduction"
+  ) |>
+  cols_align(align = "left", columns = c(Block, Description, `Sample Variables`)) |>
+  cols_align(align = "center", columns = `N Variables`) |>
+  tab_style(
+    style = cell_fill(color = "#ffffcc"),
+    locations = cells_body(rows = `N Variables` < 3)
+  ) |>
+  tab_source_note(
+    md("**Note:** Blocks with <3 variables (highlighted) will not undergo PCA")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: e1-identify-non-block-vars
+
+# =============================================================================
+# Identify variables not assigned to any PCA block
+# These will be evaluated individually in the selection pipeline
+# =============================================================================
+
+# Get all variables assigned to blocks
+variables_in_blocks <- unlist(map(pca_blocks, "variables"), use.names = FALSE)
+
+# Variables not in any block (includes maternal variables like dientes_lav_*, etc.)
+variables_non_block <- setdiff(variables_post_nzv, variables_in_blocks)
+```
+
+## E2. Execute Block PCA
+
+Apply PCA to each block with sufficient variables (≥3). For each block, retain components based on Kaiser criterion (eigenvalue > 1) with a minimum of 1 component per block.
+
+```{r}
+#| label: e2-execute-block-pca
+
+# =============================================================================
+# Execute PCA for each block with ≥3 variables
+# Retain components with eigenvalue > 1 (minimum 1 per block)
+# =============================================================================
+
+# Minimum variables required for PCA
+min_vars_for_pca <- 3
+
+# Identify blocks eligible for PCA
+blocks_for_pca <- names(pca_blocks)[map_int(pca_blocks, "n_variables") >= min_vars_for_pca]
+blocks_excluded <- names(pca_blocks)[map_int(pca_blocks, "n_variables") < min_vars_for_pca]
+
+# Execute PCA for each eligible block
+pca_results <- map(blocks_for_pca, function(block_name) {
+  
+  block_vars <- pca_blocks[[block_name]]$variables
+  
+  # Extract block data from imputed dataset
+  df_block <- df_modeling_imputed |>
+    select(all_of(block_vars)) |>
+    # Convert all variables to numeric (factors become integer codes)
+    mutate(across(everything(), ~ as.numeric(as.factor(.))))
+  
+  # Run PCA (scaled and centered)
+  pca_fit <- prcomp(df_block, center = TRUE, scale. = TRUE)
+  
+  # Calculate variance explained
+  var_explained <- pca_fit$sdev^2
+  pct_var <- var_explained / sum(var_explained) * 100
+  cumulative_var <- cumsum(pct_var)
+  
+  # Determine components to retain (eigenvalue > 1, minimum 1)
+  n_retain <- max(1, sum(var_explained > 1))
+  
+  # Extract retained component scores
+  scores <- pca_fit$x[, 1:n_retain, drop = FALSE]
+  colnames(scores) <- paste0("pc_", block_name, "_", 1:n_retain)
+  
+  list(
+    block = block_name,
+    pca_fit = pca_fit,
+    n_original_vars = length(block_vars),
+    n_components_retained = n_retain,
+    variance_explained = pct_var[1:n_retain],
+    cumulative_variance = cumulative_var[n_retain],
+    scores = as_tibble(scores)
+  )
+}) |>
+  set_names(blocks_for_pca)
+```
+
+```{r}
+#| label: tbl-e2-pca-results
+#| tbl-cap: "Block PCA dimensionality reduction results"
+
+# =============================================================================
+# Summary table of Block PCA results - Publication ready
+# =============================================================================
+
+df_pca_results <- map_dfr(names(pca_results), function(block_name) {
+  res <- pca_results[[block_name]]
+  tibble(
+    Block = block_name,
+    Description = pca_blocks[[block_name]]$description,
+    `Original Variables` = res$n_original_vars,
+    `Components Retained` = res$n_components_retained,
+    `Variance Retained (%)` = round(res$cumulative_variance, 1),
+    `Reduction (%)` = round((1 - res$n_components_retained / res$n_original_vars) * 100, 0)
+  )
+})
+
+# Add totals row
+df_pca_totals <- tibble(
+  Block = "TOTAL",
+  Description = "",
+  `Original Variables` = sum(df_pca_results$`Original Variables`),
+  `Components Retained` = sum(df_pca_results$`Components Retained`),
+  `Variance Retained (%)` = NA_real_,
+  `Reduction (%)` = round((1 - sum(df_pca_results$`Components Retained`) / 
+                              sum(df_pca_results$`Original Variables`)) * 100, 0)
+)
+
+df_pca_results_full <- df_pca_results |>
+  bind_rows(df_pca_totals)
+
+# Export data for web resources
+export(df_pca_results_full, here("01_data", "02_processed", "web_resources", "04_05_tbl_e2_pca_results.rds"))
+
+df_pca_results_full |>
+  gt() |>
+  tab_header(
+    title = "Block PCA Dimensionality Reduction",
+    subtitle = "Variance preserved while reducing variable count"
+  ) |>
+  cols_align(align = "left", columns = c(Block, Description)) |>
+  cols_align(align = "center", columns = c(`Original Variables`, `Components Retained`, 
+                                            `Variance Retained (%)`, `Reduction (%)`)) |>
+  fmt_number(columns = `Variance Retained (%)`, decimals = 1) |>
+  fmt_number(columns = `Reduction (%)`, decimals = 0) |>
+  sub_missing(missing_text = "—") |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Block == "TOTAL")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(
+      columns = `Variance Retained (%)`,
+      rows = `Variance Retained (%)` >= 70
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fff3e0"),
+    locations = cells_body(
+      columns = `Variance Retained (%)`,
+      rows = `Variance Retained (%)` < 70 & `Variance Retained (%)` >= 60
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(
+      columns = `Variance Retained (%)`,
+      rows = `Variance Retained (%)` < 60
+    )
+  ) |>
+  tab_source_note(
+    md("**Method:** Principal Component Analysis with Kaiser criterion (eigenvalue > 1)<br>
+        **Color coding:** Green ≥70%, Orange 60-70%, Red <60% variance retained")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: fig-e2-scree-plots
+#| fig-cap: "Scree plots showing eigenvalues and component retention by block"
+#| fig-width: 12
+#| fig-height: 10
+
+# =============================================================================
+# Scree plots for each PCA block
+# Shows eigenvalues and Kaiser criterion (eigenvalue > 1)
+# =============================================================================
+
+scree_data <- map_dfr(names(pca_results), function(block_name) {
+  pca_fit <- pca_results[[block_name]]$pca_fit
+  eigenvalues <- pca_fit$sdev^2
+  n_retain <- pca_results[[block_name]]$n_components_retained
+  tibble(
+    Block = block_name,
+    Component = 1:length(eigenvalues),
+    Eigenvalue = eigenvalues,
+    Retained = Component <= n_retain
+  )
+})
+
+# Export data for web resources
+export(scree_data, here("01_data", "02_processed", "web_resources", "04_05_fig_e2_scree_plots.rds"))
+
+scree_plots <- map(names(pca_results), function(block_name) {
+
+  pca_fit <- pca_results[[block_name]]$pca_fit
+  eigenvalues <- pca_fit$sdev^2
+  n_retain <- pca_results[[block_name]]$n_components_retained
+
+  df_scree <- tibble(
+    Component = 1:length(eigenvalues),
+    Eigenvalue = eigenvalues,
+    Retained = Component <= n_retain
+  )
+  
+  ggplot(df_scree, aes(x = Component, y = Eigenvalue)) +
+    geom_line(color = "grey50") +
+    geom_point(aes(color = Retained), size = 3) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+    scale_color_manual(values = c("FALSE" = "grey70", "TRUE" = "steelblue")) +
+    scale_x_continuous(breaks = function(x) seq(1, max(x), by = max(1, floor(max(x)/10)))) +
+    labs(
+      title = block_name,
+      subtitle = paste0(pca_results[[block_name]]$n_original_vars, " vars → ", 
+                        n_retain, " PCs (", 
+                        round(pca_results[[block_name]]$cumulative_variance, 1), "%)"),
+      x = "Component",
+      y = "Eigenvalue"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "grey40")
+    )
+})
+
+wrap_plots(scree_plots, ncol = 3)
+
+# Cleanup auxiliary objects
+rm(scree_plots, scree_data)
+```
+
+
+```{r}
+#| label: e2-build-pca-components-dataset
+
+# =============================================================================
+# Combine all PCA component scores into single dataset
+# =============================================================================
+
+# Bind all component scores
+df_pca_scores <- bind_cols(map(pca_results, "scores"))
+
+# Count total components created
+n_total_components <- ncol(df_pca_scores)
+n_original_vars_in_pca <- sum(map_int(pca_results, "n_original_vars"))
+```
+
+## E3. Update Modeling Dataset
+
+Replace original block variables with their PCA component scores. Variables not assigned to blocks and variables from excluded blocks remain as individual columns.
+
+Assignment variables are preserved as individual columns regardless of whether they were absorbed into PCA components.
+
+```{r}
+#| label: e3-update-dataset-with-pca
+
+# =============================================================================
+# Update modeling dataset: replace block variables with PCA components
+# =============================================================================
+
+# Get all variables that were transformed by PCA
+variables_transformed_by_pca <- unlist(map(pca_results, ~ pca_blocks[[.x$block]]$variables), 
+                                        use.names = FALSE)
+
+# Variables to keep as-is (not transformed, or from excluded blocks)
+variables_excluded_blocks <- unlist(map(blocks_excluded, ~ pca_blocks[[.x]]$variables),
+                                    use.names = FALSE)
+
+# Build updated dataset
+df_modeling_pca <- df_modeling_imputed |>
+  # Remove variables that were transformed by PCA
+  select(-all_of(variables_transformed_by_pca)) |>
+  # Add PCA component scores
+  bind_cols(df_pca_scores)
+
+# Verify assignment variables are preserved
+assignment_vars_present <- sum(variables_preserve_assignment %in% names(df_modeling_pca))
+```
+
+```{r}
+#| label: tbl-e3-pca-update-summary
+#| tbl-cap: "Dataset update after Block PCA"
+
+# =============================================================================
+# Summary of dataset transformation - Focused on candidate variables
+# =============================================================================
+
+pca_update_summary <- tibble(
+  Metric = c(
+    "Candidate variables post-NZV",
+    "— Variables in PCA blocks (transformed)",
+    "— Variables not in blocks (kept as-is)",
+    "PCA components created",
+    "Candidate variables after PCA",
+    "Assignment variables preserved"
+  ),
+  Value = c(
+    as.character(length(variables_post_nzv)),
+    as.character(length(variables_in_blocks)),
+    as.character(length(variables_non_block)),
+    as.character(n_total_components),
+    as.character(length(variables_non_block) + n_total_components),
+    paste0(assignment_vars_present, " of ", length(variables_preserve_assignment))
+  )
+)
+
+# Export data for web resources
+export(pca_update_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_e3_pca_update_summary.rds"))
+
+pca_update_summary |>
+  gt() |>
+  tab_header(
+    title = "Phase E: Candidate Variable Transformation",
+    subtitle = "Block PCA dimensionality reduction on candidate variables"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric %in% c("Candidate variables after PCA", 
+                                                  "Assignment variables preserved"))
+  ) |>
+  tab_style(
+    style = cell_text(indent = px(20)),
+    locations = cells_body(rows = str_starts(Metric, "—"))
+  ) |>
+  tab_source_note(
+    md("**Criterion:** Kaiser rule (eigenvalue > 1) with minimum 1 component per block")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+```{r}
+#| label: e3-phase-e-cleanup
+
+# =============================================================================
+# Phase E: Clean up auxiliary objects
+# =============================================================================
+
+rm(pca_block_definitions,
+   get_block_vars, df_blocks_summary, blocks_for_pca, blocks_excluded,
+   min_vars_for_pca, n_total_components, n_original_vars_in_pca,
+   variables_transformed_by_pca, variables_excluded_blocks,
+   assignment_vars_present, df_pca_results, df_pca_totals, df_pca_results_full,
+   pca_update_summary)
+```
+
+---
+
+# Phase F: Variable Selection
+
+This phase applies a systematic variable selection pipeline to identify the most relevant predictors for stunting modeling. The selection process follows three sequential steps:
+
+1. **Correlation filter**: Remove redundant variables with high pairwise correlation (r > 0.85)
+
+2. **Boruta feature selection**: Random Forest-based importance assessment on the continuous outcome
+
+3. **VIF verification**: Confirm absence of multicollinearity in the final predictor set
+
+Variables required for biofortified maize assignment are protected from elimination throughout this process.
+
+## F1. Correlation Filter
+
+Identify and remove highly correlated variables (r > 0.85) using caret::findCorrelation. This step reduces redundancy before Boruta, which assigns importance less reliably when variables are nearly collinear.
+
+The function identifies the variable to remove from each highly correlated pair based on mean absolute correlation with all other variables (removes the one with higher mean correlation).
+
+```{r}
+#| label: f1-prepare-correlation-matrix
+
+# =============================================================================
+# Prepare data for correlation analysis
+# Only candidate variables (non-block + PCA components)
+# =============================================================================
+
+# Get candidate variables after PCA
+# Non-block variables + PCA components
+pca_component_names <- names(df_pca_scores)
+
+variables_for_selection <- c(variables_non_block, pca_component_names)
+
+# Extract candidate data for correlation analysis
+df_for_correlation <- df_modeling_pca |>
+  select(all_of(variables_for_selection)) |>
+  # Ensure all numeric
+  mutate(across(everything(), ~ as.numeric(as.factor(.))))
+
+# Calculate correlation matrix
+cor_matrix <- cor(df_for_correlation, use = "pairwise.complete.obs")
+```
+
+```{r}
+#| label: f1-find-high-correlations
+
+# =============================================================================
+# Identify highly correlated variables (r > 0.85)
+# =============================================================================
+
+# Find variables to remove
+high_cor_threshold <- 0.85
+
+variables_high_cor <- findCorrelation(
+  cor_matrix, 
+  cutoff = high_cor_threshold,
+  names = TRUE,
+  verbose = FALSE
+)
+
+# Protect assignment variables from removal
+variables_to_remove_cor <- setdiff(variables_high_cor, variables_preserve_assignment)
+
+# Variables retained after correlation filter
+variables_post_cor <- setdiff(variables_for_selection, variables_to_remove_cor)
+```
+
+```{r}
+#| label: tbl-f1-correlation-filter
+#| tbl-cap: "Correlation filter results"
+
+# =============================================================================
+# Summary table of correlation filter
+# =============================================================================
+
+# Count protected variables that would have been removed
+n_protected <- length(intersect(variables_high_cor, variables_preserve_assignment))
+
+correlation_filter_summary <- tibble(
+  Metric = c(
+    "Variables entering correlation filter",
+    "Correlation threshold",
+    "Highly correlated variables identified",
+    "Protected assignment variables (kept)",
+    "Variables removed",
+    "Variables retained"
+  ),
+  Value = c(
+    as.character(length(variables_for_selection)),
+    paste0("r > ", high_cor_threshold),
+    as.character(length(variables_high_cor)),
+    as.character(n_protected),
+    as.character(length(variables_to_remove_cor)),
+    as.character(length(variables_post_cor))
+  )
+)
+
+# Export data for web resources
+export(correlation_filter_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_f1_correlation_filter.rds"))
+
+correlation_filter_summary |>
+  gt() |>
+  tab_header(
+    title = "Correlation Filter Results",
+    subtitle = "Removal of redundant variables (high pairwise correlation)"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "Variables retained")
+  ) |>
+  tab_source_note(
+    md("**Method:** caret::findCorrelation removes variable with higher mean absolute correlation from each pair")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(n_protected, correlation_filter_summary)
+```
+
+## F2. Boruta Feature Selection
+
+Apply Boruta algorithm to identify variables with confirmed predictive importance for the continuous height-for-age z-score. Boruta uses Random Forest to compare each variable's importance against "shadow" variables (permuted copies), iteratively classifying variables as Confirmed, Tentative, or Rejected.
+
+Selection runs on the continuous outcome, which preserves full distributional information; the binary stunting variable is a direct transformation of it (stunted = HAZ < -2).
+
+```{r}
+#| label: f2-run-boruta
+
+# =============================================================================
+# Prepare data for Boruta feature selection
+# =============================================================================
+
+# Build dataset with post-correlation variables + outcome
+df_for_boruta <- df_modeling_pca |>
+  select(all_of(c(variables_post_cor, "zlen"))) |>
+  # Convert all to numeric (factors become integer codes)
+  mutate(across(everything(), ~ as.numeric(as.factor(.))))
+
+# Verify no missing values
+n_missing_boruta <- sum(is.na(df_for_boruta))
+
+# =============================================================================
+# Run Boruta algorithm (ranger engine, multi-threaded)
+# =============================================================================
+
+set.seed(789)
+
+boruta_result <- Boruta::Boruta(
+  zlen ~ .,
+  data = df_for_boruta,
+  doTrace = 0,
+  maxRuns = 150,
+  getImp = Boruta::getImpRfZ,
+  num.threads = parallel::detectCores() - 2
+)
+
+# Extract decision statistics
+boruta_stats <- Boruta::attStats(boruta_result) |>
+  rownames_to_column("variable") |>
+  mutate(
+    decision = case_when(
+      decision == "Confirmed" ~ "Confirmed",
+      decision == "Tentative" ~ "Tentative",
+      decision == "Rejected" ~ "Rejected"
+    )
+  ) |>
+  arrange(desc(medianImp))
+```
+
+```{r}
+#| label: tbl-f2-boruta-results
+#| tbl-cap: "Boruta feature selection results"
+
+# =============================================================================
+# Summary table of Boruta results
+# =============================================================================
+
+boruta_summary <- boruta_stats |>
+  count(decision) |>
+  mutate(decision = factor(decision, levels = c("Confirmed", "Tentative", "Rejected"))) |>
+  arrange(decision)
+
+boruta_results_summary <- tibble(
+  Metric = c(
+    "Variables evaluated",
+    "Confirmed (relevant)",
+    "Tentative (borderline)",
+    "Rejected (not relevant)",
+    "Variables selected (Confirmed + Tentative)"
+  ),
+  Value = c(
+    as.character(nrow(boruta_stats)),
+    as.character(sum(boruta_stats$decision == "Confirmed")),
+    as.character(sum(boruta_stats$decision == "Tentative")),
+    as.character(sum(boruta_stats$decision == "Rejected")),
+    as.character(sum(boruta_stats$decision %in% c("Confirmed", "Tentative")))
+  )
+)
+
+# Export data for web resources
+export(boruta_results_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_f2_boruta_results.rds"))
+
+boruta_results_summary |>
+  gt() |>
+  tab_header(
+    title = "Boruta Feature Selection Results",
+    subtitle = "Variable importance assessment for ZLEN prediction"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "Variables selected (Confirmed + Tentative)")
+  ) |>
+  tab_source_note(
+    md("**Method:** Boruta with Random Forest")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(boruta_summary, boruta_results_summary)
+```
+
+```{r}
+#| label: fig-f2-boruta-importance
+#| fig-cap: "Variable importance from Boruta feature selection"
+#| fig-height: 12
+#| fig-width: 10
+
+# =============================================================================
+# Boruta importance plot - Selected variables only
+# =============================================================================
+
+# Filter only selected variables (Confirmed + Tentative)
+df_boruta_importance <- boruta_result$ImpHistory |>
+  as.data.frame() |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "importance"
+  ) |>
+  # Remove infinite values
+  filter(is.finite(importance)) |>
+  # Remove shadow variables for plotting
+  filter(!str_detect(variable, "^shadow")) |>
+  # Join with decisions
+  left_join(
+    boruta_stats |> select(variable, decision, medianImp),
+    by = "variable"
+  ) |>
+  # Keep only Confirmed and Tentative
+
+  filter(decision %in% c("Confirmed", "Tentative")) |>
+  # Factor for ordering
+  mutate(
+    decision = factor(decision, levels = c("Confirmed", "Tentative")),
+    variable = fct_reorder(variable, medianImp)
+  )
+
+# Export data for web resources
+export(df_boruta_importance, here("01_data", "02_processed", "web_resources", "04_05_fig_f2_boruta_importance.rds"))
+
+# Get shadow max threshold for reference line
+shadow_max_median <- boruta_result$ImpHistory |>
+  as.data.frame() |>
+  pull(shadowMax) |>
+  median(na.rm = TRUE)
+
+# Plot
+ggplot(df_boruta_importance, aes(x = importance, y = variable, fill = decision)) +
+  geom_boxplot(alpha = 0.4, outlier.size = 0.5) +
+  geom_vline(xintercept = shadow_max_median, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(
+    values = c(
+      "Confirmed" = "#2E7D32",
+      "Tentative" = "#F9A825"
+    ),
+    labels = c("Confirmed", "Tentative")
+  ) +
+  labs(
+    title = "Boruta Variable Importance",
+    subtitle = "Selected variables only (Confirmed + Tentative). Dashed line = shadow maximum threshold",
+    x = "Importance",
+    y = NULL,
+    fill = "Decision"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "bottom",
+    axis.text.y = element_text(size = 8),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Cleanup auxiliary objects
+rm(df_boruta_importance, shadow_max_median)
+```
+
+```{r}
+#| label: f2-extract-boruta-variables
+
+# =============================================================================
+# Extract selected variables (Confirmed + Tentative)
+# =============================================================================
+
+variables_boruta <- boruta_stats |>
+  filter(decision %in% c("Confirmed", "Tentative")) |>
+  pull(variable)
+
+# Ensure assignment variables are included (protect from exclusion)
+variables_post_boruta <- union(variables_boruta, 
+                                intersect(variables_preserve_assignment, variables_post_cor))
+```
+
+## F3. VIF Verification
+
+Verify multicollinearity among selected predictors using Variance Inflation Factor (VIF). While the correlation filter (F1) removed pairwise correlations > 0.85, VIF detects multicollinearity arising from linear combinations of multiple variables that pairwise correlation cannot capture.
+
+VIF measures how much the variance of a regression coefficient is inflated due to collinearity with other predictors. For categorical variables, we use Generalized VIF (GVIF) adjusted by degrees of freedom for comparability across variable types.
+
+Interpretation thresholds:
+
+- **VIF ≤ 5**: Acceptable - no concerning multicollinearity
+
+- **5 < VIF ≤ 10**: Moderate - monitor but typically acceptable for prediction models
+
+- **VIF > 10**: High - indicates problematic multicollinearity requiring review
+
+Variables above the high threshold are pruned iteratively: at each step the one with the lowest Boruta median importance among them is dropped and the VIF is recomputed on the remaining set. The correlation filter in F1 operates pairwise, so a construct captured through two separate survey items can pass it while still inflating the variance of both coefficients; this step resolves those cases and keeps whichever member carries more signal on the outcome. The table below reports the retained set, and any removed variables are listed after it.
+
+```{r}
+#| label: tbl-f3-vif-summary
+#| tbl-cap: "VIF Summary"
+
+# =============================================================================
+# F3. VIF Verification - Multicollinearity check on selected variables
+# =============================================================================
+
+# Prepare data for VIF calculation (requires numeric matrix)
+df_vif <- df_modeling_pca |>
+  select(all_of(variables_boruta)) |>
+  mutate(across(where(is.character), as.factor)) |>
+  mutate(across(everything(), ~ as.numeric(as.factor(.))))
+
+# Calculate VIF using linear model with dummy outcome
+df_vif_model <- df_vif |>
+  mutate(.row_id = row_number())
+
+# VIF for a given variable set, on the single-coefficient scale
+compute_vif <- function(variables) {
+  formula_vif <- as.formula(paste(".row_id ~", paste(variables, collapse = " + ")))
+  vif_values <- car::vif(lm(formula_vif, data = df_vif_model))
+
+  # Handle GVIF for factors (use GVIF^(1/(2*Df)) squared for comparability)
+  if (is.matrix(vif_values)) {
+    tibble(
+      variable = rownames(vif_values),
+      vif = vif_values[, "GVIF^(1/(2*Df))"]^2
+    )
+  } else {
+    tibble(
+      variable = names(vif_values),
+      vif = as.numeric(vif_values)
+    )
+  }
+}
+
+# Iterative pruning: while any variable exceeds the high-VIF threshold, drop the
+# one with the lowest Boruta importance among them
+vif_threshold <- 10
+max_vif_iterations <- 20L
+
+variables_vif_retained <- variables_boruta
+vif_dropped <- tibble(
+  variable = character(),
+  vif = numeric(),
+  median_imp = numeric()
+)
+
+for (i in seq_len(max_vif_iterations)) {
+  vif_results <- compute_vif(variables_vif_retained)
+
+  vif_above <- vif_results |>
+    filter(vif > vif_threshold) |>
+    left_join(
+      boruta_stats |> select(variable, medianImp),
+      by = join_by(variable)
+    ) |>
+    mutate(imp_rank = if_else(is.na(medianImp), -Inf, medianImp)) |>
+    arrange(imp_rank, desc(vif))
+
+  if (nrow(vif_above) == 0) break
+
+  vif_dropped <- bind_rows(
+    vif_dropped,
+    vif_above |>
+      slice(1) |>
+      transmute(variable, vif, median_imp = medianImp)
+  )
+
+  variables_vif_retained <- setdiff(variables_vif_retained, vif_above$variable[1])
+}
+
+vif_results <- vif_results |>
+  arrange(desc(vif)) |>
+  mutate(
+    status = case_when(
+      vif > 10 ~ "High",
+      vif > 5  ~ "Moderate", 
+      TRUE     ~ "Acceptable"
+    )
+  )
+
+# Summary counts
+n_high_vif <- sum(vif_results$vif > 10)
+n_moderate_vif <- sum(vif_results$vif > 5 & vif_results$vif <= 10)
+n_acceptable_vif <- sum(vif_results$vif <= 5)
+
+
+vif_summary <- tibble(
+  Metric = c(
+    "Variables evaluated",
+    "Acceptable (VIF ≤ 5)",
+    "Moderate (5 < VIF ≤ 10)",
+    "High (VIF > 10)",
+    "Maximum VIF",
+    "Mean VIF"
+  ),
+  Value = c(
+    nrow(vif_results),
+    n_acceptable_vif,
+    n_moderate_vif,
+    n_high_vif,
+    round(max(vif_results$vif), 2),
+    round(mean(vif_results$vif), 2)
+  )
+)
+
+# Export data for web resources
+export(vif_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_f3_vif_summary.rds"))
+
+vif_summary |>
+  gt() |>
+  tab_header(
+    title = "Phase F3: VIF Verification Summary",
+    subtitle = "Multicollinearity check on Boruta-selected variables"
+  ) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = Metric == "High (VIF > 10)" & Value != "0")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "Variables evaluated")
+  ) |>
+  tab_source_note(
+    source_note = "Method: VIF with GVIF adjustment for categorical variables"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(vif_values, n_high_vif, n_moderate_vif, n_acceptable_vif)
+```
+
+```{r}
+#| label: tbl-f3-vif-results
+#| tbl-cap: "VIF Analysis by Variable"
+
+# Export data for web resources
+export(vif_results, here("01_data", "02_processed", "web_resources", "04_05_tbl_f3_vif_results.rds"))
+
+vif_results |>
+  gt() |>
+  tab_header(
+    title = "Variance Inflation Factor Analysis",
+    subtitle = "Multicollinearity assessment for selected predictors"
+  ) |>
+  fmt_number(columns = vif, decimals = 2) |>
+  cols_label(
+    variable = "Variable",
+    vif = "VIF",
+    status = "Status"
+  ) |>
+  cols_align(align = "left", columns = variable) |>
+  cols_align(align = "right", columns = vif) |>
+  cols_align(align = "center", columns = status) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(rows = status == "High")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF9C4"),
+    locations = cells_body(rows = status == "Moderate")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#C8E6C9"),
+    locations = cells_body(rows = status == "Acceptable")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = vif > 10, columns = vif)
+  ) |>
+  tab_source_note(
+    source_note = "Thresholds: VIF > 10 high multicollinearity; VIF > 5 moderate concern"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-f3-vif-dropped
+#| tbl-cap: "Variables removed by the VIF pruning step"
+
+# Export data for web resources
+export(vif_dropped, here("01_data", "02_processed", "web_resources", "04_05_tbl_f3_vif_dropped.rds"))
+
+if (nrow(vif_dropped) == 0) {
+  tibble(Note = "No variable exceeded the high-VIF threshold") |>
+    gt() |>
+    tab_options(table.font.size = px(12))
+} else {
+  vif_dropped |>
+    gt() |>
+    tab_header(
+      title = "Variables Removed by VIF Pruning",
+      subtitle = "Lowest Boruta median importance among those above the threshold"
+    ) |>
+    fmt_number(columns = c(vif, median_imp), decimals = 2) |>
+    cols_label(
+      variable = "Variable",
+      vif = "VIF at removal",
+      median_imp = "Boruta median importance"
+    ) |>
+    cols_align(align = "left", columns = variable) |>
+    cols_align(align = "right", columns = c(vif, median_imp)) |>
+    tab_source_note(
+      source_note = "Removed in the order shown; the VIF is the value held at the iteration of removal"
+    ) |>
+    tab_options(
+      table.font.size = px(12),
+      heading.title.font.size = px(14),
+      heading.subtitle.font.size = px(12)
+    )
+}
+```
+
+```{r}
+#| label: f3-final-variable-set
+
+# =============================================================================
+# Final variable set after VIF verification
+# =============================================================================
+
+variables_post_vif <- variables_vif_retained
+n_variables_final <- length(variables_post_vif)
+```
+
+```{r}
+#| label: f3-phase-f-cleanup
+
+# Phase F cleanup
+rm(df_vif, df_vif_model, compute_vif, vif_summary, vif_above)
+```
+
+---
+
+# Phase G: Output Generation
+
+Export final datasets and transformation objects required for model training and synthetic population generation.
+
+
+## G1. Build Pre-PCA Dataset
+
+This dataset preserves the imputed data before the Block PCA transformation, with all original variables that participated in the PCA blocks. This is required for synthetic population generation, where we need to generate synthetic values for original variables and then apply the saved PCA transformations.
+
+```{r}
+#| label: g1-build-pre-pca-dataset
+
+# =============================================================================
+# G1. Build Pre-PCA Dataset for Synthetic Population Generation
+# =============================================================================
+
+# Identify columns to use from each source:
+# - From df_modeling: header, outcome, assignment, nutritional (non-imputed)
+# - From df_modeling_imputed: candidate variables (imputed)
+
+# Variables that exist in both - use imputed version
+vars_overlap <- intersect(names(df_modeling), variables_post_nzv)
+
+# Build pre-PCA dataset
+df_pre_pca <- df_modeling |>
+  # Keep all columns EXCEPT those that will come from imputed data
+
+  select(-any_of(vars_overlap)) |>
+  # Join with imputed candidate variables using header identifiers
+  left_join(
+    df_modeling_imputed |>
+      select(all_of(variables_header), all_of(variables_post_nzv)),
+    by = variables_header
+  )
+
+# Clean up
+rm(vars_overlap)
+```
+
+## G2. Build Training Dataset
+
+This dataset contains the final predictor set for model training: header variables, outcomes, Boruta-selected predictors (including PCA components), and protected variables (assignment and nutritional) preserved individually.
+
+```{r}
+#| label: g2-build-training-dataset
+
+# =============================================================================
+# G2. Build Training Dataset for Stunting Models
+# =============================================================================
+
+# Get PCA component names
+pca_component_vars <- names(df_pca_scores)
+
+# Final predictor set combines:
+# 1. Boruta-selected variables (VIF-verified)
+# 2. Assignment variables (protected)
+# 3. Nutritional variables (protected)
+final_predictors <- variables_post_vif |>
+  union(variables_preserve_assignment) |>
+  union(variables_nutritional)
+
+# Separate predictors by source
+predictors_from_pca <- intersect(final_predictors, pca_component_vars)
+predictors_from_imputed <- intersect(final_predictors, variables_non_block)
+predictors_from_original <- intersect(
+  final_predictors, 
+  c(variables_preserve_assignment, variables_nutritional)
+)
+
+# Variables to get from imputed dataset:
+# Boruta non-block vars EXCLUDING assignment vars (to avoid .x/.y suffixes)
+vars_to_join_from_imputed <- setdiff(predictors_from_imputed, 
+                                      variables_preserve_assignment)
+
+# Build training dataset
+df_training <- df_modeling |>
+  # Select header, outcomes, and protected variables only
+  select(
+    all_of(variables_header),
+    all_of(variables_outcome),
+    any_of(variables_preserve_assignment),
+    any_of(variables_nutritional)
+  ) |>
+  # Add Boruta-selected non-block vars from IMPUTED dataset
+  # EXCLUDING assignment vars to avoid duplicate columns
+  left_join(
+    df_modeling_imputed |>
+      select(all_of(variables_header), any_of(vars_to_join_from_imputed)),
+    by = variables_header
+  ) |>
+  # Add PCA components (row-aligned with df_modeling)
+  bind_cols(
+    df_pca_scores |> select(any_of(predictors_from_pca))
+  )
+
+# Clean up
+rm(vars_to_join_from_imputed)
+```
+
+## G3. Export Datasets and Transformation Objects
+
+Export all outputs required for downstream analysis: training dataset, pre-PCA dataset for synthetic population generation, and PCA transformation objects.
+
+```{r}
+#| label: g3-export-parquet
+
+# =============================================================================
+# G3a. Export Datasets as Parquet
+# =============================================================================
+
+write_parquet(
+  df_training,
+  here("01_data", "02_processed", 
+       "transfer", "04_05_sivesnu_stunting_modeling.parquet")
+)
+
+write_parquet(
+  df_pre_pca,
+  here("01_data", "02_processed", 
+       "transfer", "04_05_sivesnu_pre_pca.parquet")
+)
+```
+
+```{r}
+#| label: g3-export-rds
+
+# =============================================================================
+# G3b. Export PCA Transformation Objects (RDS)
+# =============================================================================
+
+saveRDS(
+  pca_results,
+  here("01_data", "02_processed", 
+       "models", "04_05_pca_transforms.rds")
+)
+
+saveRDS(
+  pca_blocks,
+  here("01_data", "02_processed", 
+       "models", "04_05_pca_block_definitions.rds")
+)
+
+# Export the selected predictors as a standalone RDS for the 04_06 formula
+# builder. This is the set that survives the full selection pipeline, Boruta
+# followed by the VIF pruning, so the formula is built on predictors free of
+# the inflated variances reported in F3. The complete selected_variables.rds
+# kept below remains the authoritative inventory of every variable set
+# produced by this script.
+saveRDS(
+  variables_post_vif,
+  here("01_data", "02_processed",
+       "models", "04_05_boruta_selected_variables.rds")
+)
+
+saveRDS(
+  list(
+    variables_header = variables_header,
+    variables_outcome = variables_outcome,
+    variables_preserve_assignment = variables_preserve_assignment,
+    variables_nutritional = variables_nutritional,
+    variables_post_nzv = variables_post_nzv,
+    variables_non_block = variables_non_block,
+    variables_in_blocks = variables_in_blocks,
+    variables_boruta = variables_boruta,
+    variables_post_vif = variables_post_vif,
+    final_predictors = final_predictors
+  ),
+  here("01_data", "02_processed", 
+       "models", "04_05_selected_variables.rds")
+)
+```
+
+## G4. Output Summary
+
+```{r}
+#| label: tbl-g4-output-summary
+#| tbl-cap: "Output files generated by this script"
+
+# =============================================================================
+# G4. Output Summary Table
+# =============================================================================
+
+output_summary <- tibble(
+  File = c(
+    "04_05_sivesnu_stunting_modeling.parquet",
+    "04_05_sivesnu_pre_pca.parquet",
+    "04_05_pca_transforms.rds",
+    "04_05_pca_block_definitions.rds",
+    "04_05_boruta_selected_variables.rds",
+    "04_05_selected_variables.rds"
+  ),
+  Location = c(
+    "transfer/",
+    "transfer/",
+    "models/",
+    "models/",
+    "models/",
+    "models/"
+  ),
+  Description = c(
+    "Training dataset with selected predictors + PCA components",
+    "Pre-PCA dataset for synthetic population generation",
+    "PCA transformation objects (prcomp) for each block",
+    "Block definitions (variable lists per block)",
+    "Boruta-selected variables (Confirmed + Tentative)",
+    "Variable selection results at each pipeline stage"
+  ),
+  Contents = c(
+    glue("{nrow(df_training)} obs × {ncol(df_training)} vars"),
+    glue("{nrow(df_pre_pca)} obs × {ncol(df_pre_pca)} vars"),
+    glue("{length(pca_results)} PCA block transforms"),
+    glue("{length(pca_blocks)} block definitions"),
+    glue("{length(variables_boruta)} variables"),
+    "10 variable vectors"
+  ),
+  Purpose = c(
+    "Model training (Phase 4)",
+    "Synthetic population generation",
+    "Apply PCA to synthetic data via predict()",
+    "Identify variables per block",
+    "Automated formula construction in 04_06 / 04_07",
+    "Documentation and downstream reference"
+  )
+)
+
+# Export data for web resources
+export(output_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_g4_output_summary.rds"))
+
+output_summary |>
+  gt() |>
+  tab_header(
+    title = "Phase G: Output Files Summary",
+    subtitle = "Files generated for downstream analysis"
+  ) |>
+  cols_align(align = "left", columns = c(File, Location, Description, Purpose)) |>
+  cols_align(align = "center", columns = Contents) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = File)
+  ) |>
+  tab_source_note(
+    source_note = "All files saved relative to project root via here()"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(output_summary)
+```
+
+## G5. Pipeline Summary
+
+```{r}
+#| label: tbl-g5-pipeline-summary
+#| tbl-cap: "Complete variable selection pipeline summary"
+
+# =============================================================================
+# G5. Complete Pipeline Summary
+# =============================================================================
+
+pipeline_summary <- tibble(
+  Phase = c(
+    "A1-A2. Data Loading",
+    "A3. Dictionary Audit",
+    "A4. Data Merge",
+    "B. Variable Classification",
+    "C1. Missing Values Filter",
+    "C2. Near-Zero Variance Filter",
+    "D. Imputation (Random Forest)",
+    "E. Block PCA",
+    "F1. Correlation Filter",
+    "F2. Boruta Selection",
+    "F3. VIF Verification",
+    "G. Final Output"
+  ),
+  Input = c(
+    "Base dataset + SIVESNU tables",
+    "Loaded SIVESNU tables",
+    "Audited SIVESNU tables + base dataset",
+    "Merged dataset",
+    "All candidate variables",
+    "Post-missing variables",
+    "Post-NZV variables",
+    "Imputed variables",
+    "Post-PCA variables",
+    "Post-correlation variables",
+    "Post-Boruta variables",
+    "Final predictor set"
+  ),
+  Output = c(
+    glue("{nrow(df_base)} base observations"),
+    "Out-of-domain values recoded to NA",
+    glue("{nrow(df_child_merged)} observations"),
+    glue("{length(variables_header)} header + {length(variables_outcome)} outcome"),
+    glue("{length(variables_post_missing)} variables retained"),
+    glue("{length(variables_post_nzv)} variables retained"),
+    "Complete data (no NAs)",
+    glue("{ncol(df_pca_scores)} PCA components"),
+    glue("{length(variables_post_cor)} variables retained"),
+    glue("{length(variables_boruta)} variables selected"),
+    glue("{length(variables_post_vif)} variables verified"),
+    glue("{length(final_predictors)} final predictors")
+  ),
+  Method = c(
+    "read_parquet + clean_names + zap_*",
+    "Domain-only validation per source table",
+    "Fuzzy merge on household + age ± 1 + sex",
+    "Pattern-based classification",
+    "> 35% NA threshold",
+    "caret::nearZeroVar",
+    "Random Forest (impute_rf_parallel, ntree=50, maxiter=5)",
+    "Kaiser criterion (eigenvalue > 1)",
+    "caret::findCorrelation (r > 0.85)",
+    "Boruta on ZLEN (maxRuns=150, ranger engine)",
+    "car::vif (GVIF adjustment)",
+    "Union: Boruta + assignment + nutritional"
+  )
+)
+
+# Export data for web resources
+export(pipeline_summary, here("01_data", "02_processed", "web_resources", "04_05_tbl_g5_pipeline_summary.rds"))
+
+pipeline_summary |>
+  gt() |>
+  tab_header(
+    title = "Variable Selection Pipeline Summary",
+    subtitle = "Complete processing workflow from raw data to final predictors"
+  ) |>
+  cols_align(align = "left", columns = c(Phase, Input, Output, Method)) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Phase == "G. Final Output")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Phase == "G. Final Output")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(pipeline_summary)
+```
+
+---
+
+# Notes
+
+## Methodological Decisions
+
+### Dictionary Audit
+
+Each SIVESNU 2018 source table (nino, mujer, hogar, miembros) is audited independently against an operational data dictionary that declares, for every variable in the table, its type (factor, binary, numeric continuous, numeric integer, id, date, text) and its universe of valid values (factor levels for categorical, plausible numeric bounds for continuous and integer). Before the audit, character columns are loaded with whitespace trimming applied uniformly via `str_trim`, normalizing fixed-width string padding inherited from the SAS/STATA exports of the original survey. The audit applies a single rule: any value outside the declared universe is replaced with NA. Empty strings in character columns are normalized to NA before the comparison. The rule is applied uniformly regardless of whether out-of-domain values correspond to documented non-response codes, sentinel values, or artefacts from upstream transformations. Because each table is audited against its own dictionary subset, variables that share names across tables but use different encodings (such as `fies1` in `hogar` with codes `1/2/98` versus a derived `fies1` in the modeling pipeline with codes `0/1`) are validated against the universe corresponding to their actual source. The audit runs at the start of Phase A, before the merge, so the integrated dataset is built from already-sanitized inputs and all downstream stages operate on data whose semantic domain is fully under control. The dictionary lives at `02_code/_config/sivesnu_data_dictionary.csv` and is loaded via `load_data_dictionary()`; the audit itself is implemented in `audit_variables_against_dictionary()`.
+
+### Missing Value Threshold (35%)
+
+Based on Van Buuren (2018) and Madley-Dowd et al. (2019), variables with more than 35% missing values were excluded prior to imputation. This threshold balances information retention with imputation reliability.
+
+### Boruta on the Continuous Outcome
+
+Feature selection runs on the continuous height-for-age z-score, which preserves full distributional information. The binary stunting variable is a direct transformation of it (stunted = HAZ < -2), so selection on the continuous outcome captures the same predictive relationships without the information loss of dichotomization.
+
+### Block PCA Strategy
+
+Variables were grouped into conceptually coherent blocks (vaccination, wealth, health controls, etc.) and reduced via PCA to minimize multicollinearity while preserving construct interpretability. The Kaiser criterion (eigenvalue > 1) determined component retention, with a minimum of 1 component per block.
+
+### Protected Variable Sets
+
+Two variable sets are protected throughout the selection pipeline and preserved as individual columns in the final dataset:
+
+- **Assignment variables** (`variables_preserve_assignment`): Required for biofortified maize allocation and downstream stunting modeling (ruralurbano, departamento, gps_altitud, ocupacion_hogar, fies_rasch_score)
+- **Nutrient variables** (`variables_nutritional`): Core pipeline outputs representing dietary intake estimates that must be preserved for impact evaluation
+
+## Terminology
+
+The dataset columns `hfa` and `zlen` carry the anthropometric outcome as it is
+named in the SIVESNU source. In the published outputs the continuous
+height-for-age z-score is reported as **HAZ** and the binary variable
+(HAZ < -2) as **stunting**.

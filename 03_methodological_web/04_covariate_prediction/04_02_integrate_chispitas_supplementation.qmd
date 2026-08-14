@@ -1,0 +1,635 @@
+---
+title: "Integrating Micronutrient Supplementation"
+subtitle: "Module 4: Covariate Prediction"
+---
+
+## Overview
+
+Guatemala's Chispitas program distributes Multiple Micronutrient Powders (MNP) to
+children 6–59 months through the public health system. These sachets provide
+iron, zinc, and other micronutrients that complement dietary intake — a critical
+intervention in a population where maize-based diets often fall short of
+requirements.
+
+To accurately model the relationship between nutrient intake and stunting risk,
+we must account for supplementation alongside dietary intake. This requires
+understanding not just program coverage, but actual consumption patterns: Did
+the household receive Chispitas? Did caregivers administer them? How much of
+each sachet was consumed?
+
+This module integrates Chispitas contributions through a **three-level adherence
+cascade**:
+
+1. **Access** — Did the household obtain Chispitas?
+2. **Administration** — Did caregivers give sachets to the child?
+3. **Dosing compliance** — What proportion of each sachet was consumed?
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  ggsankey,           # Sankey diagram visualizations
+  cowplot,            # Combine multiple plots
+  ggpubr,             # Extract legends from ggplot
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by framework 04_02).
+
+tbl_c1_access_ever <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_02_tbl_c1_access_ever.rds"),
+  trust = TRUE
+)
+
+tbl_c2_access_6months <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_02_tbl_c2_access_6months.rds"),
+  trust = TRUE
+)
+
+tbl_c3_administration <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_02_tbl_c3_administration.rds"),
+  trust = TRUE
+)
+
+tbl_c4_dosing_compliance <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_02_tbl_c4_dosing_compliance.rds"),
+  trust = TRUE
+)
+
+fig_c5_sankey_adherence <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_02_fig_c5_sankey_adherence.rds"),
+  trust = TRUE
+)
+
+tbl_d2_chispitas_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_02_tbl_d2_chispitas_summary.rds"),
+  trust = TRUE
+)
+
+fig_e_distribution_comparison <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "04_02_fig_e_distribution_comparison.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Cascade retention rates (from c1-c4 weighted distributions)
+pct_access_ever <- tbl_c1_access_ever |>
+  filter(access_ever == "Yes, ever obtained") |>
+  pull(percentage)
+
+pct_access_6months <- tbl_c2_access_6months |>
+  filter(access_6months == "Access in 6 months") |>
+  pull(percentage)
+
+pct_administration <- tbl_c3_administration |>
+  filter(administration == "Gave part or all of the sachets") |>
+  pull(percentage)
+
+# Dosing compliance breakdown (% by category among administered)
+pct_dosing_all <- tbl_c4_dosing_compliance |>
+  filter(dosing_compliance == "All") |>
+  pull(percentage)
+
+pct_dosing_more_half <- tbl_c4_dosing_compliance |>
+  filter(dosing_compliance == "More than half") |>
+  pull(percentage)
+
+pct_dosing_half <- tbl_c4_dosing_compliance |>
+  filter(dosing_compliance == "Half") |>
+  pull(percentage)
+
+pct_dosing_less_half <- tbl_c4_dosing_compliance |>
+  filter(dosing_compliance == "Less than half") |>
+  pull(percentage)
+
+# Adherence factors from summary
+mean_adherence_recipients <- tbl_d2_chispitas_summary |>
+  pull(mean_adherence_recipients)
+
+mean_adherence_all <- tbl_d2_chispitas_summary |>
+  pull(mean_adherence_all)
+
+pct_recipients <- tbl_d2_chispitas_summary |>
+  pull(pct_recipients)
+
+# Administration gap = 100 - pct_administration (among those with 6m access)
+pct_admin_gap <- 100 - pct_administration
+```
+
+
+## Chispitas Program Context
+
+### Nutritional Composition
+
+Each Chispitas sachet contains 15 micronutrients following WHO/UNICEF MNP
+specifications. For this analysis, we focus on iron and zinc — the micronutrients
+most relevant to stunting and directly comparable to biofortified maize
+improvements [@INCAP2016_Chispitas].
+
+| Micronutrient | Content per Sachet |
+|---------------|-------------------|
+| Iron (ferrous fumarate) | 10 mg |
+| Zinc (zinc gluconate) | 4.1 mg |
+
+### Distribution Protocol
+
+The program distributes 60 sachets every ~180 days, intended for daily consumption
+during 60 consecutive days. To convert this episodic pattern to average daily
+intake (compatible with 24-hour recall methodology), we apply a 1/3 adjustment:
+
+- **Effective daily Fe**: 10 mg × 1/3 = 3.33 mg/day
+- **Effective daily Zn**: 4.1 mg × 1/3 = 1.37 mg/day
+
+
+## Population and Variable Preparation
+
+### Target Population
+
+Chispitas are indicated for children 6–59 months — old enough for complementary
+feeding (where sachets are mixed into food) but within the critical window for
+micronutrient intervention. Children under 6 months are excluded as exclusive
+breastfeeding is assumed during this period.
+
+### Adherence Variables
+
+SIVESNU 2018 [@INCAP2020_SIVESNU] captures supplementation behavior through four 
+key variables:
+
+| Variable | Question | Cascade Level |
+|----------|----------|---------------|
+| `chispitas_vez` | Ever obtained Chispitas? | Level 1: Access |
+| `chispitas_6mes` | Obtained in last 6 months? | Level 1b: Recent access |
+| `chispitas_todo_parte` | Gave sachets to child? | Level 2: Administration |
+| `chispitas_sobresdelpaquete` | How much of sachet consumed? | Level 3: Dosing |
+
+::: {.callout-note}
+## Variable Interpretation
+For `chispitas_6mes`, NA values indicate **no barrier reported** (access
+maintained), not missing data. Only explicit "no" responses indicate access
+interruption. This interpretation follows the official SIVESNU 2018 report
+coding (INCAP, 2020).
+:::
+
+
+## Adherence Cascade Analysis
+
+The cascade quantifies attrition at each stage from program access to actual
+consumption of micronutrient powder. Each level filters the population, and the
+final effective coverage is the one that remains after cumulative dropout.
+
+### Level 1: Lifetime Access
+
+```{r}
+#| label: tbl-c1-access-ever
+#| tbl-cap: "Ever Obtained Chispitas"
+
+tbl_c1_access_ever |>
+  gt() |>
+  tab_header(
+    title = "Ever Obtained Chispitas",
+    subtitle = "Variable: chispitas_vez | Lifetime exposure to supplementation program"
+  ) |>
+  cols_label(
+    access_ever = "Response",
+    n_survey = "N (survey)",
+    percentage = "Percentage"
+  ) |>
+  fmt_number(columns = n_survey, decimals = 0) |>
+  fmt_number(columns = percentage, decimals = 1, pattern = "{x}%") |>
+  tab_source_note(
+    source_note = "Source: SIVESNU 2018 | Note: Survey-weighted estimates using expanded sample."
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+### Level 1b: Recent Access (Last 6 Months)
+
+```{r}
+#| label: tbl-c2-access-6months
+#| tbl-cap: "Barriers to Access in Last 6 Months"
+
+tbl_c2_access_6months |>
+  gt() |>
+  tab_header(
+    title = "Access Status in Last 6 Months",
+    subtitle = "Variable: chispitas_6mes | Among households that ever obtained Chispitas"
+  ) |>
+  cols_label(
+    access_6months = "Access Status",
+    n_survey = "N (survey)",
+    percentage = "Percentage"
+  ) |>
+  fmt_number(columns = n_survey, decimals = 0) |>
+  fmt_number(columns = percentage, decimals = 1, pattern = "{x}%") |>
+  tab_source_note(
+    source_note = "Source: SIVESNU 2018 | Note: NA values interpreted as 'access maintained' per official SIVESNU report coding."
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+### Level 2: Administration
+
+```{r}
+#| label: tbl-c3-administration
+#| tbl-cap: "Dosing Compliance Status"
+
+tbl_c3_administration |>
+  gt() |>
+  tab_header(
+    title = "Dosing Compliance Status",
+    subtitle = "Variable: chispitas_todo_parte | Among households with Chispitas access"
+  ) |>
+  cols_label(
+    administration = "Dosing Behavior",
+    n_survey = "N (survey)",
+    percentage = "Percentage"
+  ) |>
+  fmt_number(columns = n_survey, decimals = 0) |>
+  fmt_number(columns = percentage, decimals = 1, pattern = "{x}%") |>
+  tab_source_note(
+    source_note = "Source: SIVESNU 2018 | Note: Analysis restricted to households with confirmed Chispitas access."
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+### Level 3: Dosing Compliance
+
+```{r}
+#| label: tbl-c4-dosing-compliance
+#| tbl-cap: "Sachet Consumption Quantity"
+
+tbl_c4_dosing_compliance |>
+  gt() |>
+  tab_header(
+    title = "Sachet Consumption Quantity",
+    subtitle = "Variable: chispitas_sobresdelpaquete | Among households that administered Chispitas"
+  ) |>
+  cols_label(
+    dosing_compliance = "Quantity Consumed",
+    n_survey = "N (survey)",
+    percentage = "Percentage"
+  ) |>
+  fmt_number(columns = n_survey, decimals = 0) |>
+  fmt_number(columns = percentage, decimals = 1, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = dosing_compliance == "All")
+  ) |>
+  tab_source_note(
+    source_note = "Source: SIVESNU 2018 | Note: Full compliance (highlighted) indicates child received 100% of intended micronutrient dose."
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+### Cascade Visualization
+
+```{r}
+#| label: fig-c5-sankey-adherence
+#| fig-cap: "Adherence Journey: From Access to Compliance Patterns"
+#| fig-alt: >
+#|   Sankey diagram tracing households across four left-to-right stages of the
+#|   Chispitas adherence cascade: lifetime access, access in the last 6 months,
+#|   administration to the child, and final adherence level. Nodes at each stage
+#|   are labelled (for example "Ever obtained", "Access in 6 months", "Gave part
+#|   or all", "Full adherence" versus "Partial adherence"), and the width of each
+#|   flowing band is proportional to the number of households following that path.
+#|   The bands narrow and split at successive stages, showing progressive attrition
+#|   from broad program access down to full dosing compliance.
+#| fig-height: 8
+#| fig-width: 10
+
+# Create long format for ggsankey from the exported stage dataframe
+sankey_long <- fig_c5_sankey_adherence |>
+  make_long(stage1, stage2, stage3, stage4)
+
+# Define color palette (consistent Azahar blues)
+sankey_colors <- c(
+  "Ever obtained" = "#1a3a5c",
+  "Access in 6 months" = "#4a90c2",
+  "No access in 6 months" = "#a8d4f0",
+  "Unknown" = "#d3d3d3",
+  "Gave part or all" = "#4a90c2",
+  "Did NOT give any" = "#a8d4f0",
+  "No data" = "#d3d3d3",
+  "Full adherence" = "#1a3a5c",
+  "Partial adherence" = "#7ab8e8"
+)
+
+# Create Sankey plot
+ggplot(sankey_long, aes(
+  x = x,
+  next_x = next_x,
+  node = node,
+  next_node = next_node,
+  fill = factor(node),
+  label = node
+)) +
+  geom_sankey(
+    flow.alpha = 0.5,
+    node.color = "gray30",
+    smooth = 8,
+    show.legend = FALSE
+  ) +
+  geom_sankey_label(
+    size = 3.5,
+    color = "black",
+    fill = "white",
+    alpha = 0.9,
+    na.rm = TRUE
+  ) +
+  scale_fill_manual(values = sankey_colors, na.value = "#d3d3d3") +
+  labs(
+    title = "Adherence Journey: From Access to Compliance Patterns",
+    subtitle = "Flow restricted to households that 'Ever obtained' Chispitas, showing dosing behavior and consolidated reasons",
+    x = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11)
+  )
+```
+
+
+## Nutritional Integration
+
+### Adherence Factor Assignment
+
+Children who received Chispitas are assigned adherence factors based on reported
+dosing compliance:
+
+```{r}
+#| label: tbl-adherence-factor-mapping
+
+tbl_c4_dosing_compliance |>
+  filter(dosing_compliance %in% c("All", "More than half", "Half", "Less than half")) |>
+  mutate(
+    adherence_factor = case_when(
+      dosing_compliance == "All" ~ 1.00,
+      dosing_compliance == "More than half" ~ 0.75,
+      dosing_compliance == "Half" ~ 0.50,
+      dosing_compliance == "Less than half" ~ 0.25
+    )
+  ) |>
+  select(dosing_compliance, percentage, adherence_factor) |>
+  gt() |>
+  cols_label(
+    dosing_compliance = "Dosing Compliance",
+    percentage = "% of Recipients",
+    adherence_factor = "Adherence Factor"
+  ) |>
+  fmt_number(columns = percentage, decimals = 1, pattern = "{x}%") |>
+  fmt_number(columns = adherence_factor, decimals = 2) |>
+  tab_options(
+    table.font.size = 12,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-note}
+## Interpreting Adherence Factors
+These factors represent the proportion of each sachet consumed per administration
+event, not temporal adherence. A child receiving "half the sachet" daily receives
+approximately 50% of the intended micronutrient dose during supplementation periods.
+:::
+
+The effective daily contribution combines the protocol adjustment (1/3) with
+individual adherence. For example:
+
+- **Full compliance**: 10 mg Fe × 1/3 × 1.00 = 3.33 mg Fe/day.
+- **Half compliance**: 10 mg Fe × 1/3 × 0.50 = 1.67 mg Fe/day.
+
+### Integration Summary
+
+```{r}
+#| label: tbl-d2-chispitas-summary
+#| tbl-cap: "Chispitas Supplementation Summary"
+
+tbl_d2_chispitas_summary |>
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value") |>
+  mutate(
+    Metric = case_when(
+      Metric == "total_children" ~ "Total children (6-59 months)",
+      Metric == "n_recipients" ~ "Chispitas recipients",
+      Metric == "pct_recipients" ~ "Recipients (%)",
+      Metric == "mean_adherence_all" ~ "Mean adherence factor (all children)",
+      Metric == "mean_adherence_recipients" ~ "Mean adherence factor (recipients only)",
+      Metric == "mean_fe_contribution" ~ "Mean effective Fe contribution (mg/day)",
+      Metric == "mean_zn_contribution" ~ "Mean effective Zn contribution (mg/day)"
+    )
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Chispitas Supplementation Summary",
+    subtitle = "Effective coverage and nutrient contribution (children 6-59 months)"
+  ) |>
+  cols_label(
+    Metric = "Indicator",
+    Value = "Value"
+  ) |>
+  fmt_number(columns = Value, decimals = 2) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  ) |>
+  tab_source_note(
+    source_note = "Source: SIVESNU 2018 | Note: Recipients = children with access who received part or all of sachets."
+  )
+```
+
+::: {.callout-tip}
+## Why Integrate into Non-Maize?
+Chispitas are added to the non-maize intake component to maintain separation
+between dietary sources. This structure enables direct comparison: biofortification
+modifies the nutrient composition of maize, while supplementation modifies the
+non-maize totals.
+:::
+
+
+## Validation
+
+```{r}
+#| label: fig-e-distribution-comparison
+#| fig-cap: "Distribution Comparison: Non-Maize Intake Before and After Chispitas Integration"
+#| fig-alt: >
+#|   Two side-by-side panels of overlaid violin and box plots, one for iron and
+#|   one for zinc, each with intake in milligrams per day on the y-axis. Within
+#|   every panel the "Before Chispitas" and "After Chispitas" distributions are
+#|   compared side by side. The after-integration violins and box medians sit
+#|   higher, showing that supplementation raises non-maize iron and zinc intake.
+#| fig-height: 6
+#| fig-width: 10
+
+# Define color palette
+color_palette <- c("Before Chispitas" = "#a8d4f0", "After Chispitas" = "#5C946E")
+
+# Calculate 95th percentile for axis limits
+fe_upper <- quantile(
+  c(fig_e_distribution_comparison$fe_before, fig_e_distribution_comparison$fe_after),
+  0.95, na.rm = TRUE
+)
+zn_upper <- quantile(
+  c(fig_e_distribution_comparison$zn_before, fig_e_distribution_comparison$zn_after),
+  0.95, na.rm = TRUE
+)
+
+# Prepare long format for Iron
+df_fe <- fig_e_distribution_comparison |>
+  select(fe_before, fe_after) |>
+  filter(fe_before > 0 & fe_before <= fe_upper,
+         fe_after > 0 & fe_after <= fe_upper) |>
+  pivot_longer(everything(), names_to = "stage", values_to = "value") |>
+  mutate(stage = if_else(stage == "fe_before", "Before Chispitas", "After Chispitas"))
+
+# Prepare long format for Zinc
+df_zn <- fig_e_distribution_comparison |>
+  select(zn_before, zn_after) |>
+  filter(zn_before > 0 & zn_before <= zn_upper,
+         zn_after > 0 & zn_after <= zn_upper) |>
+  pivot_longer(everything(), names_to = "stage", values_to = "value") |>
+  mutate(stage = if_else(stage == "zn_before", "Before Chispitas", "After Chispitas"))
+
+# Iron plot
+plot_fe <- df_fe |>
+  ggplot(aes(x = stage, y = value, fill = stage)) +
+  geom_violin(alpha = 0.6, trim = TRUE) +
+  geom_boxplot(width = 0.1, alpha = 0.8, outlier.alpha = 0.3) +
+  scale_fill_manual(values = color_palette) +
+  labs(title = "Iron (Fe) - mg/day", x = NULL, y = "Intake (mg/day)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, color = "azure4", face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4"),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+# Zinc plot
+plot_zn <- df_zn |>
+  ggplot(aes(x = stage, y = value, fill = stage)) +
+  geom_violin(alpha = 0.6, trim = TRUE) +
+  geom_boxplot(width = 0.1, alpha = 0.8, outlier.alpha = 0.3) +
+  scale_fill_manual(values = color_palette) +
+  labs(title = "Zinc (Zn) - mg/day", x = NULL, y = "Intake (mg/day)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, color = "azure4", face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4"),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+# Create legend plot
+legend_plot <- df_fe |>
+  ggplot(aes(x = stage, y = value, fill = stage)) +
+  geom_violin(alpha = 0.6) +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11, color = "azure4")
+  ) +
+  guides(fill = guide_legend(override.aes = list(alpha = 0.6)))
+
+# Extract legend
+legend_grob <- ggpubr::get_legend(legend_plot)
+
+# Arrange plots in grid
+plot_grid_plots <- plot_grid(plot_fe, plot_zn, ncol = 2, nrow = 1)
+
+# Combine with legend
+plot_grid(plot_grid_plots, legend_grob, ncol = 1, rel_heights = c(1, 0.08))
+```
+
+
+## Summary
+
+### Cascade Results
+
+| Level | Filter | Retention |
+|-------|--------|-----------|
+| Access (lifetime) | Ever obtained Chispitas | `r sprintf("%.1f%%", pct_access_ever)` |
+| Access (6 months) | Maintained access | `r sprintf("%.1f%%", pct_access_6months)` of above |
+| Administration | Gave sachets | `r sprintf("%.1f%%", pct_administration)` of above |
+| Dosing | Full compliance | `r sprintf("%.1f%%", pct_dosing_all)` of recipients |
+
+The weighted average adherence factor among recipients is
+`r sprintf("%.2f", mean_adherence_recipients)`. At the population level
+(including non-recipients), the mean adherence factor is
+`r sprintf("%.2f", mean_adherence_all)`.
+
+### Key Findings
+
+1. **High program reach** — `r sprintf("%.0f%%", pct_access_ever)` of children
+   6–59 months have accessed Chispitas at some point, indicating broad program
+   reach.
+
+2. **Administration gap** — `r sprintf("%.0f%%", pct_admin_gap)` of households
+   with access did not administer sachets to children, representing an
+   intervention opportunity.
+
+3. **Partial compliance common** — Among recipients,
+   `r sprintf("%.1f%%", pct_dosing_all)` consumed full sachets,
+   `r sprintf("%.1f%%", pct_dosing_more_half)` more than half,
+   `r sprintf("%.1f%%", pct_dosing_half)` half, and
+   `r sprintf("%.1f%%", pct_dosing_less_half)` less than half.
+
+4. **SIVESNU vs official rates** — Observed coverage in our sample exceeds
+   official MSPAS reports [@MSPAS2023_Chispitas], likely due to SIVESNU sampling
+   characteristics. This discrepancy will be adjusted during synthetic
+   population generation.

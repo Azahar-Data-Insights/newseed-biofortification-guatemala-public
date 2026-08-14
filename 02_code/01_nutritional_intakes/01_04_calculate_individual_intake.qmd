@@ -1,0 +1,846 @@
+---
+title: "Calculate Individual Nutrient Intake"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script completes the nutrient intake calculations by:
+
+1. Loading individual demographic data with synthetic age in months (from script 01_03)
+2. Calculating Adult Male Equivalent (AME) using age in months for improved granularity
+3. Distributing household intake to individuals via AME proportions
+4. Calculating individual nutrient intake for all nutrients
+5. Separating maize vs. non-maize contributions at individual level
+6. Creating the survey design for statistical analysis
+7. Saving final integrated dataset
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  gt,             # Table formatting and presentation
+  survey,         # Complex survey methodology
+  srvyr,          # Tidy wrapper for survey package
+  tidyverse       # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# Ensure output directories exist
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+---
+
+# Phase A: Data Loading
+
+## A1. Load Household Intake Data
+
+Load all processed datasets from the previous script.
+
+```{r}
+#| label: a1-load-data
+
+# Load household socioeconomic data
+df_hogar <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_01_household_socioeconomic.parquet")
+)
+
+# Load individuals with synthetic age in months
+df_individuos <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_03_individuals_with_age_months.parquet")
+)
+
+# Load household food intake datasets
+df_alimentos <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_total.parquet")
+)
+
+df_maiz <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_maize.parquet")
+)
+
+df_vegetales <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_plantbased.parquet")
+)
+
+df_no_vegetales <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "01_02_household_intake_animalbased.parquet")
+)
+```
+
+## A2. Merge Nutrient Data
+
+Combine individual, household, and food intake data.
+
+```{r}
+#| label: a2-merge-datasets
+
+df_merged <- df_individuos |>
+  # Join household socioeconomic data
+  left_join(df_hogar |> select(-departamento), by = join_by(no_hogar, upm, factor)) |>
+  # Join total food intake
+  left_join(df_alimentos, by = join_by(no_hogar)) |>
+  # Join maize-specific intake
+  left_join(df_maiz, by = join_by(no_hogar)) |>
+  # Join plant-based food intake
+  left_join(df_vegetales, by = join_by(no_hogar)) |>
+  # Join animal-based food intake
+  left_join(df_no_vegetales, by = join_by(no_hogar))
+```
+
+## A3. Calculate Adult Male Equivalent (AME)
+
+Assign AME coefficients using age in months and sex, following INCAP energy requirement guidelines for Guatemala (Weisell & Dop, 2012; INCAP, 2012). Children aged 0-5 months receive AME = 0 under the exclusive breastfeeding assumption. Children aged 6-11 months, identified through the synthetic month estimation in script 01_03, receive AME = 0.21 and enter the study population.
+
+```{r}
+#| label: a3-calculate-ame
+
+df_with_ame <- df_merged |>
+  mutate(
+    ame = case_when(
+      # Exclusive breastfeeding: 0-5 months
+      edad_meses >= 0  & edad_meses <= 5   ~ 0,
+      # Complementary feeding: 6-11 months
+      edad_meses >= 6  & edad_meses <= 11  ~ 0.21,
+      # Children 1-2 years
+      edad_meses >= 12 & edad_meses <= 23  ~ 0.27,
+      # Children 2-3 years
+      edad_meses >= 24 & edad_meses <= 47  ~ 0.37,
+      # Children 4-6 years
+      edad_meses >= 48 & edad_meses <= 83  ~ 0.44,
+      # Males 7+
+      edad >= 7  & edad < 10  & sexo == "Hombre" ~ 0.56,
+      edad >= 10 & edad < 14  & sexo == "Hombre" ~ 0.73,
+      edad >= 14 & edad < 18  & sexo == "Hombre" ~ 0.96,
+      edad >= 18 & edad < 30  & sexo == "Hombre" ~ 1.00,
+      edad >= 30 & edad < 60  & sexo == "Hombre" ~ 0.95,
+      edad >= 60              & sexo == "Hombre" ~ 0.76,
+      # Females 7+
+      edad >= 7  & edad < 10  & sexo == "Mujer" ~ 0.51,
+      edad >= 10 & edad < 14  & sexo == "Mujer" ~ 0.65,
+      edad >= 14 & edad < 18  & sexo == "Mujer" ~ 0.73,
+      edad >= 18 & edad < 60  & sexo == "Mujer" ~ 0.74,
+      edad >= 60              & sexo == "Mujer" ~ 0.65,
+      TRUE ~ NA_real_
+    )
+  ) |>
+  # Calculate AME percentage within household
+  mutate(
+    ame_hogar = sum(ame, na.rm = TRUE),
+    .by = no_hogar
+  ) |>
+  mutate(
+    ame_porcentaje = if_else(ame_hogar > 0, ame / ame_hogar, 0)
+  ) |>
+  select(-ame_hogar)
+```
+
+---
+
+# Phase B: Individual Intake Distribution
+
+## B1. Distribute Household Intake by AME
+
+Apply AME percentage to distribute household intake to each individual.
+
+```{r}
+#| label: b1-calculate-individual-intake
+
+df_intake <- df_with_ame  |>
+  mutate(
+    # === TOTAL INTAKE (all foods) ===
+    gr_individuo_dia_totales = gr_hogar_dia_totales * ame_porcentaje,
+    gr_individuo_dia_vegetales = gr_hogar_dia_vegetales * ame_porcentaje,
+    gr_individuo_dia_no_vegetales = gr_hogar_dia_no_vegetales * ame_porcentaje,
+    kcal_individuo_dia_totales = kcal_hogar_dia_totales * ame_porcentaje,
+    prot_individuo_dia_totales = prot_hogar_dia_totales * ame_porcentaje,
+    prot_apro_individuo_dia_totales = prot_apro_hogar_dia_totales * ame_porcentaje,
+    fe_individuo_dia_totales = fe_hogar_dia_totales * ame_porcentaje,
+    zn_individuo_dia_totales = zn_hogar_dia_totales * ame_porcentaje,
+    lys_individuo_dia_totales = lys_hogar_dia_totales * ame_porcentaje,
+    met_individuo_dia_totales = met_hogar_dia_totales * ame_porcentaje,
+    cys_individuo_dia_totales = cys_hogar_dia_totales * ame_porcentaje,
+    thr_individuo_dia_totales = thr_hogar_dia_totales * ame_porcentaje,
+    trp_individuo_dia_totales = trp_hogar_dia_totales * ame_porcentaje,
+    
+    # === MAIZE INTAKE ===
+    gr_individuo_dia_maiz = gr_hogar_dia_maiz * ame_porcentaje,
+    kcal_individuo_dia_maiz = kcal_hogar_dia_maiz * ame_porcentaje,
+    prot_individuo_dia_maiz = prot_hogar_dia_maiz * ame_porcentaje,
+    prot_apro_individuo_dia_maiz = prot_apro_hogar_dia_maiz * ame_porcentaje,
+    fe_individuo_dia_maiz = fe_hogar_dia_maiz * ame_porcentaje,
+    zn_individuo_dia_maiz = zn_hogar_dia_maiz * ame_porcentaje,
+    lys_individuo_dia_maiz = lys_hogar_dia_maiz * ame_porcentaje,
+    met_individuo_dia_maiz = met_hogar_dia_maiz * ame_porcentaje,
+    cys_individuo_dia_maiz = cys_hogar_dia_maiz * ame_porcentaje,
+    thr_individuo_dia_maiz = thr_hogar_dia_maiz * ame_porcentaje,
+    trp_individuo_dia_maiz = trp_hogar_dia_maiz * ame_porcentaje,
+    
+    # === NON-MAIZE INTAKE (by subtraction) ===
+    gr_individuo_dia_no_maiz = gr_individuo_dia_totales - gr_individuo_dia_maiz,
+    kcal_individuo_dia_no_maiz = kcal_individuo_dia_totales - kcal_individuo_dia_maiz,
+    prot_individuo_dia_no_maiz = prot_individuo_dia_totales - prot_individuo_dia_maiz,
+    prot_apro_individuo_dia_no_maiz = prot_apro_individuo_dia_totales - prot_apro_individuo_dia_maiz,
+    fe_individuo_dia_no_maiz = fe_individuo_dia_totales - fe_individuo_dia_maiz,
+    zn_individuo_dia_no_maiz = zn_individuo_dia_totales - zn_individuo_dia_maiz,
+    lys_individuo_dia_no_maiz = lys_individuo_dia_totales - lys_individuo_dia_maiz,
+    met_individuo_dia_no_maiz = met_individuo_dia_totales - met_individuo_dia_maiz,
+    cys_individuo_dia_no_maiz = cys_individuo_dia_totales - cys_individuo_dia_maiz,
+    thr_individuo_dia_no_maiz = thr_individuo_dia_totales - thr_individuo_dia_maiz,
+    trp_individuo_dia_no_maiz = trp_individuo_dia_totales - trp_individuo_dia_maiz
+  )
+```
+
+---
+
+# Phase C: Finalize Dataset
+
+## C1. Calculate Plant-Based Diet Percentage
+
+Calculate the proportion of plant-based foods in each individual's diet. This variable is used in transfer models for predicting nutrient profiles.
+
+```{r}
+#| label: c1-calculate-plant-percentage
+
+df_complete <- df_intake |>
+  mutate(
+    # Calculate percentage of plant-based foods in diet
+    porcentaje_vegetales = gr_individuo_dia_vegetales / gr_individuo_dia_totales,
+    # Stratify into ranges for downstream analysis
+    per_vegetales_estratificado = factor(
+      cut(
+        porcentaje_vegetales, 
+        breaks = c(-Inf, 0.5, 0.7, 0.9, Inf), 
+        labels = c("0-50%", "50-70%", "70-90%", "90-100%")
+      ),
+      ordered = TRUE
+    )
+  )
+```
+
+## C2. Create Survey Design Object
+
+Create the survey design accounting for ENCOVI's complex sampling structure (clusters and expansion weights). This enables population-representative statistical estimates.
+
+```{r}
+#| label: c2-create-survey-design
+
+survey_design <- df_complete |>
+  as_survey_design(
+    ids = upm,
+    weights = factor,
+    # No stratification specified in original design
+    strata = NULL
+  )
+```
+
+---
+
+# Phase D: Quality Checks and Export
+
+## D1. Summary Statistics
+
+```{r}
+#| label: tbl-d1-summary-sample-characteristics
+
+# Calculate sample characteristics
+sample_summary <- survey_design |>
+  summarise(
+    individuals = n(),
+    households = n_distinct(no_hogar),
+    departments = n_distinct(departamento),
+    pop_estimate = survey_total(vartype = "se")
+  )
+
+# Create summary table
+tbl_sample_characteristics <- tibble(
+  Characteristic = c(
+    "Sample size (individuals)",
+    "Unique households",
+    "Departments covered",
+    "Population estimate (weighted)"
+  ),
+  Value = c(
+    format(sample_summary$individuals, big.mark = ","),
+    format(sample_summary$households, big.mark = ","),
+    sample_summary$departments,
+    paste0(
+      format(round(sample_summary$pop_estimate / 1e6, 2), nsmall = 2),
+      " million (SE: ",
+      format(round(sample_summary$pop_estimate_se / 1e6, 2), nsmall = 2),
+      ")"
+    )
+  )
+)
+
+# Save data for web resources
+export(
+  tbl_sample_characteristics,
+  here("01_data", "02_processed",
+       "web_resources", "01_04_tbl_d1_summary_sample_characteristics.rds")
+)
+
+tbl_sample_characteristics |>
+  gt() |>
+  tab_header(
+    title = "Sample Characteristics",
+    subtitle = "Survey-weighted estimates for Guatemala"
+  ) |>
+  cols_label(
+    Characteristic = "Characteristic",
+    Value = "Value"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(sample_summary, tbl_sample_characteristics)
+```
+
+## D2. Distribution Diagnostics
+
+### D2.a Total and Maize Intake
+
+```{r}
+#| label: tbl-d2a-summary-total-maize-intake
+
+# Calculate total and maize intake statistics
+intake_total_maize <- survey_design |>
+  summarise(
+    mean_gr_totales = survey_mean(gr_individuo_dia_totales, na.rm = TRUE, vartype = "ci"),
+    mean_kcal = survey_mean(kcal_individuo_dia_totales, na.rm = TRUE, vartype = "ci"),
+    mean_prot = survey_mean(prot_individuo_dia_totales, na.rm = TRUE, vartype = "ci"),
+    mean_fe = survey_mean(fe_individuo_dia_totales, na.rm = TRUE, vartype = "ci"),
+    mean_zn = survey_mean(zn_individuo_dia_totales, na.rm = TRUE, vartype = "ci"),
+    mean_gr_maiz = survey_mean(gr_individuo_dia_maiz, na.rm = TRUE, vartype = "ci")
+  )
+
+# Create table
+tbl_total_maize_intake <- tibble(
+  Nutrient = c(
+    "Food weight (g/day)",
+    "Energy (kcal/day)",
+    "Protein (g/day)",
+    "Iron (mg/day)",
+    "Zinc (mg/day)",
+    "Maize weight (g/day)"
+  ),
+  `Mean (95% CI)` = c(
+    paste0(round(intake_total_maize$mean_gr_totales, 1), " (",
+           round(intake_total_maize$mean_gr_totales_low, 1), " - ",
+           round(intake_total_maize$mean_gr_totales_upp, 1), ")"),
+    paste0(round(intake_total_maize$mean_kcal, 0), " (",
+           round(intake_total_maize$mean_kcal_low, 0), " - ",
+           round(intake_total_maize$mean_kcal_upp, 0), ")"),
+    paste0(round(intake_total_maize$mean_prot, 1), " (",
+           round(intake_total_maize$mean_prot_low, 1), " - ",
+           round(intake_total_maize$mean_prot_upp, 1), ")"),
+    paste0(round(intake_total_maize$mean_fe, 2), " (",
+           round(intake_total_maize$mean_fe_low, 2), " - ",
+           round(intake_total_maize$mean_fe_upp, 2), ")"),
+    paste0(round(intake_total_maize$mean_zn, 2), " (",
+           round(intake_total_maize$mean_zn_low, 2), " - ",
+           round(intake_total_maize$mean_zn_upp, 2), ")"),
+    paste0(round(intake_total_maize$mean_gr_maiz, 1), " (",
+           round(intake_total_maize$mean_gr_maiz_low, 1), " - ",
+           round(intake_total_maize$mean_gr_maiz_upp, 1), ")")
+  )
+)
+
+# Save data for web resources
+export(
+  tbl_total_maize_intake,
+  here("01_data", "02_processed",
+       "web_resources", "01_04_tbl_d2a_summary_total_maize_intake.rds")
+)
+
+tbl_total_maize_intake |>
+  gt() |>
+  tab_header(
+    title = "Total and Maize Daily Intake",
+    subtitle = "Survey-weighted population estimates with 95% confidence intervals"
+  ) |>
+  cols_label(
+    Nutrient = "Nutrient/Metric",
+    `Mean (95% CI)` = "Mean (95% CI)"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Estimates account for complex survey design (clustering, weights).",
+    locations = cells_title(groups = "subtitle")
+  )
+
+# Cleanup auxiliary objects
+rm(intake_total_maize, tbl_total_maize_intake)
+```
+
+### D2.b Maize Contribution to Total Intake
+
+```{r}
+#| label: tbl-d2b-summary-maize-contribution
+
+# Calculate maize contribution percentages
+maize_contribution <- survey_design |>
+  summarise(
+    pct_kcal_maiz = survey_mean(
+      kcal_individuo_dia_maiz / kcal_individuo_dia_totales * 100, 
+      na.rm = TRUE, 
+      vartype = "ci"
+    ),
+    pct_prot_maiz = survey_mean(
+      prot_individuo_dia_maiz / prot_individuo_dia_totales * 100, 
+      na.rm = TRUE, 
+      vartype = "ci"
+    ),
+    pct_fe_maiz = survey_mean(
+      fe_individuo_dia_maiz / fe_individuo_dia_totales * 100, 
+      na.rm = TRUE, 
+      vartype = "ci"
+    ),
+    pct_zn_maiz = survey_mean(
+      zn_individuo_dia_maiz / zn_individuo_dia_totales * 100, 
+      na.rm = TRUE, 
+      vartype = "ci"
+    )
+  )
+
+# Create table
+tbl_maize_contribution <- tibble(
+  Nutrient = c(
+    "Energy contribution",
+    "Protein contribution",
+    "Iron contribution",
+    "Zinc contribution"
+  ),
+  `% from Maize (95% CI)` = c(
+    paste0(round(maize_contribution$pct_kcal_maiz, 1), "% (",
+           round(maize_contribution$pct_kcal_maiz_low, 1), " - ",
+           round(maize_contribution$pct_kcal_maiz_upp, 1), ")"),
+    paste0(round(maize_contribution$pct_prot_maiz, 1), "% (",
+           round(maize_contribution$pct_prot_maiz_low, 1), " - ",
+           round(maize_contribution$pct_prot_maiz_upp, 1), ")"),
+    paste0(round(maize_contribution$pct_fe_maiz, 1), "% (",
+           round(maize_contribution$pct_fe_maiz_low, 1), " - ",
+           round(maize_contribution$pct_fe_maiz_upp, 1), ")"),
+    paste0(round(maize_contribution$pct_zn_maiz, 1), "% (",
+           round(maize_contribution$pct_zn_maiz_low, 1), " - ",
+           round(maize_contribution$pct_zn_maiz_upp, 1), ")")
+  )
+)
+
+# Save data for web resources
+export(
+  tbl_maize_contribution,
+  here("01_data", "02_processed",
+       "web_resources", "01_04_tbl_d2b_summary_maize_contribution.rds")
+)
+
+tbl_maize_contribution |>
+  gt() |>
+  tab_header(
+    title = "Maize Contribution to Total Nutrient Intake",
+    subtitle = "Percentage of daily nutrients from maize products"
+  ) |>
+  cols_label(
+    Nutrient = "Nutrient",
+    `% from Maize (95% CI)` = "% from Maize (95% CI)"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(maize_contribution, tbl_maize_contribution)
+```
+
+### D2.c Intake by Age Group
+
+```{r}
+#| label: tbl-d2c-summary-intake-by-age
+
+# Age bands built on edad_meses so they align with the AME month brackets:
+# right = FALSE places the [0, 6) month band (AME = 0) in the first group
+intake_by_age <- survey_design |>
+  mutate(
+    edad_grupos = factor(cut(
+      edad_meses,
+      breaks = c(-Inf, 6, 12, 24, 48, 84, 120, 168, 216, 360, 720, Inf),
+      labels = c("de 0 a 5 meses", "de 6 meses a 1 año", "de 1 a 2 años",
+                 "de 2 a 4 años", "de 4 a 7 años", "de 7 a 10 años",
+                 "de 10 a 14 años", "de 14 a 18 años", "de 18 a 30 años",
+                 "de 30 a 60 años", "más de 60 años"),
+      right = FALSE
+    ))
+  ) |>
+  group_by(edad_grupos) |>
+  summarise(
+    n = n(),
+    mean_kcal = survey_mean(kcal_individuo_dia_totales, na.rm = TRUE),
+    mean_prot = survey_mean(prot_individuo_dia_totales, na.rm = TRUE),
+    mean_fe = survey_mean(fe_individuo_dia_totales, na.rm = TRUE),
+    mean_zn = survey_mean(zn_individuo_dia_totales, na.rm = TRUE),
+    pct_maiz_kcal = survey_mean(
+      kcal_individuo_dia_maiz / kcal_individuo_dia_totales * 100, 
+      na.rm = TRUE
+    )
+  )
+
+# Save data for web resources
+export(
+  intake_by_age,
+  here("01_data", "02_processed",
+       "web_resources", "01_04_tbl_d2c_summary_intake_by_age.rds")
+)
+
+# Create table
+intake_by_age |>
+  gt() |>
+  tab_header(
+    title = "Daily Nutrient Intake by Age Group",
+    subtitle = "Survey-weighted population estimates"
+  ) |>
+  fmt_number(
+    columns = c(mean_kcal, mean_kcal_se, mean_prot, mean_prot_se,
+                mean_fe, mean_fe_se, mean_zn, mean_zn_se,
+                pct_maiz_kcal, pct_maiz_kcal_se),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = n,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_label(
+    edad_grupos = "Age Group",
+    n = "N",
+    mean_kcal = "Energy (kcal)",
+    mean_kcal_se = "Energy (SE)",
+    mean_prot = "Protein (g)",
+    mean_prot_se = "Protein (SE)",
+    mean_fe = "Iron (mg)",
+    mean_fe_se = "Iron (SE)",
+    mean_zn = "Zinc (mg)",
+    mean_zn_se = "Zinc (SE)",
+    pct_maiz_kcal = "Maize Energy (%)",
+    pct_maiz_kcal_se = "Maize Energy (SE)"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(intake_by_age)
+```
+
+### D2.d Diet Composition
+
+```{r}
+#| label: tbl-d2d-summary-diet-composition
+
+# Calculate distribution of plant-based diet categories
+diet_composition <- survey_design |>
+  group_by(per_vegetales_estratificado) |>
+  summarise(
+    n = n(),
+    proportion = survey_mean(vartype = "ci")
+  )
+
+# Save data for web resources
+export(
+  diet_composition,
+  here("01_data", "02_processed",
+       "web_resources", "01_04_tbl_d2d_summary_diet_composition.rds")
+)
+
+# Create table
+diet_composition |>
+  gt() |>
+  tab_header(
+    title = "Distribution of Plant-Based Diet Categories",
+    subtitle = "Survey-weighted population proportions"
+  ) |>
+  fmt_number(
+    columns = n,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_percent(
+    columns = c(proportion, proportion_low, proportion_upp),
+    decimals = 1
+  ) |>
+  cols_label(
+    per_vegetales_estratificado = "Plant-based Foods (%)",
+    n = "Sample N",
+    proportion = "Population %",
+    proportion_low = "95% CI Lower",
+    proportion_upp = "95% CI Upper"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Categories based on percentage of grams from plant-based foods.",
+    locations = cells_column_labels(columns = per_vegetales_estratificado)
+  )
+
+# Cleanup auxiliary objects
+rm(diet_composition)
+```
+
+## D3. Data Quality Checks
+
+### D3.a Missing Values
+
+```{r}
+#| label: tbl-d3a-quality-check-missing
+
+# Calculate missing values
+missing_summary <- df_complete |>
+  summarise(
+    missing_ame = sum(is.na(ame_porcentaje)),
+    missing_intake = sum(is.na(gr_individuo_dia_totales)),
+    missing_maiz = sum(is.na(gr_individuo_dia_maiz)),
+    missing_plant_pct = sum(is.na(porcentaje_vegetales))
+  )
+
+# Create table
+tbl_quality_missing <- tibble(
+  Variable = c(
+    "AME percentage",
+    "Total intake",
+    "Maize intake",
+    "Plant-based percentage"
+  ),
+  `Missing N` = c(
+    missing_summary$missing_ame,
+    missing_summary$missing_intake,
+    missing_summary$missing_maiz,
+    missing_summary$missing_plant_pct
+  ),
+  `Missing %` = c(
+    missing_summary$missing_ame / nrow(df_complete) * 100,
+    missing_summary$missing_intake / nrow(df_complete) * 100,
+    missing_summary$missing_maiz / nrow(df_complete) * 100,
+    missing_summary$missing_plant_pct / nrow(df_complete) * 100
+  )
+)
+
+# Save data for web resources
+export(
+  tbl_quality_missing,
+  here("01_data", "02_processed",
+       "web_resources", "01_04_tbl_d3a_quality_check_missing.rds")
+)
+
+tbl_quality_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Values by Key Variable",
+    subtitle = "Data completeness assessment"
+  ) |>
+  fmt_number(
+    columns = `Missing N`,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = `Missing %`,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  cols_label(
+    Variable = "Variable",
+    `Missing N` = "N",
+    `Missing %` = "%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(missing_summary, tbl_quality_missing)
+```
+
+### D3.b Extreme Values
+
+```{r}
+#| label: tbl-d3b-quality-check-extremes
+
+# Calculate extreme values
+extreme_summary <- df_complete |>
+  summarise(
+    high_kcal = sum(kcal_individuo_dia_totales > 5000, na.rm = TRUE),
+    low_kcal = sum(kcal_individuo_dia_totales < 500, na.rm = TRUE),
+    high_prot = sum(prot_individuo_dia_totales > 200, na.rm = TRUE),
+    zero_intake = sum(gr_individuo_dia_totales == 0, na.rm = TRUE)
+  )
+
+# Create table
+tbl_quality_extremes <- tibble(
+  Check = c(
+    "Very high energy (>5000 kcal)",
+    "Very low energy (<500 kcal)",
+    "Very high protein (>200g)",
+    "Zero food intake"
+  ),
+  Count = c(
+    extreme_summary$high_kcal,
+    extreme_summary$low_kcal,
+    extreme_summary$high_prot,
+    extreme_summary$zero_intake
+  ),
+  Percentage = c(
+    extreme_summary$high_kcal / nrow(df_complete) * 100,
+    extreme_summary$low_kcal / nrow(df_complete) * 100,
+    extreme_summary$high_prot / nrow(df_complete) * 100,
+    extreme_summary$zero_intake / nrow(df_complete) * 100
+  )
+)
+
+# Save data for web resources
+export(
+  tbl_quality_extremes,
+  here("01_data", "02_processed",
+       "web_resources", "01_04_tbl_d3b_quality_check_extremes.rds")
+)
+
+tbl_quality_extremes |>
+  gt() |>
+  tab_header(
+    title = "Extreme Value Detection",
+    subtitle = "Potential data quality issues or outliers"
+  ) |>
+  fmt_number(
+    columns = Count,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = Percentage,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  cols_label(
+    Check = "Quality Check",
+    Count = "N",
+    Percentage = "%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Extreme values may indicate data entry errors, unusual household compositions, or recall bias.",
+    locations = cells_title(groups = "subtitle")
+  )
+
+# Cleanup auxiliary objects
+rm(extreme_summary, tbl_quality_extremes)
+```
+
+## D4. Save Final Dataset
+
+```{r}
+#| label: d4-save-outputs
+
+# Save complete individual-level dataset
+write_parquet(
+  df_complete,
+  here("01_data", "02_processed", 
+       "transfer", "01_04_individual_nutritional_intake_complete.parquet")
+)
+```
+
+---
+
+# Notes
+
+## Methodology
+
+### Adult Male Equivalent (AME)
+AME coefficients follow INCAP energy requirement guidelines for Guatemala, accounting for age and sex differences in energy needs. This script calculates AME using age in months (from script 01_03) for children 0-4 years.
+
+### Maize/Non-Maize Separation
+- Supports biofortification impact modeling at the individual level
+- Maize-derived nutrients are the fraction modified in intervention scenarios
+- Non-maize intake is held constant across scenarios
+
+### Survey Design
+- ENCOVI uses complex sampling with Primary Sampling Units (UPM) and expansion weights
+- All population-level statistics require survey-weighted estimation
+- Standard errors account for clustering within UPMs
+
+## Data Quality
+
+### Infants Under 6 Months
+Infants under 6 months have `ame_porcentaje = 0`, resulting in zero calculated intake from solid foods, following the exclusive breastfeeding assumption.
+
+### Missing Values
+Missing values in intake variables occur for individuals in households with no food consumption data reported.
+
+### Extreme Values
+Extreme values (very high or very low intake) may reflect:
+- Data entry errors in original survey
+- Unusual household compositions (e.g., large families, guests)
+- Reporting period issues (recall bias)

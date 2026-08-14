@@ -1,0 +1,55 @@
+# ==============================================================================
+# Seed Variants Configuration
+# ==============================================================================
+#
+# Single source of truth for seed variant parameters used across the NewSeed
+# biofortification framework. Consumed by parametrized Quarto scripts and by
+# local and master orchestrators.
+#
+# Each variant declares:
+#   - Identification:  seed_year, seed_label, seed_description, seed_suffix
+#   - Yield factors:   proportional yield change by farmer segment,
+#                      keyed by segment name to decouple vector order from
+#                      the segment_final factor levels.
+#
+# Segment keys are identical to the `segment_final` factor levels used in
+# Script 02_03 (farmer segmentation). Any change to segment nomenclature
+# must be reflected here and in the parametrized scripts simultaneously.
+#
+# Source: Semilla Nueva yield data and market analysis (November 2025).
+# ==============================================================================
+
+variants:
+
+  s22:
+    seed_year: "2022"
+    seed_label: "2022 Seed"
+    seed_description: "currently deployed biofortified seed variety (released 2022)"
+    seed_suffix: "s22"
+    yield_change:
+      OPV_Criollo:  0.316
+      Low:          0.256
+      Mid:          0.018
+      High:        -0.138
+
+  s26:
+    seed_year: "2026"
+    seed_label: "2026 Seed"
+    seed_description: "improved biofortified seed variety (expected release 2026)"
+    seed_suffix: "s26"
+    yield_change:
+      OPV_Criollo:  0.450
+      Low:          0.400
+      Mid:          0.100
+      High:        -0.070
+
+  s28:
+    seed_year: "2028"
+    seed_label: "2028 Seed"
+    seed_description: "next-generation biofortified seed variety (expected release 2028)"
+    seed_suffix: "s28"
+    yield_change:
+      OPV_Criollo:  0.550
+      Low:          0.550
+      Mid:          0.200
+      High:        -0.020

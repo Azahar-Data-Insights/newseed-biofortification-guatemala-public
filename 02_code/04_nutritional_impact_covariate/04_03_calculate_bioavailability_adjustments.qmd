@@ -1,0 +1,767 @@
+---
+title: "Calculate Iron and Zinc Bioavailability"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script calculates micronutrient bioavailability for children 6-59 months in SIVESNU 2018, applying:
+
+1.  Load SIVESNU data with integrated Chispitas supplementation
+2.  Calculate total nutrient intake by aggregating maize and non-maize sources
+3.  Apply Miller equation to estimate Total Absorbed Zinc (TAZ) from combined diet + Chispitas
+4.  Apply uniform 5% iron absorption factor based on predominantly plant-based dietary patterns
+5.  Generate diagnostic tables and visualizations
+6.  Save processed dataset maintaining three-tier variable structure
+
+**Key methodological decisions**:
+
+-   **Miller equation version**: Estimate total absorbed zinc among children 6-59 months using equation developed by Miller et al. (2015).
+
+-   **Miller equation applicability**: The equation was derived from studies including micronutrient powder trials, making it appropriate for estimating absorption from diet + Chispitas combined.
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  gt,                 # Table formatting and presentation
+  tidyverse           # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Parameters
+
+## A1. Load SIVESNU Data with Chispitas
+
+Load SIVESNU 2018 children's data with integrated Chispitas supplementation from Script 04_02.
+
+```{r}
+#| label: a1-load-data
+
+# Load SIVESNU data with Chispitas integration
+df_input <- read_parquet(
+
+here("01_data", "02_processed", 
+     "transfer", "04_02_sivesnu_with_chispitas.parquet")
+)
+```
+
+## A2. Define Miller Equation Parameters
+
+The Miller equation for children estimates Total Absorbed Zinc (TAZ) as a function of age and total dietary zinc (TDZ). 
+
+**Equation**:
+
+$$TAZ = 0.5 \times \left( K_T + A \cdot Age^E + TDZ - \sqrt{(K_T + A \cdot Age^E + TDZ)^2 - 4 \cdot (A \cdot Age^E) \cdot TDZ} \right)$$
+
+Where:
+
+-   $TAZ$ = Total Absorbed Zinc (mg/day)
+-   $TDZ$ = Total Daily Zinc from all sources (mg/day)
+-   $Age$ = Age in months
+-   $K_T$ = 2.42 (saturation constant)
+-   $A$ = 0.633 (age coefficient)
+-   $E$ = 0.311 (age exponent)
+
+```{r}
+#| label: a2-define-miller-parameters
+
+# Miller equation parameters for children (6-59 months)
+# Source: Engle-Stone R, UC Davis (2025, personal communication)
+MILLER_K_T <- 2.42
+MILLER_A   <- 0.633
+MILLER_E   <- 0.311
+```
+
+## A3. Analyze Dietary Composition for Iron Bioavailability Decision
+
+Based on the distribution of the proportion of total food consumption from plant-based sources in this population, summarised in the figure below, we apply a uniform 5% iron absorption rate.
+
+```{r}
+#| label: fig-a3-plant-percentage-distribution
+#| fig-cap: "Distribution of plant-based food percentage in children's diets (SIVESNU 2018)"
+#| fig-width: 9
+#| fig-height: 6
+
+# =============================================================================
+# A3. Histogram: Plant-Based Food Percentage Distribution
+# =============================================================================
+
+# Define Azahar color palette
+color_azul_primary <- "#1f78b4"
+
+# Filter valid data for plotting (removes NA and non-finite values)
+df_plot <- df_input |>
+  filter(!is.na(per_vegetales) & is.finite(per_vegetales))
+
+# Calculate survey-weighted statistics for reference lines
+svy_temp <- df_plot |>
+  as_survey_design(ids = conglomerado, weights = pesonino)
+
+weighted_median <- svyquantile(~per_vegetales, design = svy_temp, 
+                                quantiles = 0.50, na.rm = TRUE) |>
+  coef() * 100
+
+weighted_terciles <- svyquantile(~per_vegetales, design = svy_temp, 
+                                  quantiles = c(1/3, 2/3), na.rm = TRUE) |>
+  coef() * 100
+
+export(df_plot, here("01_data", "02_processed", "web_resources", "04_03_fig_a3_plant_percentage_distribution.rds"))
+
+# Create histogram
+ggplot(df_plot, aes(x = per_vegetales * 100)) +
+  geom_histogram(
+    binwidth = 2.5,
+    fill = color_azul_primary,
+    color = "white",
+    alpha = 0.8
+  ) +
+  geom_vline(
+    xintercept = weighted_terciles[1], 
+    linetype = "dashed", 
+    color = "#3AAF85", 
+    linewidth = 0.8
+  ) +
+  geom_vline(
+    xintercept = weighted_terciles[2], 
+    linetype = "dashed", 
+    color = "#3AAF85", 
+    linewidth = 0.8
+  ) +
+  geom_vline(
+    xintercept = weighted_median, 
+    linetype = "solid", 
+    color = "#1a3a5c", 
+    linewidth = 1
+  ) +
+  annotate(
+    "text", 
+    x = weighted_terciles[1] - 2, 
+    y = Inf, 
+    label = paste0("T1: ", round(weighted_terciles[1], 1), "%"),
+    hjust = 1, 
+    vjust = 1.5, 
+    size = 3, 
+    color = "#236C51"
+  ) +
+  annotate(
+    "text", 
+    x = weighted_terciles[2] + 2, 
+    y = Inf, 
+    label = paste0("T2: ", round(weighted_terciles[2], 1), "%"),
+    hjust = 0, 
+    vjust = 1.5, 
+    size = 3, 
+    color = "#236C51"
+  ) +
+  labs(
+    title = "Distribution of Plant-Based Food Consumption",
+    subtitle = "Children 6-59 months, SIVESNU 2018",
+    x = "Percentage of Plant-Based Food Consumption",
+    y = "Frequency",
+    caption = "Vertical lines: median (solid), tercile cutoffs (dashed). Source: SIVESNU 2018."
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%")
+  ) +
+  coord_cartesian(xlim = c(0, 100)) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 13, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    plot.caption = element_text(size = 9, color = "grey50", hjust = 0),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+
+# Cleanup temporary objects
+rm(svy_temp, weighted_median, weighted_terciles, df_plot, color_azul_primary)
+```
+
+```{r}
+#| label: tbl-a3-plant-percentage-summary
+#| tbl-cap: "Survey-weighted distribution of plant-based food percentage (SIVESNU 2018)"
+
+# =============================================================================
+# A3. Summary Statistics Table
+# Survey-weighted estimates: Mean, SD, Median, IQR, Terciles
+# =============================================================================
+
+# Create survey design object
+svy_plant <- df_input |>
+  filter(!is.na(per_vegetales) & is.finite(per_vegetales)) |>
+  as_survey_design(ids = conglomerado, weights = pesonino)
+
+# Calculate survey-weighted statistics
+weighted_mean <- svymean(~per_vegetales, design = svy_plant, na.rm = TRUE)
+mean_val <- coef(weighted_mean) * 100
+
+# Unweighted SD
+unwt_sd <- sd(df_input$per_vegetales, na.rm = TRUE) * 100
+
+# Quantiles: Q25, Median, Q75
+weighted_quantiles <- svyquantile(
+  ~per_vegetales, 
+  design = svy_plant, 
+  quantiles = c(0.25, 0.50, 0.75), 
+  na.rm = TRUE
+)
+q25_val <- coef(weighted_quantiles)[1] * 100
+median_val <- coef(weighted_quantiles)[2] * 100
+q75_val <- coef(weighted_quantiles)[3] * 100
+
+# Terciles
+weighted_terciles <- svyquantile(
+  ~per_vegetales, 
+  design = svy_plant, 
+  quantiles = c(1/3, 2/3), 
+  na.rm = TRUE
+)
+t1_val <- coef(weighted_terciles)[1] * 100
+t2_val <- coef(weighted_terciles)[2] * 100
+
+# Sample size
+n_sample <- nrow(df_input |> filter(!is.na(per_vegetales)))
+
+# Build summary table
+summary_plant_pct <- tibble(
+  statistic = c(
+    "Mean (± SD)",
+    "Median [Q25, Q75]",
+    "IQR",
+    "Tercile 1 cutoff (33.3%)",
+    "Tercile 2 cutoff (66.7%)"
+  ),
+  value = c(
+    sprintf("%.1f%% (± %.1f%%)", mean_val, unwt_sd),
+    sprintf("%.1f%% [%.1f%%, %.1f%%]", median_val, q25_val, q75_val),
+    sprintf("%.1f%%", q75_val - q25_val),
+    sprintf("%.1f%%", t1_val),
+    sprintf("%.1f%%", t2_val)
+  ),
+  interpretation = c(
+    "Population average plant-food consumption",
+    "Central tendency and spread",
+    "Interquartile range",
+    "Lower third of population below this threshold",
+    "Upper third of population above this threshold"
+  )
+)
+
+export(summary_plant_pct, here("01_data", "02_processed", "web_resources", "04_03_tbl_a3_plant_percentage_summary.rds"))
+
+# Create GT table
+summary_plant_pct |>
+  gt() |>
+  tab_header(
+    title = "Plant-Based Food Percentage Distribution",
+    subtitle = sprintf("Children 6-59 months (N = %d), SIVESNU 2018", n_sample)
+  ) |>
+  cols_label(
+    statistic = "Statistic",
+    value = "Value",
+    interpretation = "Interpretation"
+  ) |>
+  tab_spanner(
+    label = "Survey-Weighted Estimates",
+    columns = c(value, interpretation)
+  ) |>
+  tab_footnote(
+    footnote = "Survey weights applied (pesonino). Tercile cutoffs per Allen et al. (2020) H-AR methodology.",
+    locations = cells_title(groups = "subtitle")
+  ) |>
+  tab_source_note(
+    source_note = md("**Source**: SIVESNU 2018. SD estimated from unweighted data.")
+  ) |>
+  cols_width(
+    statistic ~ px(180),
+    value ~ px(180),
+    interpretation ~ px(280)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100),
+    column_labels.font.weight = "bold"
+  )
+
+# Cleanup
+rm(svy_plant, weighted_mean, mean_val, unwt_sd,
+   weighted_quantiles, q25_val, median_val, q75_val,
+   weighted_terciles, t1_val, t2_val, summary_plant_pct, n_sample)
+```
+
+::: callout-note
+### Methodological Decision
+
+**Finding**: The distribution shows that the great majority of children have diets above 70% plant-based food consumption, and the lower tercile cutoff also falls within the "very high phytate" category.
+
+**Decision**: Based on predominantly plant-based dietary patterns in the population, we apply a uniform **low iron absorption rate of 5%** to the entire population, following Allen et al. (2020) H-AR recommendations for unrefined/high-phytate diets.
+
+**Iron requirement benchmark**: With 5% absorption and a recommended intake of 10 mg/day (Allen et al., 2020), the absorbed iron requirement is **0.5 mg/day**.
+:::
+
+------------------------------------------------------------------------
+
+# Phase B: Nutrient Calculations
+
+## B1. Calculate Total Nutrient Intake
+
+Aggregate maize and non-maize sources to obtain total daily intake for all nutrients. 
+
+```{r}
+#| label: b1-calculate-total-intake
+
+df_totals <- df_input |>
+  mutate(
+    # === TOTAL NUTRIENT INTAKE (maize + non-maize) ===
+    # Iron (mg/day) - non-maize includes Chispitas
+    fe_mg_total = fe_mg_maiz + fe_mg_nomaiz,
+    
+    # Zinc (mg/day) - non-maize includes Chispitas
+    zn_mg_total = zn_mg_maiz + zn_mg_nomaiz,
+    
+    # Digestible protein (g/day)
+    prot_g_total = prot_g_maiz + prot_g_nomaiz,
+    
+    # Lysine (mg/day)
+    lys_mg_total = lys_mg_maiz + lys_mg_nomaiz,
+    
+    # Tryptophan (mg/day)
+    trp_mg_total = trp_mg_maiz + trp_mg_nomaiz,
+    
+    # Energy (kcal/day)
+    ene_kcal_total = ene_kcal_maiz + ene_kcal_nomaiz
+  )
+```
+
+## B2. Apply Miller Equation for Zinc
+
+Calculate Total Absorbed Zinc (TAZ) using the Miller equation for children. The equation is applied to total zinc intake (diet + Chispitas).
+
+```{r}
+#| label: b2-apply-miller-equation
+
+df_miller <- df_totals |>
+  mutate(
+    # === MILLER EQUATION COMPONENTS ===
+    # Age-dependent absorption capacity
+    miller_age_factor = MILLER_A * (edad_mes ^ MILLER_E),
+    
+    # Sum of constants and zinc intake
+    miller_sum = MILLER_K_T + miller_age_factor + zn_mg_total,
+    
+    # Discriminant for quadratic formula
+    miller_discriminant = (miller_sum ^ 2) - (4 * miller_age_factor * zn_mg_total),
+    
+    # === TOTAL ABSORBED ZINC (TAZ) ===
+    taz_mg = 0.5 * (miller_sum - sqrt(miller_discriminant)),
+    
+    # === FRACTIONAL ABSORPTION (for diagnostics) ===
+    zn_fractional_absorption = taz_mg / zn_mg_total
+  ) |>
+  # Remove intermediate calculation columns
+  select(-miller_age_factor, -miller_sum, -miller_discriminant)
+```
+
+## B3. Apply Iron Bioavailability Factor
+
+Apply uniform 5% iron absorption rate to total iron intake. This conservative factor reflects the predominantly plant-based dietary patterns observed in this population.
+
+```{r}
+#| label: b3-apply-iron-bioavailability
+
+df_bioavailable <- df_miller |>
+  mutate(
+    # === IRON ABSORPTION FACTOR (uniform) ===
+    fe_absorption_factor = 0.05,
+    
+    # === ABSORBED IRON ===
+    fe_absorbed_mg = fe_mg_total * fe_absorption_factor
+  )
+```
+
+------------------------------------------------------------------------
+
+# Phase C: Diagnostic Tables
+
+## C1. Zinc Absorption by Age Group (Miller)
+
+```{r}
+#| label: tbl-c1-miller-by-age
+#| tbl-cap: "Zinc Absorption by Age Group (Miller Equation)"
+
+# Create survey design for weighted estimates
+svy_bioavailable <- df_bioavailable |>
+ as_survey_design(
+
+    ids = conglomerado,
+    weights = pesonino
+  )
+
+# TAZ by age group
+tbl_c1_miller_by_age <- svy_bioavailable |>
+  mutate(
+    age_group = cut(
+      edad_mes,
+      breaks = c(6, 12, 24, 36, 48, 60),
+      labels = c("6-11 mo", "12-23 mo", "24-35 mo", "36-47 mo", "48-59 mo"),
+      include.lowest = TRUE
+    )
+  ) |>
+  group_by(age_group) |>
+  summarise(
+    n = n(),
+    mean_zn_intake = survey_mean(zn_mg_total, vartype = "ci"),
+    mean_taz = survey_mean(taz_mg, vartype = "ci"),
+    mean_absorption_pct = survey_mean(zn_fractional_absorption * 100, vartype = "ci")
+  )
+
+export(tbl_c1_miller_by_age, here("01_data", "02_processed", "web_resources", "04_03_tbl_c1_miller_by_age.rds"))
+
+tbl_c1_miller_by_age |>
+  gt() |>
+  tab_header(
+    title = "Zinc Absorption by Age Group",
+    subtitle = "Miller equation results for children 6-59 months"
+  ) |>
+  cols_label(
+    age_group = "Age Group",
+    n = "N",
+    mean_zn_intake = "Zn Intake",
+    mean_zn_intake_low = "95% CI",
+    mean_zn_intake_upp = "",
+    mean_taz = "TAZ",
+    mean_taz_low = "95% CI",
+    mean_taz_upp = "",
+    mean_absorption_pct = "Absorption",
+    mean_absorption_pct_low = "95% CI",
+    mean_absorption_pct_upp = ""
+  ) |>
+  cols_merge(columns = c(mean_zn_intake_low, mean_zn_intake_upp), pattern = "[{1}, {2}]") |>
+  cols_merge(columns = c(mean_taz_low, mean_taz_upp), pattern = "[{1}, {2}]") |>
+  cols_merge(columns = c(mean_absorption_pct_low, mean_absorption_pct_upp), pattern = "[{1}, {2}]") |>
+  fmt_number(columns = c(mean_zn_intake, mean_taz), decimals = 2) |>
+  fmt_number(columns = c(mean_zn_intake_low, mean_taz_low), decimals = 2) |>
+  fmt_number(columns = c(mean_absorption_pct, mean_absorption_pct_low), decimals = 1) |>
+  tab_spanner(label = "Zinc Intake (mg/d)", columns = c(mean_zn_intake, mean_zn_intake_low)) |>
+  tab_spanner(label = "Absorbed Zinc (mg/d)", columns = c(mean_taz, mean_taz_low)) |>
+  tab_spanner(label = "Fractional (%)", columns = c(mean_absorption_pct, mean_absorption_pct_low)) |>
+  tab_source_note("TAZ = Total Absorbed Zinc. Absorption increases with age per Miller equation.") |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_c1_miller_by_age)
+```
+
+## C2. Iron Absorption Summary
+
+```{r}
+#| label: tbl-c2-iron-summary
+#| tbl-cap: "Iron Intake and Absorption Summary"
+
+tbl_c2_iron_summary <- svy_bioavailable |>
+  summarise(
+    n = n(),
+    mean_fe_intake = survey_mean(fe_mg_total, vartype = "ci"),
+    mean_fe_absorbed = survey_mean(fe_absorbed_mg, vartype = "ci")
+  ) |>
+  mutate(
+    absorption_factor = "5% (low absorption)",
+    absorbed_requirement = "0.5 mg/day"
+  )
+
+export(tbl_c2_iron_summary, here("01_data", "02_processed", "web_resources", "04_03_tbl_c2_iron_summary.rds"))
+
+tbl_c2_iron_summary |>
+  gt() |>
+  tab_header(
+    title = "Iron Intake and Absorption",
+    subtitle = "Children 6-59 months, uniform 5% absorption factor"
+  ) |>
+  cols_label(
+    n = "N",
+    mean_fe_intake = "Mean Intake",
+    mean_fe_intake_low = "95% CI",
+    mean_fe_intake_upp = "",
+    mean_fe_absorbed = "Mean Absorbed",
+    mean_fe_absorbed_low = "95% CI",
+    mean_fe_absorbed_upp = "",
+    absorption_factor = "Absorption Factor",
+    absorbed_requirement = "Requirement (absorbed)"
+  ) |>
+  cols_merge(columns = c(mean_fe_intake_low, mean_fe_intake_upp), pattern = "[{1}, {2}]") |>
+  cols_merge(columns = c(mean_fe_absorbed_low, mean_fe_absorbed_upp), pattern = "[{1}, {2}]") |>
+  fmt_number(columns = c(mean_fe_intake, mean_fe_intake_low, mean_fe_absorbed, mean_fe_absorbed_low), decimals = 2) |>
+  tab_spanner(label = "Iron Intake (mg/d)", columns = c(mean_fe_intake, mean_fe_intake_low)) |>
+  tab_spanner(label = "Absorbed Iron (mg/d)", columns = c(mean_fe_absorbed, mean_fe_absorbed_low)) |>
+  tab_spanner(label = "Methodology", columns = c(absorption_factor, absorbed_requirement)) |>
+  tab_source_note("Absorption factor based on Allen et al. (2020) H-AR for unrefined diets.") |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_c2_iron_summary)
+```
+
+## C3. Overall Bioavailability Summary
+
+```{r}
+#| label: tbl-c3-bioavailability-summary
+#| tbl-cap: "Micronutrient Bioavailability Summary"
+
+tbl_c3_bioavailability_summary <- svy_bioavailable |>
+  summarise(
+    # Zinc
+    zn_intake_mean = survey_mean(zn_mg_total, vartype = "ci"),
+    taz_mean = survey_mean(taz_mg, vartype = "ci"),
+    zn_abs_pct = survey_mean(zn_fractional_absorption * 100, vartype = "ci"),
+    # Iron
+    fe_intake_mean = survey_mean(fe_mg_total, vartype = "ci"),
+    fe_absorbed_mean = survey_mean(fe_absorbed_mg, vartype = "ci"),
+    fe_abs_pct = survey_mean(fe_absorption_factor * 100, vartype = "ci")
+  ) |>
+  pivot_longer(everything(), names_to = "metric", values_to = "value") |>
+  mutate(
+    nutrient = case_when(
+      str_detect(metric, "^zn|^taz") ~ "Zinc",
+      str_detect(metric, "^fe") ~ "Iron"
+    ),
+    measure = case_when(
+      str_detect(metric, "intake_mean$") ~ "Total Intake (mg/d)",
+      str_detect(metric, "^taz_mean$|absorbed_mean$") ~ "Absorbed (mg/d)",
+      str_detect(metric, "abs_pct$") ~ "Absorption Rate (%)",
+      str_detect(metric, "_low$") ~ "ci_low",
+      str_detect(metric, "_upp$") ~ "ci_upp"
+    ),
+    ci_type = case_when(
+      str_detect(metric, "_low$") ~ "low",
+      str_detect(metric, "_upp$") ~ "upp",
+      TRUE ~ "est"
+    ),
+    measure_clean = str_remove(metric, "(_low|_upp)$")
+  ) |>
+  filter(ci_type == "est") |>
+  select(nutrient, measure, value) |>
+  filter(!is.na(measure)) |>
+  pivot_wider(names_from = nutrient, values_from = value)
+
+export(tbl_c3_bioavailability_summary, here("01_data", "02_processed", "web_resources", "04_03_tbl_c3_bioavailability_summary.rds"))
+
+tbl_c3_bioavailability_summary |>
+  gt() |>
+  tab_header(
+    title = "Micronutrient Bioavailability Summary",
+    subtitle = "Survey-weighted estimates for children 6-59 months"
+  ) |>
+  cols_label(
+    measure = "Metric",
+    Zinc = "Zinc",
+    Iron = "Iron"
+  ) |>
+  fmt_number(columns = c(Zinc, Iron), decimals = 2) |>
+  tab_source_note("Zinc: Miller equation (age-dependent). Iron: Assumed uniform 5% absorption based on dietary patterns") |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_c3_bioavailability_summary)
+```
+
+------------------------------------------------------------------------
+
+# Phase D: Export
+
+```{r}
+#| label: d-save-output
+
+# Prepare final dataset
+df_output <- df_bioavailable |>
+  select(
+    # === Identifiers ===
+    nboletahogar, conglomerado, pesonino,
+    
+    # === Demographics ===
+    parentesco, sexo, edad_an, edad_mes, edad_grupos,
+    
+    # === Geographic ===
+    departamento, area,
+    
+    # === Household characteristics ===
+    miembros_hogar_original, n_cuartos_original,
+    grado_estudios, grado_estudios_hogar,
+    propiedad, tipo_vivienda,
+    material_paredes, material_techo, material_piso,
+    
+    # === Basic services ===
+    cocina, tipo_sanitario, fuente_agua, recoleccion_basura,
+    
+    # === Household assets ===
+    electricidad, televisor, telefonia_fija, telefonia_celular, computadora,
+    
+    # === Food security (FIES) ===
+    fies1, fies2, fies3, fies4, fies5, fies6, fies7, fies8,
+    fies_raw_score,
+    
+    # === Nutritional intake by source (mg/day or kcal/day) ===
+    fe_mg_maiz, fe_mg_nomaiz,
+    zn_mg_maiz, zn_mg_nomaiz,
+    prot_g_maiz, prot_g_nomaiz,
+    lys_mg_maiz, lys_mg_nomaiz,
+    trp_mg_maiz, trp_mg_nomaiz,
+    ene_kcal_maiz, ene_kcal_nomaiz,
+
+    # === Raw transfer-model predictions (preserved from 04_01) ===
+    # Pre-FIES, pre-quantile-mapping, pre-alignment. Diagnostics only.
+    fe_mg_maiz_raw, fe_mg_nomaiz_raw,
+    zn_mg_maiz_raw, zn_mg_nomaiz_raw,
+    prot_g_maiz_raw, prot_g_nomaiz_raw,
+    lys_mg_maiz_raw, lys_mg_nomaiz_raw,
+    trp_mg_maiz_raw, trp_mg_nomaiz_raw,
+    ene_kcal_maiz_raw, ene_kcal_nomaiz_raw,
+
+    # === Dietary composition ===
+    per_vegetales,
+    
+    # === Bioavailable micronutrients ===
+    # Zinc (Miller equation)
+    zn_mg_total,
+    taz_mg,
+    zn_fractional_absorption,
+    # Iron
+    fe_mg_total,
+    fe_absorption_factor,
+    fe_absorbed_mg,
+    
+    # === Total intake (other nutrients) ===
+    prot_g_total, lys_mg_total, trp_mg_total, ene_kcal_total,
+    
+    # === Chispitas supplementation ===
+    receives_chispitas,
+    adherence_factor_final,
+    fe_chispitas_effective_mg,
+    zn_chispitas_effective_mg
+  )
+
+# Save final dataset
+write_parquet(
+  df_output,
+  here("01_data", "02_processed", 
+       "transfer", "04_03_sivesnu_bioavailable.parquet")
+)
+```
+
+# Notes
+
+## Methodology
+
+### Miller Equation for Zinc
+
+The Miller equation estimates Total Absorbed Zinc (TAZ) among children based on age and total zinc intake:
+
+$$TAZ = 0.5 \times \left( K_T + A \cdot Age^E + TDZ - \sqrt{(K_T + A \cdot Age^E + TDZ)^2 - 4 \cdot (A \cdot Age^E) \cdot TDZ} \right)$$
+
+Parameters used:
+
+-   $K_T = 2.42$ (saturation constant)
+-   $A = 0.633$ (age coefficient)
+-   $E = 0.311$ (age exponent)
+
+Key characteristics:
+
+-   Absorption capacity increases with age
+-   Fractional absorption decreases at higher zinc intakes (saturation effect)
+-   Validated for combined dietary + supplemental zinc (including MNP studies)
+
+### Iron Bioavailability
+
+Iron absorption is estimated using a uniform 5% factor based on the predominantly plant-based dietary patterns observed in this population.
+
+**Methodology justification**:
+
+1. **Dietary analysis**: Survey-weighted analysis places the plant-food share of the diet in the very-high-phytate range for the great majority of children, as reported in the Phase A distribution.
+
+2. **Reference framework**: Allen et al. (2020) H-AR values recommend 5% absorption for "low absorption / unrefined diet" scenarios with high phytate content.
+
+3. **Absorbed iron requirement**: With 5% absorption and 10 mg/day recommended intake, the absorbed iron requirement is 0.5 mg/day.
+
+This absorbed-iron requirement is consistent with the bioavailability methodology adopted for predominantly plant-based child populations.
+
+## Limitations
+
+1.  **Iron bioavailability factors**: A uniform 5% absorption rate is applied to the entire population; individual variation in absorption is not modelled. 
+
+2.  **Chispitas mineral form**: Modeled iron and zinc absorption does not account for potential differences in absorption of zinc sulfate and ferrous fumarate in Chispitas relative to iron and zinc from dietary sources.
+
+## References
+
+-   Allen LH, Carriquiry AL, Murphy SP (2020). Perspective: Proposed Harmonized Nutrient Reference Values for Populations. *Advances in Nutrition* 11:469-483. doi: 10.1093/advances/nmz096.
+
+-   Miller LV, Krebs NF, Hambidge KM (2007). A mathematical model of zinc absorption in humans as a function of dietary zinc and phytate. *Journal of Nutrition* 137(1):135-141.
+
+-   International Zinc Nutrition Consultative Group (IZiNCG) (2004). Technical Brief No. 3: Assessment of the risk of zinc deficiency in populations.
+
+-   WHO/FAO (2004). Vitamin and mineral requirements in human nutrition, 2nd edition.
+
+-   Engle-Stone R (2025). Personal communication regarding the application of the Miller equation for children receiving micronutrient powders.
+
+-   Soto Méndez MJ (2025). Personal communication regarding iron bioavailability methodology for the Guatemalan child population.

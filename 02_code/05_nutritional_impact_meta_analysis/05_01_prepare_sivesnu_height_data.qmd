@@ -1,0 +1,1355 @@
+---
+title: "Prepare SIVESNU Height Data for Transfer Modeling"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script prepares the SIVESNU 2018 dataset for building a height transfer model that will predict child stature in ENCOVI 2023. 
+
+The predictor variable set comprises demographic, socioeconomic, and geographic variables present in both ENCOVI 2023 and SIVESNU 2018, which constitute the bridge between the two surveys for cross-dataset prediction. Feature selection via Boruta confirms or refines this subset specifically for height prediction.
+
+Main operations:
+
+1. Load SIVESNU 2018 raw data (household, individual, and child tables)
+2. Filter to target population (children aged 6-59 months with valid anthropometric data)
+3. Merge tables and harmonize variables to match ENCOVI coding structure
+4. Impute missing values using Random Forest (missRanger via `impute_rf_parallel()`)
+5. Evaluate predictor quality (correlation, near-zero variance)
+6. Apply Yeo-Johnson transformations to continuous predictors
+7. Run Boruta feature selection with multi-threaded ranger engine using height (talla_cm) as outcome
+8. Save modeling-ready dataset and transformation objects
+
+**Target population**: Children aged 6-59 months. Children under 6 months are excluded as they should be exclusively breastfed per WHO guidelines, making their anthropometric patterns non-comparable with older children's dietary intake profiles.
+
+# Setup
+
+## Load Packages
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  janitor,            # Data cleaning utilities
+  haven,              # Manage Stata files
+  gt,                 # Table formatting and presentation
+  bestNormalize,      # Variable normalization
+  moments,            # Skewness calculation for YJ assessment
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to avoid namespace bloat):
+# ggcorrplot  — ggcorrplot() for correlation matrix visualization
+# caret       — nearZeroVar() for variable selection
+# Boruta      — Boruta(), getImpRfZ(), attStats() for RF-based feature selection
+# missRanger  — loaded internally by impute_rf_parallel() in 00_functions.R
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# models/
+ensure_output_dir(here("01_data", "02_processed", "models"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+---
+
+# Phase A: Data Loading
+
+## A1. Load SIVESNU Raw Data
+
+Load the three SIVESNU 2018 tables required for this script: household characteristics, individual demographics, and child anthropometric measurements.
+
+```{r}
+#| label: a1-load-sivesnu-data
+
+# Load SIVESNU 2018 household data
+sivesnu_hogar <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018", "sivesnu_gt18_hogar_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Load SIVESNU 2018 individual/members data
+sivesnu_individuos <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018", "sivesnu_gt18_miembros_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Load SIVESNU 2018 child data (contains anthropometric measurements)
+sivesnu_nino <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018", "sivesnu_gt18_nino_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+```
+
+## A2. Extract Child Anthropometric Data
+
+Extract height measurements and age in months from the child table. Filter to the target population (6-59 months) and remove records with missing or implausible anthropometric values.
+
+```{r}
+#| label: a2-extract-child-data
+
+# Extract relevant child-level variables
+df_children <- sivesnu_nino |>
+  transmute(
+    # Identifiers
+    nboletahogar,
+    conglomerado,
+    # Survey weight
+    pesonino = pesonino,
+    # Age in months
+    edad_mes = edad_mes,
+    # Sex (recode to match ENCOVI labels)
+    sexo_nino = case_when(
+      sexonino == 1 ~ "Hombre",
+      sexonino == 2 ~ "Mujer",
+      TRUE ~ NA_character_
+    ),
+    # Anthropometric measurements
+    talla_cm = talla_cm,
+    # WHO z-scores (for validation, not used as predictors)
+    zlen = zlen,
+    hfa = hfa
+  ) |>
+  # Filter to target population: 6-59 months
+  filter(
+    edad_mes >= 6,
+    edad_mes <= 59
+  ) |>
+  # Remove records with missing or implausible height
+  filter(
+    !is.na(talla_cm),
+    talla_cm > 40,   # Physiological minimum for 6+ month children
+    talla_cm < 130   # Physiological maximum for under-5 children
+  ) |>
+  # Remove records with missing z-scores
+  drop_na(zlen)
+```
+
+```{r}
+#| label: tbl-a2-population-summary
+#| tbl-cap: "Target population summary after filtering"
+
+# Summary of filtered population
+tbl_a2_population_summary <- tibble(
+  Metric = c(
+    "Total children in SIVESNU child table",
+    "Children aged 6-59 months",
+    "With valid height measurement",
+    "With valid ZLEN z-score",
+    "Final target population"
+  ),
+  N = c(
+    nrow(sivesnu_nino),
+    sivesnu_nino |> filter(edad_mes >= 6, edad_mes <= 59) |> nrow(),
+    sivesnu_nino |>
+      filter(edad_mes >= 6, edad_mes <= 59, !is.na(talla_cm),
+             talla_cm > 40, talla_cm < 130) |>
+      nrow(),
+    df_children |> nrow(),
+    nrow(df_children)
+  )
+)
+
+export(tbl_a2_population_summary,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_a2_population_summary.rds"))
+
+tbl_a2_population_summary |>
+  gt() |>
+  tab_header(
+    title = "Target Population Filtering Summary",
+    subtitle = "SIVESNU 2018 children aged 6-59 months with valid anthropometry"
+  ) |>
+  fmt_number(columns = N, decimals = 0, sep_mark = ",") |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = N) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "Final target population")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "Final target population")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_a2_population_summary)
+```
+
+---
+
+# Phase B: Variable Harmonization
+
+Merge SIVESNU tables and recode variables to ensure coding compatibility with ENCOVI 2023, which is required for the transfer model to generate predictions across both surveys. The harmonization covers geographic, socioeconomic, housing, service, and asset variables using standardized factor levels.
+
+## B1. Merge and Recode SIVESNU Variables
+
+```{r}
+#| label: b1-merge-and-recode
+
+# Merge household and individual tables, then recode to match ENCOVI structure
+df_merge <- sivesnu_individuos |>
+  left_join(sivesnu_hogar, by = join_by(nboletahogar, conglomerado)) |>
+  transmute(
+    # --- Identifiers ---
+    nboletahogar,
+    conglomerado,
+
+    # --- Geographic ---
+    departamento = factor(
+      departamento,
+      levels = c("Guatemala", "", "Sacatepéquez", "Chimaltenango",
+                 "Escuintla", "Santa Rosa", "Sololá", "Totonicapán",
+                 "Quezaltenango", "Suchitepéquez", "Retalhuleu", "San Marcos",
+                 "Huehuetenango", "Quiché", "Baja Verapaz", "Alta Verapaz",
+                 "Petén", "Izabal", "Zacapa", "Chiquimula",
+                 "Jalapa", "Jutiapa"),
+      labels = c("Guatemala", "El Progreso", "Sacatepéquez", "Chimaltenango",
+                 "Escuintla", "Santa Rosa", "Sololá", "Totonicapán",
+                 "Quetzaltenango", "Suchitepéquez", "Retalhuleu", "San Marcos",
+                 "Huehuetenango", "Quiché", "Baja Verapaz", "Alta Verapaz",
+                 "Petén", "Izabal", "Zacapa", "Chiquimula",
+                 "Jalapa", "Jutiapa"),
+      ordered = TRUE
+    ),
+    area = factor(
+      ruralurbano,
+      levels = c(1, 2),
+      labels = c("Urbana", "Rural")
+    ),
+
+    # --- Household characteristics ---
+    miembros_hogar = num_miembros_hogar,
+    propiedad = factor(
+      ifelse(vivienda_propriedad == "", 96, vivienda_propriedad),
+      levels = c(1, 2, 3, 4, 96),
+      labels = c("Propia y totalmente pagada", "Propia y pagandola a plazos",
+                 "Alquilada", "Cedida o prestada", "Otro")
+    ),
+
+    # --- Housing characteristics ---
+    material_paredes = factor(
+      ifelse(vivienda_material_pared == "" |
+               vivienda_material_pared == 8 |
+               is.na(vivienda_material_pared),
+             96, vivienda_material_pared),
+      levels = c(6, 3, 2, 5, 4, 1, 7, 96),
+      labels = c("Ladrillo", "Block", "Adobe", "Madera",
+                 "Lamina metalica", "Bajareque", "Lepa, palo o caña", "Otro")
+    ),
+    material_techo = factor(
+      ifelse(vivienda_material_techo == "" | is.na(vivienda_material_techo),
+             96, vivienda_material_techo),
+      levels = c(5, 3, 4, 2, 1, 96),
+      labels = c("Concreto", "Lamina metalica", "Asbesto cemento",
+                 "Teja", "Paja, palma o similar", "Otro")
+    ),
+    material_piso = factor(
+      ifelse(vivienda_material_piso == "" | is.na(vivienda_material_piso), 
+             96, vivienda_material_piso),
+      levels = c(6, 5, 2, 7, 4, 3, 1, 96), 
+      labels = c("Ladrillo ceramico", "Ladrillo de cemento", "Ladrillo de barro", 
+                 "Torta de cemento", "Tierra", "Madera", "Tierra", "Tierra")
+    ),
+    tipo_vivienda = factor(
+      ifelse(vivienda_tipo == "", 96, vivienda_tipo),
+      levels = c(1, 2, 3, 4, 5, 96),
+      labels = c("Casa formal", "Apartamento", "Cuarto en casa de vecindad",
+                 "Rancho", "Casa improvisada", "Otro")
+    ),
+    n_cuartos = vivienda_cuartos,
+    tipo_sanitario = factor(
+      case_when(
+        serv_san_tipo == 1 ~ "Uso exclusivo",
+        serv_san_tipo == 2 ~ "Uso compartido",
+        serv_san_tipo == 3 ~ "Uso compartido",
+        serv_san_tipo == 4 ~ "Uso exclusivo",
+        serv_san_tipo == 5 ~ "Uso exclusivo",
+        serv_san_tipo == 6 ~ "Uso compartido",
+        serv_san_tipo == 96 ~ "Uso compartido",
+        TRUE ~ "Uso compartido"
+      ),
+      levels = c("Uso exclusivo", "Uso compartido")
+    ),
+    cocina = factor(
+      cocina_tiene, 
+      levels = c(1, 2), 
+      labels = c("De uso exclusivo", "De uso compartido")
+    ),
+
+    # --- Basic services ---
+    fuente_agua = factor(
+      ifelse(agua_fuente %in% c("", 9), 96, agua_fuente),
+      levels = c(1, 3, 2, 5, 6, 8, 7, 96),
+      labels = c("Tubería dentro de la vivienda",
+                 "Tubería fuera de la vivienda",
+                 "Chorro publico", "Pozo perforado",
+                 "Río, lago, manantial", "Camion cisterna",
+                 "Agua de lluvia", "Otro")
+    ),
+    recoleccion_basura = factor(
+      ifelse(basura_deshacer == "", 96, basura_deshacer),
+      levels = c(3, 5, 4, 2, 1, 96),
+      labels = c("Servicio municipal", "Servicio privado",
+                 "Servicio municipal", "La queman o la entierran",
+                 "La tiran en cualquier lugar",
+                 "La tiran en cualquier lugar")
+    ),
+
+    # --- Household assets ---
+    electricidad = factor(
+      bienes_luz, levels = c("Yes", "No"), labels = c("Si", "No")
+    ),
+    televisor = factor(
+      bienes_television, levels = c("Yes", "No"), labels = c("Si", "No")
+    ),
+    telefonia_fija = factor(
+      bienes_telefonofija, levels = c("Yes", "No"), labels = c("Si", "No")
+    ),
+    telefonia_celular = factor(
+      bienes_celular, levels = c("Yes", "No"), labels = c("Si", "No")
+    ),
+    computadora = factor(
+      bienes_computadora, levels = c("Yes", "No"), labels = c("Si", "No")
+    ),
+
+    # --- Individual demographics ---
+    parentesco = factor(
+      case_when(
+        parentesco == 1 ~ "Jefe del hogar",
+        parentesco == 2 ~ "Esposo(a) o compañero(a)",
+        parentesco %in% c(3, 10) ~ "Hijo(a)",
+        parentesco == 4 ~ "Yerno o nuera",
+        parentesco == 5 ~ "Nieto(a)",
+        parentesco == 6 ~ "Padre o madre",
+        parentesco == 7 ~ "Suegro(a)",
+        parentesco == 8 ~ "Hermano(a)",
+        parentesco == 9 ~ "Otro pariente",
+        parentesco == 11 ~ "Empleado de casa particular",
+        parentesco == 12 ~ "Otro no pariente",
+        TRUE ~ "Otro pariente"
+      )
+    ),
+    sexo = factor(sexo, levels = c(1, 2), labels = c("Hombre", "Mujer")),
+    edad = edad,
+
+    # --- Education ---
+    grado_estudios = fct_relevel(
+      factor(
+        case_when(
+          grado_estudio %in% c("", "9-No sabe") ~ "Desconocido",
+          grado_estudio == "0-Ninguno" ~ "Ninguno",
+          grado_estudio == "4-Alfabetización" ~ "Solo sabe leer",
+          grado_estudio == "1-Primaria" ~ "Primaria",
+          grado_estudio == "2-Secundaria" ~ "Secundaria",
+          grado_estudio == "3-Superior/universitaria" ~ "Superior/universitaria"
+        ),
+        ordered = TRUE
+      ),
+      c("Desconocido", "Ninguno", "Solo sabe leer",
+        "Primaria", "Secundaria", "Superior/universitaria")
+    ),
+    grado_estudios_num = case_when(
+      grado_estudios == "Desconocido" ~ 1,
+      grado_estudios == "Ninguno" ~ 1,
+      grado_estudios == "Solo sabe leer" ~ 2,
+      grado_estudios == "Primaria" ~ 4,
+      grado_estudios == "Secundaria" ~ 7,
+      grado_estudios == "Superior/universitaria" ~ 10
+    ),
+    grado_estudios_num = if_else(
+      parentesco %in% c("Jefe del hogar", "Esposo(a) o compañero(a)"),
+      grado_estudios_num,
+      NA
+    )
+  ) |>
+  mutate(
+    grado_estudios_hogar = mean(grado_estudios_num, na.rm = TRUE),
+    .by = "nboletahogar",
+    .keep = "unused"
+  ) |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+```
+
+## B2. Join with Child Anthropometric Data
+
+Merge the harmonized household/individual data with child-level anthropometric measurements. Each child is matched to their household's socioeconomic profile.
+
+```{r}
+#| label: b2-join-with-children
+
+# Join children with household/individual data
+# Children are identified by household + age + sex match
+df_joined <- df_children |>
+  left_join(
+    df_merge,
+    by = join_by(nboletahogar, conglomerado),
+    relationship = "many-to-many"
+  ) |>
+  # Resolve many-to-many: keep the match closest in age
+  mutate(
+    age_diff = abs(edad_mes / 12 - edad)
+  ) |>
+  slice_min(age_diff, n = 1, by = c(nboletahogar, conglomerado,
+                                      edad_mes, sexo_nino)) |>
+  select(-age_diff, -edad) |>
+  # Use child's sex from the child table (more reliable)
+  mutate(
+    sexo = factor(sexo_nino, levels = c("Hombre", "Mujer"))
+  ) |>
+  select(-sexo_nino) |>
+  # Convert edad_mes to years for compatibility with transfer model predictors
+  mutate(
+    edad = edad_mes / 12
+  ) |>
+  # Remove duplicates if any remain
+  distinct()
+```
+
+```{r}
+#| label: tbl-b2-merge-quality
+#| tbl-cap: "Merge quality assessment"
+
+tbl_b2_merge_quality <- tibble(
+  Metric = c(
+    "Children before merge",
+    "Children after merge",
+    "Match rate",
+    "Children with complete department",
+    "Children with complete area"
+  ),
+  Value = c(
+    as.character(nrow(df_children)),
+    as.character(nrow(df_joined)),
+    paste0(round(nrow(df_joined) / nrow(df_children) * 100, 1), "%"),
+    as.character(sum(!is.na(df_joined$departamento))),
+    as.character(sum(!is.na(df_joined$area)))
+  )
+)
+
+export(tbl_b2_merge_quality,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_b2_merge_quality.rds"))
+
+tbl_b2_merge_quality |>
+  gt() |>
+  tab_header(
+    title = "Child-Household Merge Quality",
+    subtitle = "Matching children to their household socioeconomic profiles"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_b2_merge_quality)
+```
+
+---
+
+# Phase C: Missing Value Treatment
+
+## C1. Diagnose Missing Values
+
+Assess the extent of missing data in predictor variables to determine imputation requirements.
+
+```{r}
+#| label: tbl-c1-diagnose-missing
+#| tbl-cap: "Missing value summary for predictor variables"
+
+# Calculate missing value statistics for predictors
+missing_summary <- df_joined |>
+  select(
+    parentesco, sexo, edad, departamento, area,
+    miembros_hogar, grado_estudios_hogar, propiedad,
+    tipo_vivienda, material_paredes, material_techo, material_piso,
+    n_cuartos, cocina, tipo_sanitario,
+    fuente_agua, recoleccion_basura,
+    electricidad, televisor, telefonia_fija, telefonia_celular, computadora
+  ) |>
+  summarise(
+    across(
+      everything(),
+      list(
+        n_missing = \(x) sum(is.na(x)),
+        pct_missing = \(x) mean(is.na(x)) * 100
+      )
+    )
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_pattern = "(.+)_(n_missing|pct_missing)"
+  ) |>
+  arrange(desc(pct_missing))
+
+export(missing_summary,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_c1_diagnose_missing.rds"))
+
+# Format as GT table
+missing_summary |>
+  gt() |>
+  tab_header(
+    title = "Missing Values in Predictor Variables",
+    subtitle = "Assessment prior to imputation"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_missing = "N Missing",
+    pct_missing = "% Missing"
+  ) |>
+  fmt_number(columns = n_missing, decimals = 0, sep_mark = ",") |>
+  fmt_number(columns = pct_missing, decimals = 2, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = pct_missing, rows = pct_missing > 10)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF9C4"),
+    locations = cells_body(columns = pct_missing,
+                           rows = pct_missing > 0 & pct_missing <= 10)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#C8E6C9"),
+    locations = cells_body(columns = pct_missing, rows = pct_missing == 0)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(missing_summary)
+```
+
+## C2. Impute Missing Values
+
+Apply Random Forest imputation using the `impute_rf_parallel()` utility function to handle missing values in predictor variables. The function wraps `missRanger::missRanger()` with a multi-threaded `ranger` engine, preserving inter-variable correlations and handling mixed data types. Output follows the same contract (`ximp`, `OOBerror`) used across preparation scripts.
+
+```{r}
+#| label: tbl-c2-impute-missing
+#| tbl-cap: "Random Forest imputation quality metrics"
+
+# Separate predictors for imputation
+predictors_to_impute <- df_joined |>
+  select(
+    parentesco, sexo, departamento, area,
+    miembros_hogar, grado_estudios_hogar, propiedad,
+    tipo_vivienda, material_paredes, material_techo, material_piso,
+    n_cuartos, cocina, tipo_sanitario,
+    fuente_agua, recoleccion_basura,
+    electricidad, televisor, telefonia_fija, telefonia_celular, computadora
+  ) |>
+  # Convert ordered factors for imputation compatibility
+  mutate(
+    departamento = factor(departamento, ordered = FALSE)
+  ) |>
+  # Drop unused factor levels to avoid ranger warnings
+  droplevels() |>
+  as.data.frame()
+
+# Apply Random Forest imputation via missRanger (multi-threaded ranger engine)
+set.seed(789)
+imputed_result <- impute_rf_parallel(
+  data = predictors_to_impute,
+  maxiter = 10,
+  ntree = 100,
+  verbose = FALSE
+)
+
+# Extract imputed data
+predictors_imputed <- imputed_result$ximp
+
+# Reconstruct complete dataset
+df_imputed <- df_joined |>
+  select(nboletahogar, conglomerado, pesonino, edad_mes, edad,
+         talla_cm, zlen, hfa, sexo) |>
+  bind_cols(
+    predictors_imputed |> select(-sexo)
+  )
+
+# Imputation quality table
+imputation_metrics <- imputed_result$OOBerror
+
+# Report each metric only when a variable of that type required imputation
+n_continuous <- imputed_result$n_continuous
+n_categorical <- imputed_result$n_categorical
+
+oobe_display <- if (n_continuous > 0) {
+  formatC(imputation_metrics["OOBE"], digits = 4, format = "f")
+} else {
+  "N/A"
+}
+oobe_assessment <- if (n_continuous > 0) {
+  if_else(imputation_metrics["OOBE"] < 0.5, "Acceptable", "Review required")
+} else {
+  "No continuous variables required imputation"
+}
+
+pfc_display <- if (n_categorical > 0) {
+  formatC(imputation_metrics["PFC"], digits = 4, format = "f")
+} else {
+  "N/A"
+}
+pfc_assessment <- if (n_categorical > 0) {
+  if_else(imputation_metrics["PFC"] < 0.2, "Acceptable", "Review required")
+} else {
+  "No categorical variables required imputation"
+}
+
+tbl_c2_impute_missing <- tibble(
+  Metric = c(
+    "OOBE (Continuous Variables)",
+    "PFC (Categorical Variables)",
+    "Number of Iterations",
+    "Trees per Iteration"
+  ),
+  Value = c(
+    oobe_display,
+    pfc_display,
+    "10",
+    "100"
+  ),
+  Assessment = c(
+    oobe_assessment,
+    pfc_assessment,
+    "Fixed parameter",
+    "Fixed parameter"
+  )
+)
+
+export(tbl_c2_impute_missing,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_c2_impute_missing.rds"))
+
+tbl_c2_impute_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Value Imputation Quality Assessment",
+    subtitle = "Out-of-bag error estimates from Random Forest imputation (missRanger)"
+  ) |>
+  cols_label(
+    Metric = "Metric",
+    Value = "Value",
+    Assessment = "Quality Assessment"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#C8E6C9"),
+    locations = cells_body(columns = Assessment,
+                           rows = Assessment == "Acceptable")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = Assessment,
+                           rows = Assessment == "Review required")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(columns = Assessment,
+                           rows = Assessment == "No continuous variables required imputation")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(columns = Assessment,
+                           rows = Assessment == "No categorical variables required imputation")
+  ) |>
+  tab_footnote(
+    footnote = "OOBE: out-of-bag error across continuous variables, the square root of the variance-weighted mean of per-variable unexplained variance. Values < 0.5 indicate acceptable imputation quality. N/A when no continuous variables had missing values.",
+    locations = cells_body(columns = Metric, rows = 1)
+  ) |>
+  tab_footnote(
+    footnote = "PFC: Proportion of Falsely Classified entries. Values < 0.2 indicate acceptable imputation quality for categorical variables. N/A when no categorical variables had missing values.",
+    locations = cells_body(columns = Metric, rows = 2)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean auxiliary objects
+rm(predictors_to_impute, imputed_result, predictors_imputed, imputation_metrics,
+   n_continuous, n_categorical,
+   oobe_display, oobe_assessment, pfc_display, pfc_assessment,
+   tbl_c2_impute_missing)
+```
+
+---
+
+# Phase D: Variable Quality Assessment
+
+## D1. Evaluate Predictor Correlation
+
+Assess pairwise correlation among predictor variables to identify potential multicollinearity issues. Variables with correlation exceeding r > 0.8 are candidates for removal.
+
+```{r}
+#| label: fig-d1-correlation-analysis
+#| fig-cap: "Correlation matrix of predictor variables for height modeling"
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+
+# Calculate correlation matrix for all predictors
+fig_d1_correlation_analysis <- df_imputed |>
+  select(
+    parentesco, sexo, edad, departamento, area, miembros_hogar,
+    grado_estudios_hogar, propiedad, tipo_vivienda, material_paredes,
+    material_techo, material_piso, n_cuartos, cocina, tipo_sanitario,
+    fuente_agua, recoleccion_basura, electricidad, televisor,
+    telefonia_fija, telefonia_celular, computadora
+  ) |>
+  mutate(across(everything(), \(x) as.numeric(as.factor(x)))) |>
+  cor() |>
+  round(1)
+
+export(fig_d1_correlation_analysis,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_fig_d1_correlation_analysis.rds"))
+
+fig_d1_correlation_analysis |>
+  ggcorrplot::ggcorrplot(
+    hc.order = TRUE,
+    colors = c("#E46726", "white", "#6D9EC1"),
+    type = "lower",
+    lab = TRUE
+  )
+
+# Cleanup auxiliary objects
+rm(fig_d1_correlation_analysis)
+```
+
+## D2. Identify Near-Zero Variance Predictors
+
+Evaluate variables with near-zero variance that provide minimal information for modeling.
+
+```{r}
+#| label: tbl-d2-near-zero-variance
+#| tbl-cap: "Near-zero variance analysis for predictor variables"
+
+# Analyze variance for all predictors
+nzv_results <- df_imputed |>
+  select(
+    parentesco, sexo, edad, departamento, area, miembros_hogar,
+    grado_estudios_hogar, propiedad, tipo_vivienda, material_paredes,
+    material_techo, material_piso, n_cuartos, cocina, tipo_sanitario,
+    fuente_agua, recoleccion_basura, electricidad, televisor,
+    telefonia_fija, telefonia_celular, computadora
+  ) |>
+  caret::nearZeroVar(saveMetrics = TRUE) |>
+  rownames_to_column("variable") |>
+  arrange(desc(freqRatio))
+
+export(nzv_results,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_d2_near_zero_variance.rds"))
+
+# Display results
+nzv_results |>
+  gt() |>
+  tab_header(
+    title = "Near-Zero Variance Analysis",
+    subtitle = "Variables with insufficient variation for modeling"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    freqRatio = "Frequency Ratio",
+    percentUnique = "% Unique Values",
+    zeroVar = "Zero Variance",
+    nzv = "Near-Zero Variance"
+  ) |>
+  fmt_number(columns = c(freqRatio, percentUnique), decimals = 2) |>
+  tab_style(
+    style = cell_fill(color = "#FFCDD2"),
+    locations = cells_body(columns = nzv, rows = nzv == TRUE)
+  ) |>
+  tab_source_note(
+    source_note = "Variables flagged as near-zero variance will be removed from the modeling dataset."
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Identify NZV variables to remove
+vars_nzv <- nzv_results |>
+  filter(nzv == TRUE) |>
+  pull(variable)
+
+rm(nzv_results)
+```
+
+## D3. Remove Problematic Variables
+
+Remove variables flagged as near-zero variance by the NZV analysis. Variables with insufficient variation provide no discriminating information for the transfer model and can introduce noise in downstream feature selection.
+
+```{r}
+#| label: d3-remove-variables
+
+# Remove near-zero variance variables and high-correlation redundancies
+df_clean <- df_imputed |>
+  select(-any_of(vars_nzv))
+```
+
+---
+
+# Phase E: Yeo-Johnson Transformations
+
+Apply Yeo-Johnson transformations to normalize continuous predictors. These transformations must be saved and reapplied identically when preparing ENCOVI data for prediction in script 05_03.
+
+## E1. Transform Continuous Predictors
+
+```{r}
+#| label: e1-yeo-johnson-transforms
+
+# Apply Yeo-Johnson transformation to miembros_hogar
+yj_miembros_hogar <- bestNormalize(df_clean$miembros_hogar,
+                                    allow_orderNorm = FALSE)
+
+# Apply Yeo-Johnson transformation to n_cuartos
+yj_n_cuartos <- bestNormalize(df_clean$n_cuartos,
+                               allow_orderNorm = FALSE)
+
+# Apply transformations to create final modeling variables
+df_transformed <- df_clean |>
+  mutate(
+    miembros_hogar_original = miembros_hogar,
+    n_cuartos_original = n_cuartos,
+    miembros_hogar = predict(yj_miembros_hogar),
+    n_cuartos = predict(yj_n_cuartos)
+  )
+```
+
+```{r}
+#| label: tbl-e1-yj-summary
+#| tbl-cap: "Yeo-Johnson transformation summary"
+
+tbl_e1_yj_summary <- tibble(
+  Variable = c("miembros_hogar", "n_cuartos"),
+  `Pre-transform Skewness` = c(
+    skewness(df_clean$miembros_hogar, na.rm = TRUE),
+    skewness(df_clean$n_cuartos, na.rm = TRUE)
+  ),
+  `Post-transform Skewness` = c(
+    skewness(df_transformed$miembros_hogar, na.rm = TRUE),
+    skewness(df_transformed$n_cuartos, na.rm = TRUE)
+  ),
+  `Transformation Type` = c(
+    class(yj_miembros_hogar$chosen_transform)[1],
+    class(yj_n_cuartos$chosen_transform)[1]
+  )
+)
+
+export(tbl_e1_yj_summary,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_e1_yj_summary.rds"))
+
+tbl_e1_yj_summary |>
+  gt() |>
+  tab_header(
+    title = "Yeo-Johnson Transformation Results",
+    subtitle = "Normalization of continuous predictor variables"
+  ) |>
+  fmt_number(
+    columns = c(`Pre-transform Skewness`, `Post-transform Skewness`),
+    decimals = 3
+  ) |>
+  cols_align(align = "left", columns = Variable) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_e1_yj_summary)
+```
+
+---
+
+# Phase F: Feature Selection
+
+Apply Boruta algorithm to identify the predictor variables with confirmed importance for height prediction. The Boruta algorithm evaluates each candidate predictor against random shadow variables to determine statistical relevance for height prediction. The ranger engine is used as importance source, enabling multi-threaded tree construction within each Boruta iteration. With ~20 candidate predictors, the feature space is manageable without dimensionality reduction techniques, preserving full interpretability of the selected variable set.
+
+## F1. Run Boruta Feature Selection
+
+Feature selection uses height in cm (`talla_cm`) as the outcome variable. This is the actual measured variable that will be predicted in ENCOVI, providing a direct assessment of which socioeconomic/demographic variables best predict child stature.
+
+```{r}
+#| label: f1-run-boruta
+
+# Prepare data for Boruta
+# Exclude identifiers, age_months, z-scores, and original untransformed variables
+df_for_boruta <- df_transformed |>
+  select(
+    # Outcome
+    talla_cm,
+    # Predictors (exclude NZV-removed and keep only modeling variables)
+    any_of(c(
+      "parentesco", "sexo", "edad", "departamento", "area",
+      "miembros_hogar", "grado_estudios_hogar", "propiedad",
+      "tipo_vivienda", "material_paredes", "material_techo",
+      "material_piso", "n_cuartos", "cocina", "tipo_sanitario",
+      "fuente_agua", "recoleccion_basura",
+      "electricidad", "televisor", "telefonia_celular", "computadora"
+    ))
+  ) |>
+  # Convert all to numeric for Boruta
+  mutate(across(everything(), \(x) as.numeric(as.factor(x))))
+
+# Run Boruta algorithm with ranger as importance source (multi-threaded)
+set.seed(789)
+boruta_result <- Boruta::Boruta(
+  talla_cm ~ .,
+  data = df_for_boruta,
+  doTrace = 0,
+  maxRuns = 150,
+  getImp = Boruta::getImpRfZ,
+  num.threads = parallel::detectCores() - 2
+)
+
+# Extract decision statistics
+boruta_stats <- Boruta::attStats(boruta_result) |>
+  rownames_to_column("variable") |>
+  mutate(
+    decision = case_when(
+      decision == "Confirmed" ~ "Confirmed",
+      decision == "Tentative" ~ "Tentative",
+      decision == "Rejected" ~ "Rejected"
+    )
+  ) |>
+  arrange(desc(medianImp))
+```
+
+```{r}
+#| label: tbl-f1-boruta-results
+#| tbl-cap: "Boruta feature selection results for height prediction"
+
+tbl_f1_boruta_results <- tibble(
+  Metric = c(
+    "Variables evaluated",
+    "Confirmed (relevant)",
+    "Tentative (borderline)",
+    "Rejected (not relevant)",
+    "Variables selected (Confirmed + Tentative)"
+  ),
+  Value = c(
+    as.character(nrow(boruta_stats)),
+    as.character(sum(boruta_stats$decision == "Confirmed")),
+    as.character(sum(boruta_stats$decision == "Tentative")),
+    as.character(sum(boruta_stats$decision == "Rejected")),
+    as.character(sum(boruta_stats$decision %in%
+                       c("Confirmed", "Tentative")))
+  )
+)
+
+export(tbl_f1_boruta_results,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_f1_boruta_results.rds"))
+
+tbl_f1_boruta_results |>
+  gt() |>
+  tab_header(
+    title = "Boruta Feature Selection Results",
+    subtitle = "Variable importance assessment for height (talla_cm) prediction"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      rows = Metric == "Variables selected (Confirmed + Tentative)"
+    )
+  ) |>
+  tab_source_note(
+    md("**Method:** Boruta with ranger importance source (multi-threaded), 150 iterations against shadow variables")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_f1_boruta_results)
+```
+
+```{r}
+#| label: fig-f1-boruta-importance
+#| fig-cap: "Variable importance from Boruta feature selection for height prediction"
+#| fig-height: 8
+#| fig-width: 10
+
+# Prepare importance data for selected variables
+df_boruta_plot <- boruta_result$ImpHistory |>
+  as.data.frame() |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "importance"
+  ) |>
+  filter(is.finite(importance), !str_detect(variable, "^shadow")) |>
+  left_join(
+    boruta_stats |> select(variable, decision, medianImp),
+    by = "variable"
+  ) |>
+  filter(decision %in% c("Confirmed", "Tentative")) |>
+  mutate(
+    decision = factor(decision, levels = c("Confirmed", "Tentative")),
+    variable = fct_reorder(variable, medianImp)
+  )
+
+# Shadow max threshold for reference line
+shadow_max_median <- boruta_result$ImpHistory |>
+  as.data.frame() |>
+  pull(shadowMax) |>
+  median(na.rm = TRUE)
+
+export(df_boruta_plot,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_fig_f1_boruta_importance.rds"))
+
+# Plot with corporate aesthetic
+ggplot(df_boruta_plot,
+       aes(x = importance, y = variable, fill = decision)) +
+  geom_boxplot(alpha = 0.8, outlier.size = 0.5, color = "grey40") +
+  geom_vline(
+    xintercept = shadow_max_median,
+    linetype = "dashed",
+    color = "azure4",
+    linewidth = 0.8
+  ) +
+  scale_fill_manual(
+    values = c("Confirmed" = "#3AAF85", "Tentative" = "#F9A825")
+  ) +
+  labs(
+    title = "Boruta Variable Importance for Height Prediction",
+    subtitle = "Selected variables only. Dashed line = shadow maximum threshold",
+    x = "Importance",
+    y = NULL,
+    fill = "Decision"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    axis.text.y = element_text(size = 9),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+rm(df_boruta_plot, shadow_max_median)
+```
+
+## F2. Extract Selected Variables
+
+```{r}
+#| label: f2-extract-selected-variables
+
+# Extract selected variables (Confirmed + Tentative)
+variables_selected <- boruta_stats |>
+  filter(decision %in% c("Confirmed", "Tentative")) |>
+  pull(variable)
+
+# Ensure critical variables are included even if Boruta rejects them
+# edad and departamento are required for downstream processing
+# (WHO LMS lookup and weight recalibration respectively)
+variables_protected <- c("edad", "departamento", "sexo")
+variables_final <- union(variables_selected, variables_protected)
+```
+
+---
+
+# Phase G: Build Final Dataset and Export
+
+## G1. Build Modeling-Ready Dataset
+
+Construct the final dataset containing only the selected predictors, outcome variable, and required identifiers.
+
+```{r}
+#| label: g1-build-final-dataset
+
+# Build modeling-ready dataset
+df_modeling_ready <- df_transformed |>
+  select(
+    # Identifiers and metadata
+    nboletahogar, conglomerado, pesonino, edad_mes,
+    # Outcome
+    talla_cm,
+    # Validation reference (not used as predictors)
+    zlen, hfa,
+    # Selected predictors
+    all_of(variables_final),
+    # Keep original continuous values for reference
+    miembros_hogar_original, n_cuartos_original
+  )
+```
+
+```{r}
+#| label: tbl-g1-final-dataset-summary
+#| tbl-cap: "Final modeling dataset summary"
+
+tbl_g1_final_dataset_summary <- tibble(
+  Category = c(
+    "Identifiers & metadata",
+    "Outcome variable",
+    "Validation references (not predictors)",
+    "Selected predictors",
+    "Original continuous values (reference)",
+    "TOTAL"
+  ),
+  Variables = c(
+    "nboletahogar, conglomerado, pesonino, edad_mes",
+    "talla_cm",
+    "zlen, hfa",
+    paste(variables_final, collapse = ", "),
+    "miembros_hogar_original, n_cuartos_original",
+    ""
+  ),
+  Count = c(
+    4,
+    1,
+    2,
+    length(variables_final),
+    2,
+    ncol(df_modeling_ready)
+  )
+)
+
+export(tbl_g1_final_dataset_summary,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_tbl_g1_final_dataset_summary.rds"))
+
+tbl_g1_final_dataset_summary |>
+  gt() |>
+  tab_header(
+    title = "Final Modeling Dataset Structure",
+    subtitle = paste0(nrow(df_modeling_ready), " children x ",
+                      ncol(df_modeling_ready), " variables")
+  ) |>
+  cols_label(
+    Category = "Category",
+    Variables = "Variables",
+    Count = "N"
+  ) |>
+  cols_align(align = "left", columns = c(Category, Variables)) |>
+  cols_align(align = "right", columns = Count) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Category == "TOTAL")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Category == "TOTAL")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_g1_final_dataset_summary)
+```
+
+## G2. Descriptive Statistics of Height by Key Variables
+
+```{r}
+#| label: fig-g2-height-distributions
+#| fig-cap: "Height distribution by age group and stunting status"
+#| fig-width: 10
+#| fig-height: 7
+
+# Create age groups for visualization
+fig_g2_height_distributions <- df_modeling_ready |>
+  mutate(
+    age_group = cut(
+      edad_mes,
+      breaks = c(5, 11, 23, 35, 47, 59),
+      labels = c("6-11m", "12-23m", "24-35m", "36-47m", "48-59m")
+    ),
+    stunting_status = factor(
+      if_else(hfa == 1, "Stunted (HAZ < -2)", "Not stunted"),
+      levels = c("Not stunted", "Stunted (HAZ < -2)")
+    )
+  )
+
+export(fig_g2_height_distributions,
+            here("01_data", "02_processed", "web_resources",
+                 "05_01_fig_g2_height_distributions.rds"))
+
+fig_g2_height_distributions |>
+  ggplot(aes(x = talla_cm, fill = stunting_status)) +
+  geom_density(alpha = 0.5, color = NA) +
+  facet_wrap(~ age_group, scales = "free") +
+  scale_fill_manual(
+    values = c("Not stunted" = "#3AAF85",
+               "Stunted (HAZ < -2)" = "#E07A5F")
+  ) +
+  labs(
+    title = "Height Distribution by Age Group and Stunting Status",
+    subtitle = "SIVESNU 2018 children aged 6-59 months",
+    x = "Height (cm)",
+    y = "Density",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "azure4", size = 14),
+    plot.subtitle = element_text(color = "azure4", size = 10),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, colour = "azure4", hjust = 0),
+    axis.text = element_text(size = 8, colour = "azure4"),
+    strip.text = element_text(face = "bold", color = "azure4"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8, color = "azure4")
+  )
+
+# Cleanup auxiliary objects
+rm(fig_g2_height_distributions)
+```
+
+## G3. Save Outputs
+
+```{r}
+#| label: g3-save-outputs
+
+# Save modeling-ready dataset
+write_parquet(
+  df_modeling_ready,
+  here("01_data", "02_processed", 
+       "transfer", "05_01_sivesnu_height_modeling_data.parquet")
+)
+
+# Save Yeo-Johnson transformation objects (for application to ENCOVI in 05_03)
+export(
+  list(
+    yj_miembros_hogar = yj_miembros_hogar,
+    yj_n_cuartos = yj_n_cuartos
+  ),
+  here("01_data", "02_processed", 
+       "models", "05_01_yj_transforms.rds")
+)
+
+# Save Boruta results and selected variables
+export(
+  list(
+    boruta_result = boruta_result,
+    boruta_stats = boruta_stats,
+    variables_selected = variables_selected,
+    variables_final = variables_final,
+    variables_protected = variables_protected
+  ),
+  here("01_data", "02_processed", 
+       "models", "05_01_boruta_results.rds")
+)
+
+# Clean auxiliary objects
+rm(yj_miembros_hogar, yj_n_cuartos, boruta_result, boruta_stats,
+   variables_selected, variables_final, variables_protected,
+   df_joined, df_clean, df_transformed, vars_nzv)
+```
+
+
+---
+
+# Notes
+
+## Methodological Decisions
+
+**Variable set**: The predictor variables comprise demographic, socioeconomic, and geographic indicators present in both ENCOVI 2023 and SIVESNU 2018, constituting the bridge between surveys for cross-dataset prediction. Variable coding follows the structure used in the Module 3 transfer models (scripts 03_02 through 03_08), so that the trained height model applies to ENCOVI data without recoding. The premise is that the variables predicting nutrient intake also predict child stature, since socioeconomic conditions are linked to both dietary quality and growth outcomes.
+
+**Boruta on talla_cm**: Feature selection uses raw height in centimeters as the outcome variable. This directly targets the variable that will be transferred to ENCOVI and avoids circularity, since HAZ z-scores depend on age (which is already a predictor). The age variable captures the strong developmental relationship between age and height, while other predictors capture socioeconomic determinants of growth beyond what age explains.
+
+**Variable inclusion strategy**: All candidate predictor variables (including those with high missing rates or expected low variance) enter the pipeline and are evaluated algorithmically. Near-zero variance detection and Boruta feature selection determine which variables are retained, so that inclusion and exclusion decisions are data-driven and auditable.
+
+**Yeo-Johnson transformations**: Applied to `miembros_hogar` and `n_cuartos` to normalize continuous predictors. Transformation objects are saved separately for consistent application to ENCOVI data in script 05_03.
+
+## Imputation Engine
+
+Missing value imputation uses the `impute_rf_parallel()` utility function (defined in `00_functions.R`), which wraps `missRanger::missRanger()` with a multi-threaded `ranger` engine. Output follows the `list(ximp, OOBerror = c(OOBE, PFC))` contract consumed by diagnostic tables across the framework.
+
+Reproducibility note: with `num.threads > 1`, ranger introduces non-deterministic thread scheduling. Imputed values are statistically equivalent across runs but not bit-identical. For strict audit-grade reproducibility, set `num.threads = 1` in the `impute_rf_parallel()` call at the cost of runtime.
+
+## Boruta Configuration
+
+Boruta is executed with `maxRuns = 150` and `getImp = Boruta::getImpRfZ`, which uses `ranger::ranger()` as the importance source. Multi-threaded tree construction is enabled via `num.threads = parallel::detectCores() - 2`.
+
+Reproducibility note: with `num.threads > 1`, Confirmed/Tentative/Rejected decisions for variables with clear importance signals are stable across runs; decisions for variables at the margin of the shadow maximum threshold may oscillate. For strict audit-grade reproducibility, set `num.threads = 1` at the cost of runtime.
+
+## Data Quality
+
+**Population size**: The target population comprises the SIVESNU 2018 children aged 6-59 months with valid anthropometric measurements. Records with missing height values were excluded; the counts are reported in the Phase A extraction table.
+
+**Merge strategy**: Children are matched to household characteristics via household identifiers. The many-to-many join (multiple household members per child record) is resolved by selecting the closest age match, prioritizing the child's own demographic profile.
+
+## Limitations
+
+**SIVESNU sampling**: SIVESNU 2018 uses a health center-based sampling frame, which may introduce selection bias toward children who access public health services. This bias is addressed in script 05_03 through weight recalibration against ENSMI stunting prevalence targets.
+
+**Cross-sectional design**: Height is measured at a single point in time. The transfer model captures the association between socioeconomic profiles and height, not causal effects of specific interventions.

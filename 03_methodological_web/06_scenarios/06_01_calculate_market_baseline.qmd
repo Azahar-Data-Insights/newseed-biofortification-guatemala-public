@@ -1,0 +1,815 @@
+---
+title: "Market Baseline Calculation"
+subtitle: "Module 6: Scenarios"
+---
+
+## Why Calculate a Market Baseline?
+
+Scenario modeling requires establishing the supply-demand balance for white maize across Guatemala's 22 departments. Before simulating biofortification production coverage scenarios, we must quantify:
+
+- **Production capacity** — How much maize can each department produce if all farmers adopt biofortified varieties?
+- **Consumption demand** — How much maize does each department's population require?
+- **Structural surplus/deficit** — Which departments produce more than they consume, and which face structural deficits?
+
+This baseline enables realistic scenario projections that account for geographic heterogeneity in agricultural capacity and population density. It also feeds two structural elements that govern how production reaches consumption across the country: the continuous adoption curves that determine each farmer's contribution at any national production coverage level, and the gravity-based redistribution model that channels surplus from producing departments to deficit departments along real travel times.
+
+The figures presented here correspond to the **baseline scenario** combining the **2022 biofortified seed variety** (currently deployed in the field) with the **current subsidy regime** as of April 2026. Alternative seed variants and subsidy regimes are evaluated in the Shiny dashboard.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file reading for travel time / capitals
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-data
+#| include: false
+
+# Centralized load for this script. Two distinct sources:
+#
+#   (1) RDS exported by framework 06_01x under the baseline variant
+#       (seed S22, subsidy sub00). Artefacts covering data
+#       dimensions, baseline metrics, saturation curves, conservation
+#       check, saturation order, post-redistribution metrics.
+#
+#   (2) Parquets exported by framework 06_00 (one-shot OSRM script).
+#       Two artefacts covering departmental capital coordinates and
+#       the 22x22 travel time matrix with gravity weights.
+#
+# The 06_00 parquets are loaded directly (exception to the load-rds-only
+# rule) because 06_00 does not export to web_resources by design:
+# it is a one-shot script whose outputs are invariant across seed x
+# subsidy combinations and therefore not parameterized at framework
+# level.
+
+# --- Framework RDS (06_01_s22_sub00) -----------------------------------
+
+tbl_a5_data_dimensions <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_a5_data_dimensions.rds"),
+  trust = TRUE
+)
+
+tbl_a7_gravity_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_a7_gravity_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b7_baseline_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_b7_baseline_summary.rds"),
+  trust = TRUE
+)
+
+fig_c1_saturation_curves <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_fig_c1_saturation_curves.rds"),
+  trust = TRUE
+)
+
+tbl_c3_conservation_check <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_c3_conservation_check.rds"),
+  trust = TRUE
+)
+
+tbl_c4_saturation_order <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_c4_saturation_order.rds"),
+  trust = TRUE
+)
+
+fig_c5_saturation_after <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_fig_c5_saturation_after.rds"),
+  trust = TRUE
+)
+
+tbl_c6_market_metrics_after <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_c6_market_metrics_after.rds"),
+  trust = TRUE
+)
+
+# --- 06_00 parquets (external infrastructure) --------------------------
+
+df_capitals <- read_parquet(
+  here("..", "01_data", "02_processed", "external",
+       "06_00_departmental_capitals.parquet")
+)
+
+df_travel_time <- read_parquet(
+  here("..", "01_data", "02_processed", "external",
+       "06_00_osrm_travel_time_matrix.parquet")
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Pipeline configuration constants. These encode methodological choices
+# fixed in the framework header parameters and the reference YAML files;
+# they are not computed outputs.
+
+# Per-capita consumption benchmarks (kg/capita/year), used in the
+# baseline calculation of departmental maize demand.
+consumption_human_kg <- 110
+consumption_fsi_kg <- 174
+
+# Conversion factor: kilograms to quintales (1 qq = 100 lb = 45.36 kg).
+kg_to_qq <- 45.36
+
+# Gravity model decay parameter. Newtonian decay (beta = 2) is the
+# classical specification in trade gravity literature.
+gravity_beta <- 2
+
+# Manzana to hectare conversion (1 mz = 0.7 ha).
+mz_to_ha <- 0.7
+
+# Gravity matrix extent, read back from the exported summary
+gravity_value <- function(label) {
+  tbl_a7_gravity_summary |>
+    filter(metric == label) |>
+    pull(value)
+}
+
+n_gravity_pairs <- gravity_value("Number of department pairs")
+min_travel_time <- gravity_value("Min travel time (min)")
+max_travel_time <- gravity_value("Max travel time (min)")
+
+# Departmental coverage before and after the gravity redistribution
+n_dept_saturating <- sum(tbl_b7_baseline_summary$max_coverage_pct >= 100)
+n_dept_total      <- nrow(tbl_b7_baseline_summary)
+min_coverage_after <- round(min(tbl_c6_market_metrics_after$coverage_after), 1)
+max_coverage_gain  <- round(max(tbl_c6_market_metrics_after$coverage_change), 1)
+```
+
+
+## Data Integration
+
+The market baseline integrates four data sources:
+
+- **Farmer adoption data** (from Module 2) — Contains farmer rankings, production capacity, segment assignments, calibrated survey weights, and the per-farmer continuous adoption parameters (`p_entry`, `profile`) that govern conversion intensity across production coverage levels.
+- **Individual nutrient intake** (from Module 1) — Contains population counts by department for consumption demand calculations.
+- **Calibrated model configuration** (from Module 2) — Contains the six continuous adoption curve parameters (`floor_S/M/L`, `k_S/M/L`) calibrated against empirical anchors.
+- **Travel time matrix** (from the one-shot routing script of this module) — Contains the 22×22 driving-time matrix between departmental capitals and the derived gravity weights.
+
+```{r}
+#| label: tbl-a5-data-dimensions
+#| tbl-cap: "Input datasets for market baseline calculations"
+
+tbl_a5_data_dimensions |>
+  gt() |>
+  tab_header(
+    title = "Input Datasets",
+    subtitle = "Data sources for market baseline calculations (2022 seed, current subsidy)"
+  ) |>
+  cols_label(
+    dataset = "Dataset",
+    n_records = "Records",
+    n_variables = "Variables",
+    notes = "Notes"
+  ) |>
+  cols_align(align = "left", columns = c(dataset, notes)) |>
+  fmt_number(
+    columns = c(n_records, n_variables),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  sub_missing(missing_text = "—") |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated), Module 2 outputs, OSRM (OpenStreetMap routing).")
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+The farmer dataset contains expanded records (from MAGA weight calibration [@MAGA2023_GranosBasicos]) with adoption priority scores and the continuous adoption parameters per farmer, while the individual dataset provides the population base for consumption calculations. The model configuration provides the six scalar parameters that define the sigmoid conversion curves used downstream.
+
+
+## Departmental Baseline Metrics
+
+All calculations use survey weights to produce population-representative estimates. The baseline captures four dimensions for each department: farmer population by technology segment, land area allocation, annual consumption demand, and production capacity (current and maximum biofortified).
+
+::: {.callout-note}
+## Consumption Reference Values
+
+Two consumption benchmarks inform our analysis:
+
+- **Direct human consumption**: `r consumption_human_kg` kg/capita/year — Lower-bound estimate for direct food use only (primarily tortillas).
+- **FSI consumption**: `r consumption_fsi_kg` kg/capita/year — Includes food, seed retention, animal feed, and post-harvest losses.
+:::
+
+Consumption coverage calculations use the **FSI estimate** [@USDA2019_GrainFeed] as the denominator, rather than direct human consumption [@MAGA2008_RecursosFitogeneticos], since biofortified production must satisfy total domestic demand.
+
+**Conversion factors used in the baseline:**
+
+- Kilograms to quintales: ÷ `r kg_to_qq` (1 qq = 100 lb = `r kg_to_qq` kg)
+- Quintales to metric tons: × 0.04536 (1 qq ≈ 0.04536 MT)
+- Manzanas to hectares: × `r mz_to_ha` (1 mz = `r mz_to_ha` ha)
+
+```{r}
+#| label: tbl-b7-baseline-summary
+#| tbl-cap: "Departmental baseline metrics for scenario modeling"
+
+tbl_b7_baseline_summary |>
+  gt() |>
+  tab_header(
+    title = "Departmental Market Baseline Metrics",
+    subtitle = "Farmers, land, consumption, and production capacity by department"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers_total = "Total Farmers",
+    n_farmers_hybrid = "Hybrid Farmers",
+    n_farmers_opv = "Non-hybrid Farmers",
+    land_ha_total = "Land (ha)",
+    consumption_human_mt = "Human Cons. (MT/yr)",
+    consumption_fsi_mt = "FSI Cons. (MT/yr)",
+    current_production_mt = "Current Prod. (MT)",
+    max_bio_production_mt = "Max Bio Prod. (MT)",
+    max_coverage_pct = "Max Coverage (%)"
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  fmt_number(
+    columns = c(n_farmers_total, n_farmers_hybrid, n_farmers_opv),
+    use_seps = TRUE, decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(land_ha_total, consumption_human_mt, consumption_fsi_mt,
+                current_production_mt, max_bio_production_mt),
+    use_seps = TRUE, decimals = 1
+  ) |>
+  fmt_number(columns = max_coverage_pct, decimals = 1, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(columns = max_coverage_pct, rows = max_coverage_pct >= 100)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = max_coverage_pct, rows = max_coverage_pct < 50)
+  ) |>
+  grand_summary_rows(
+    columns = c(n_farmers_total, n_farmers_hybrid, n_farmers_opv, land_ha_total,
+                consumption_human_mt, consumption_fsi_mt,
+                current_production_mt, max_bio_production_mt),
+    fns = list(Total = ~ sum(., na.rm = TRUE)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023 (MAGA-calibrated). Human Cons. = 110 kg/capita/year (lower-bound estimate). FSI Cons. = 174 kg/capita/year (USDA 2019). Green = surplus (≥100%). Red = deficit (<50%). Production capacity shares cited in the text (e.g., a department's share of national production) are relative to the national total; consumption coverage and surplus/deficit status are relative to each department's own annual FSI consumption demand."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    column_labels.font.size = px(10)
+  )
+```
+
+The baseline is geographically concentrated. Petén alone accounts for 23.1% of national maize production capacity, and together with Alta Verapaz and Quiché for 46.8%, while Guatemala department, the most populous, covers 7.3% of its own FSI demand from local production. Six departments (highlighted in green) reach or exceed 100% consumption coverage from local production alone; five (highlighted in red) stay below 50% even at full production coverage.
+
+::: {.callout-important}
+## Structural Supply-Demand Imbalance
+
+Even at 100% biofortified production coverage, 6 of the 22 departments satisfy their local consumption demand from their own production. The other 16 range from 7.3% to 91.2% coverage. This is what the redistribution model that follows is built for: without surplus moving between departments, a national consumption coverage target cannot be met from a geographically concentrated supply.
+:::
+
+
+## Continuous Adoption Model
+
+Production coverage is implemented as a continuous adoption process rather than a binary admit / exclude rule. Each farmer carries two attributes calibrated in Module 2:
+
+- A **per-farmer entry point** `p_entry` — the national production coverage level at which the farmer begins adopting biofortified seed.
+- A **behavioural profile** `S`, `M`, or `L` (Small, Medium, Large entry-size) — that governs the steepness of conversion intensity from the entry point onwards.
+
+At national production coverage `p`, every farmer with `p_entry ≤ p` is in the adoption pool. The fraction of that farmer's potential biofortified production realised at production coverage `p` is the conversion ratio:
+
+$$
+r_i(p) = \text{sigmoid}(p, p_{entry,i}, \text{floor}_{profile}, k_{profile})
+$$
+
+where `floor_{profile}` is the conversion fraction at the entry point itself, and `k_{profile}` controls how rapidly conversion rises from the floor towards 1 as `p` increases. The six scalar parameters (`floor_S`, `floor_M`, `floor_L`, `k_S`, `k_M`, `k_L`) come from the model configuration calibrated in [Module 2](../02_economic_impact/02_05_determine_likely_adopters_model.qmd) against empirical adoption anchors via median absolute deviation. At `p = 0` no farmer is in the pool; at `p = 1` every farmer is in the pool with `r_i(1) = 1` by construction.
+
+The effective biofortified production of farmer `i` at production coverage `p` is therefore:
+
+$$
+\text{bio}_i(p) = \text{production\_biofortified}_i \times \text{weight\_calibrated}_i \times r_i(p)
+$$
+
+This formulation captures realistic adoption patterns where early adopters are not uniformly distributed across departments, and where each farmer's conversion intensity varies by behavioural profile and position along the production coverage curve. It also produces smooth saturation trajectories (shown in the consumption coverage analysis below) that converge to the maximum biofortified production capacity at full production coverage.
+
+
+## Consumption Coverage Before Redistribution
+
+Before introducing inter-departmental redistribution, we analyse how departmental consumption coverage evolves across the national production coverage range (0–100%) based solely on local production. At each production coverage level `p`, the biofortified production realised in department `d` is the sum of `bio_i(p)` across all farmers `i` located in `d`. Coverage is the ratio between this realised production and the department's annual FSI consumption demand.
+
+This analysis surfaces the departments that **saturate early** (reach 100% local coverage at low national production coverage) — these are the natural supply nodes for the redistribution model that follows.
+
+```{r}
+#| label: fig-c1-saturation-curves
+#| fig-cap: "Departmental consumption coverage evolution by national production coverage level (before redistribution)"
+#| fig-alt: >
+#|   Line chart with national production coverage (percent) on the x-axis and
+#|   departmental consumption coverage (percent) on the y-axis, one line per
+#|   department based on local production only. Non-saturating departments are
+#|   drawn as faint gray lines, while the departments that saturate are
+#|   highlighted in color with a marker at the point where each first crosses
+#|   the dashed 100 percent threshold. A few departments rise steeply and
+#|   saturate early at low national coverage, marking them as natural supply
+#|   nodes for redistribution.
+#| fig-width: 10
+#| fig-height: 8
+#| warning: false
+
+# Saturation point: lowest production coverage level at which each
+# department reaches 100% consumption coverage, before redistribution
+df_saturation_points <- fig_c1_saturation_curves |>
+  filter(color_group != "Other") |>
+  filter(coverage_pct >= 100) |>
+  slice_min(penetration, by = departamento)
+
+ggplot() +
+  # Non-saturating departments (background)
+  geom_line(
+    data = filter(fig_c1_saturation_curves, color_group == "Other"),
+    aes(x = penetration * 100, y = coverage_pct, group = departamento),
+    color = "gray60",
+    linewidth = 0.4,
+    alpha = 0.5
+  ) +
+  # Saturating departments (highlighted)
+  geom_line(
+    data = filter(fig_c1_saturation_curves, color_group != "Other"),
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    linewidth = 1
+  ) +
+  # Saturation threshold line
+  geom_hline(
+    yintercept = 100,
+    linetype = "dashed",
+    color = "darkred",
+    linewidth = 0.6
+  ) +
+  # Annotate saturation points
+  geom_point(
+    data = df_saturation_points,
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    size = 3,
+    shape = 16
+  ) +
+  # Threshold label
+  annotate(
+    "text",
+    x = 1, y = 105,
+    label = "Saturation threshold (100%)",
+    hjust = 0,
+    size = 3,
+    color = "darkred",
+    fontface = "italic"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 300, 50),
+    labels = function(x) paste0(x, "%"),
+    limits = c(0, 320)
+  ) +
+  labs(
+    title = "Departmental Consumption Coverage by National Production Coverage",
+    subtitle = "Before redistribution — Gray lines show non-saturating departments",
+    x = "National Production Coverage Level",
+    y = "Departmental Consumption Coverage",
+    color = "Saturating\nDepartments"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = c(0.12, 0.85),
+    legend.background = element_rect(fill = "white", color = "gray80"),
+    legend.title = element_text(size = 10, face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 12),
+    axis.title = element_text(color = "gray40")
+  )
+```
+
+::: {.callout-note}
+## Saturation Timing
+
+Departments that reach 100% consumption coverage at lower national production coverage levels have production capacity that exceeds local demand. These early saturators become natural supply nodes for the redistribution model: once their own demand is satisfied, additional biofortified production from local farmers is available to supply deficit departments elsewhere in the country.
+:::
+
+
+## Travel Time Infrastructure
+
+Redistribution between Guatemalan departments is not symmetric in space. The country's road network is shaped by mountain ranges (Sierra Madre, Sierra de los Cuchumatanes) that create significant travel time asymmetries between departments that are geographically close but poorly connected by road. The gravity-based redistribution model therefore uses real driving times rather than Euclidean distances or simple adjacency.
+
+The 22×22 travel time matrix between departmental capitals is computed once, by a separate one-shot routing script. That script queries the Open Source Routing Machine (OSRM) over OpenStreetMap road network data and produces a deterministic matrix that depends only on the road network. The matrix is stored as a parquet file and re-used across all seed × subsidy combinations of the scenario pipeline.
+
+### Departmental Capitals
+
+The reference points for the travel time matrix are the administrative seats (cabeceras departamentales) of each of Guatemala's 22 departments, as defined by Guatemala's Instituto Nacional de Estadística (INE). Coordinates were obtained from the GeoNames geographical database (https://www.geonames.org, Creative Commons Attribution 4.0 License), which aggregates data from official national mapping agencies and the OpenStreetMap community. Each coordinate corresponds to the populated place record classified as `feature class P` (populated place) and `feature code PPLA` (seat of a first-order administrative division) in GeoNames. Coordinates are in WGS84 (EPSG:4326).
+
+```{r}
+#| label: tbl-capitals-summary
+#| tbl-cap: "Departmental capitals of Guatemala with geographic coordinates"
+
+df_capitals |>
+  gt() |>
+  tab_header(
+    title = "Departmental Capitals of Guatemala",
+    subtitle = "Reference points for OSRM travel time computation"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    cabecera = "Capital (Cabecera)",
+    lat = "Latitude",
+    lon = "Longitude"
+  ) |>
+  cols_align(align = "left", columns = c(departamento, cabecera)) |>
+  fmt_number(
+    columns = c(lat, lon),
+    decimals = 4
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** GeoNames geographical database (https://www.geonames.org, CC BY 4.0). Coordinates in WGS84 (EPSG:4326).")
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Travel Time Matrix
+
+The matrix below shows driving times in minutes between every pair of departmental capitals. The matrix is asymmetric — `t(i, j) ≠ t(j, i)` in general — reflecting real directional differences in road routing, terrain gradients, and directional constraints in Guatemala's road network.
+
+```{r}
+#| label: fig-travel-time-heatmap
+#| fig-cap: "Driving travel times between departmental capitals (minutes) — OSRM asymmetric matrix"
+#| fig-alt: >
+#|   Heatmap of a 22-by-22 matrix with origin departmental capitals along the
+#|   x-axis and destination capitals along the y-axis. Each tile is labelled
+#|   with the driving time in minutes and shaded on a blue gradient that
+#|   deepens with longer travel times. The pattern is asymmetric across the
+#|   diagonal, so travel time in one direction differs from the reverse, and
+#|   the longest times cluster around the most distant, peripheral departments.
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+
+# Department factor ordering follows the INE standard. We define it
+# explicitly here rather than relying on an RDS framework export, to
+# keep the topological sub-section self-contained from the 06_00
+# parquets only (per the load-as-exception rule for this sub-section).
+
+dept_order <- c(
+  "Guatemala", "El Progreso", "Sacatepéquez", "Chimaltenango",
+  "Escuintla", "Santa Rosa", "Sololá", "Totonicapán",
+  "Quetzaltenango", "Suchitepéquez", "Retalhuleu", "San Marcos",
+  "Huehuetenango", "Quiché", "Baja Verapaz", "Alta Verapaz",
+  "Petén", "Izabal", "Zacapa", "Chiquimula", "Jalapa", "Jutiapa"
+)
+
+df_heatmap <- df_travel_time |>
+  select(origin, destination, travel_time_min) |>
+  mutate(
+    origin = factor(origin, levels = dept_order),
+    destination = factor(destination, levels = rev(dept_order))
+  )
+
+ggplot(df_heatmap, aes(x = origin, y = destination, fill = travel_time_min)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = round(travel_time_min, 0)),
+    size = 2.2,
+    color = "gray20"
+  ) +
+  scale_fill_gradient2(
+    low = "#E8F0F7",
+    high = "#1B6CA8",
+    midpoint = median(df_heatmap$travel_time_min),
+    name = "Travel Time\n(minutes)"
+  ) +
+  labs(
+    title = "Driving Travel Times Between Departmental Capitals",
+    subtitle = "OSRM routing over OpenStreetMap road network — asymmetric (directional)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40", size = 11),
+    legend.position = "bottom",
+    legend.key.width = unit(2, "cm"),
+    legend.key.height = unit(0.4, "cm"),
+    panel.grid = element_blank()
+  )
+```
+
+### Gravity Weights
+
+From the travel time matrix we derive a matrix of gravity weights `w(i, j) = 1 / travel_time(i, j)^β`, with a decay parameter β = `r gravity_beta`, the Newtonian specification used in the trade gravity literature [@Anderson2003_Gravity]. The summary below characterises the resulting weight distribution over the `r n_gravity_pairs` ordered department pairs, whose driving times run from `r min_travel_time` to `r max_travel_time` minutes.
+
+```{r}
+#| label: tbl-gravity-summary
+#| tbl-cap: "Gravity weight matrix summary statistics"
+
+tbl_a7_gravity_summary |>
+  gt() |>
+  tab_header(
+    title = "Gravity Weight Matrix Summary",
+    subtitle = md("w(i,j) = 1 / travel_time(i,j)² — Anderson & van Wincoop (2003)")
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  cols_align(align = "left", columns = metric) |>
+  cols_align(align = "right", columns = value) |>
+  tab_source_note(
+    source_note = "Source: OSRM travel time matrix. Statistics computed over off-diagonal pairs (origin ≠ destination)."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Gravity-Based Redistribution Model
+
+The redistribution model channels surplus biofortified production from departments that exceed their local demand to departments that face a deficit. The flow allocation follows the gravity formulation of [@Anderson2003_Gravity], adapted here to inter-departmental commodity movement within Guatemala. The model is implemented in the utility function `redistribute_gravity()` of the framework's centralized function file.
+
+For each donor department `i` with surplus production `S_i` and each receiver department `j` with deficit `D_j`, the share of `S_i` that flows to `j` is proportional to:
+
+$$
+\text{flow}_{i \to j} \;\propto\; D_j \;\times\; w(i, j)
+$$
+
+where `w(i, j) = 1 / travel_time(i, j)²` is the gravity weight defined above. The proportionality gives the allocation two structural properties: receivers with larger deficits attract a larger share of surplus, the demand pull, and receivers further away by road attract a smaller share, the distance friction. Flows are normalised so that the total volume out of `i` equals `S_i`. The asymmetric travel time matrix means the flow `i → j` may differ from `j → i`, which matters when topographic asymmetry makes one direction more accessible than the other.
+
+The gravity model uses real driving times rather than nominal adjacency, captures the terrain effects that adjacency hides, and evaluates all donor-receiver pairs jointly without requiring an external ordering rule.
+
+### Production Conservation
+
+A direct consequence of the proportional allocation is that **total biofortified production is conserved through redistribution**: the volume leaving each donor equals the volume distributed across receivers. The check below evaluates this at full national production coverage, the most demanding case, where every department is simultaneously active in the redistribution network.
+
+```{r}
+#| label: tbl-c3-conservation-check
+#| tbl-cap: "Production conservation validation at 100% production coverage"
+
+tbl_c3_conservation_check |>
+  gt() |>
+  tab_header(
+    title = "Production Conservation Check",
+    subtitle = "Validation at 100% national production coverage — gravity redistribution"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  cols_align(align = "left", columns = metric) |>
+  cols_align(align = "right", columns = value) |>
+  tab_source_note(
+    source_note = "A non-zero difference indicates production loss or creation through redistribution. Values near zero (< 1 qq) are acceptable due to floating-point arithmetic."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Consumption Coverage After Redistribution
+
+With the gravity model applied, departmental consumption coverage at each production coverage level reflects both **local production** (from the continuous adoption curves) and **received flows** from surplus departments (from the gravity allocation). The two outputs below summarise the post-redistribution market structure: the saturation order describes how progressively more departments reach 100% local coverage as national production coverage rises, and the saturation curves describe the smoothed trajectories for every department.
+
+### Saturation Order
+
+The table below ranks departments by the national production coverage level at which each first reaches 100% consumption coverage after gravity redistribution. Departments that do not reach saturation even at 100% national production coverage are marked with "—", indicating insufficient inflow through the gravity network to close their local deficit.
+
+```{r}
+#| label: tbl-c4-saturation-order
+#| tbl-cap: "Departmental saturation order by production coverage level (after gravity redistribution)"
+
+tbl_c4_saturation_order |>
+  gt() |>
+  tab_header(
+    title = "Departmental Saturation Order",
+    subtitle = "Production coverage level at which each department reaches 100% coverage (after gravity redistribution)"
+  ) |>
+  cols_label(
+    rank = "Order",
+    departamento = "Department",
+    saturation_display = "Saturation Point"
+  ) |>
+  cols_align(align = "center", columns = c(rank, saturation_display)) |>
+  cols_align(align = "left", columns = departamento) |>
+  sub_missing(missing_text = "—") |>
+  tab_source_note(
+    source_note = "Saturation point = national production coverage level at which the department first reaches 100% local consumption coverage post-redistribution. A dash indicates the department does not saturate even at 100% national production coverage."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Saturation Curves
+
+The figure below shows the post-redistribution consumption coverage trajectory for every department across the full production coverage range. Compared with the pre-redistribution curves shown earlier, the gravity model raises the deficit departments as national production coverage grows, and caps the apparent surplus of donor departments at 100%, since their excess beyond local demand has been allocated outwards. At full production coverage the lowest departmental coverage rises to `r min_coverage_after`%, and the largest single gain is `r max_coverage_gain` percentage points in Guatemala, which moves from 7.3% to 66.5%.
+
+```{r}
+#| label: fig-c5-saturation-after
+#| fig-cap: "Departmental consumption coverage evolution by national production coverage level (after gravity redistribution)"
+#| fig-alt: >
+#|   Line chart with national production coverage (percent) on the x-axis and
+#|   departmental consumption coverage (percent) on the y-axis, one line per
+#|   department after gravity redistribution. Non-saturating departments appear
+#|   as faint gray lines and saturating departments are highlighted in color,
+#|   each with a marker where it first crosses the dashed 100 percent
+#|   threshold. Compared with the pre-redistribution version, deficit
+#|   departments are lifted closer to saturation while donor departments are
+#|   capped at 100 percent as their surplus is allocated outward.
+#| fig-width: 10
+#| fig-height: 8
+#| warning: false
+
+# Saturation point: lowest production coverage level reaching 100%
+df_saturation_points_after <- fig_c5_saturation_after |>
+  filter(coverage_pct >= 100) |>
+  slice_min(penetration, by = departamento)
+
+# Build colour grouping: saturating vs non-saturating departments
+dept_saturates <- fig_c5_saturation_after |>
+  filter(penetration == 1) |>
+  mutate(saturates = coverage_pct >= 100) |>
+  select(departamento, saturates)
+
+df_plot <- fig_c5_saturation_after |>
+  left_join(dept_saturates, by = "departamento")
+
+ggplot() +
+  # Non-saturating departments (background, gray)
+  geom_line(
+    data = filter(df_plot, !saturates),
+    aes(x = penetration * 100, y = coverage_pct, group = departamento),
+    color = "gray60",
+    linewidth = 0.4,
+    alpha = 0.5
+  ) +
+  # Saturating departments (foreground, coloured)
+  geom_line(
+    data = filter(df_plot, saturates),
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    linewidth = 0.9
+  ) +
+  # Saturation threshold line
+  geom_hline(
+    yintercept = 100,
+    linetype = "dashed",
+    color = "darkred",
+    linewidth = 0.6
+  ) +
+  # Annotate saturation points
+  geom_point(
+    data = df_saturation_points_after,
+    aes(x = penetration * 100, y = coverage_pct, color = departamento),
+    size = 2.5,
+    shape = 16,
+    show.legend = FALSE
+  ) +
+  # Threshold label
+  annotate(
+    "text",
+    x = 1, y = 105,
+    label = "Saturation threshold (100%)",
+    hjust = 0,
+    size = 3,
+    color = "darkred",
+    fontface = "italic"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 100, 20),
+    labels = function(x) paste0(x, "%"),
+    limits = c(0, 110)
+  ) +
+  labs(
+    title = "Departmental Consumption Coverage by National Production Coverage",
+    subtitle = "After gravity-based redistribution — Coverage capped at 100% (excess allocated outwards)",
+    x = "National Production Coverage Level",
+    y = "Departmental Consumption Coverage",
+    color = "Saturating\nDepartments"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "gray80"),
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 12),
+    axis.title = element_text(color = "gray40")
+  )
+```
+
+
+## Market Metrics After Redistribution
+
+The final table consolidates the market-level outcomes at full national production coverage, comparing pre- and post-redistribution coverage to quantify the contribution of the gravity model to closing departmental deficits.
+
+```{r}
+#| label: tbl-c6-market-metrics-after
+#| tbl-cap: "Market structure metrics — pre vs post gravity redistribution"
+
+tbl_c6_market_metrics_after |>
+  gt() |>
+  tab_header(
+    title = "Market Structure: Pre vs Post Redistribution",
+    subtitle = "Comparison at 100% national production coverage"
+  ) |>
+  cols_align(align = "left", columns = 1) |>
+  cols_align(align = "right", columns = -1) |>
+  tab_source_note(
+    source_note = "Pre-redistribution metrics rely solely on local production at 100% production coverage. Post-redistribution metrics incorporate gravity-weighted flows from surplus departments to deficit departments."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Summary
+
+### Baseline Framework
+
+The market baseline characterises the supply-demand structure of white maize across Guatemala's 22 departments and supplies three structural elements consumed downstream by the scenario precomputation step:
+
+1. **Per-department baseline metrics** — Farmer counts by segment, land area, FSI consumption demand, current production, and maximum biofortified production capacity.
+2. **Continuous adoption parameters** — The six scalar parameters (`floor_S/M/L`, `k_S/M/L`) calibrated in Module 2 that define the per-farmer conversion ratio at every national production coverage level.
+3. **Gravity redistribution infrastructure** — The 22×22 OSRM travel time matrix and the derived gravity weights that channel surplus from donor departments to deficit departments.
+
+### Key Findings
+
+1. **Structural geographic heterogeneity** — Petén concentrates nearly a quarter of national maize production capacity, while several densely populated departments face structural deficits below 50% of FSI demand even at full local production. This heterogeneity makes inter-departmental redistribution a necessary component of any national consumption coverage target.
+
+2. **Continuous adoption smooths the saturation trajectories** — Per-farmer entry points and profile-specific sigmoid curves replace the prior binary adopt / not-adopt rule. Adoption progresses smoothly across national production coverage, with `r_i(0) = 0` and `r_i(1) = 1` as endpoint constraints by construction.
+
+3. **Gravity redistribution narrows deficits without creating production** — The Anderson & van Wincoop formulation channels surplus to deficit departments along real driving times. At full production coverage the lowest departmental coverage rises from 7.3% to `r min_coverage_after`%, while the number of departments reaching 100% stays at `r n_dept_saturating`: the model closes the distance to saturation without adding saturating departments. Total production before and after redistribution matches to 0 qq.
+
+4. **Travel time asymmetry** — Inter-departmental driving times run from `r min_travel_time` to `r max_travel_time` minutes across `r n_gravity_pairs` ordered pairs, and differ by direction. The asymmetric matrix returned by OSRM carries that structure, which a symmetric distance or a simple adjacency rule would not.
+
+### Application
+
+The outputs of this script feed the [scenario precomputation step](06_02_precompute_scenarios.qmd), which uses the per-department coverage trajectories to assign biofortified maize consumption to children via the hierarchical priority assignment, and then aggregates the resulting individual nutrient and stunting outcomes at departmental and national level.
+
+### Limitations
+
+- **Driving mode only** — The travel time matrix assumes road transport. Alternative routes (river, air) are not modelled.
+- **Static road network** — Travel times reflect the OSM road network at the time of OSRM computation. Major infrastructure changes such as new highways or bridge construction would require the routing script to be run again.
+- **Single reference point per department** — Travel times are measured between cabeceras departamentales. Intra-departmental distribution costs are not modelled.
+- **No seasonal variation** — Travel times do not account for seasonal road conditions (rainy season closures, flooding).

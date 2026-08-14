@@ -1,0 +1,117 @@
+# =============================================================================
+# Nutrient Variants Configuration
+# =============================================================================
+#
+# Single source of truth for 03_0x_transfer_model.qmd parametrization.
+# Each variant defines the set of parameters required to fit a nutrient-
+# specific gamma regression model for subsequent transfer to SIVESNU.
+#
+# Applies to scripts 03_02 through 03_07 (Fe, Zn, digestible protein,
+# lysine, tryptophan, energy). Script 03_08 (plant percentage) is
+# excluded because its distribution and modelling structure differ
+# substantially from the nutrient intake variants and is maintained
+# as a separate non-parametrized script.
+#
+# =============================================================================
+
+variants:
+
+  - nutrient_id:      "iron"
+    nutrient_label:   "Iron Intake"
+    var_prefix:       "fe"
+    var_maize:        "fe_individuo_dia_maiz"
+    var_non_maize:    "fe_individuo_dia_no_maiz"
+    units:            "mg/day"
+    script_number:    "03_02"
+    model_filename:   "03_02_iron_models.rds"
+    outlier_quantile: 0.95
+    outlier_label:    "P95 + 1.5×IQR"
+    distribution_fn:  "determine_distribution"
+    overview_text: >
+      This script develops predictive models for iron intake (maize vs
+      non-maize sources) using ENCOVI 2023 data.
+
+  - nutrient_id:      "zinc"
+    nutrient_label:   "Zinc Intake"
+    var_prefix:       "zn"
+    var_maize:        "zn_individuo_dia_maiz"
+    var_non_maize:    "zn_individuo_dia_no_maiz"
+    units:            "mg/day"
+    script_number:    "03_03"
+    model_filename:   "03_03_zinc_models.rds"
+    outlier_quantile: 0.95
+    outlier_label:    "P95 + 1.5×IQR"
+    distribution_fn:  "determine_distribution"
+    overview_text: >
+      This script develops predictive models for zinc intake (maize vs
+      non-maize sources) using ENCOVI 2023 data.
+
+  - nutrient_id:      "digestible_protein"
+    nutrient_label:   "Digestible Protein Intake (PDCAAS-Adjusted)"
+    var_prefix:       "prot_apro"
+    var_maize:        "prot_apro_individuo_dia_maiz"
+    var_non_maize:    "prot_apro_individuo_dia_no_maiz"
+    units:            "g/day"
+    script_number:    "03_04"
+    model_filename:   "03_04_digestible_protein_models.rds"
+    outlier_quantile: 0.75
+    outlier_label:    "Q3 + 1.5×IQR"
+    distribution_fn:  "determine_distribution"
+    overview_text: >
+      This script develops predictive models for digestible protein intake
+      (maize vs non-maize sources) using ENCOVI 2023 data. Digestible
+      protein is calculated by adjusting total protein intake with
+      food-level PDCAAS (Protein Digestibility Corrected Amino Acid Score)
+      values, providing a more accurate assessment of protein quality than
+      crude protein alone.
+
+  - nutrient_id:      "lysine"
+    nutrient_label:   "Lysine Intake"
+    var_prefix:       "lys"
+    var_maize:        "lys_individuo_dia_maiz"
+    var_non_maize:    "lys_individuo_dia_no_maiz"
+    units:            "g/day"
+    script_number:    "03_05"
+    model_filename:   "03_05_lysine_models.rds"
+    outlier_quantile: 0.75
+    outlier_label:    "Q3 + 1.5×IQR"
+    distribution_fn:  "determine_distribution"
+    overview_text: >
+      This script develops predictive models for lysine intake (maize vs
+      non-maize sources) using ENCOVI 2023 data. Lysine is a limiting
+      amino acid in maize, making it particularly important for assessing
+      protein quality in maize-dependent diets.
+
+  - nutrient_id:      "tryptophan"
+    nutrient_label:   "Tryptophan Intake"
+    var_prefix:       "trp"
+    var_maize:        "trp_individuo_dia_maiz"
+    var_non_maize:    "trp_individuo_dia_no_maiz"
+    units:            "g/day"
+    script_number:    "03_06"
+    model_filename:   "03_06_tryptophan_models.rds"
+    outlier_quantile: 0.75
+    outlier_label:    "Q3 + 1.5×IQR"
+    distribution_fn:  "determine_distribution"
+    overview_text: >
+      This script develops predictive models for tryptophan intake (maize
+      vs non-maize sources) using ENCOVI 2023 data. Tryptophan is another
+      limiting amino acid in maize, making it important for assessing
+      protein quality.
+
+  - nutrient_id:      "energy"
+    nutrient_label:   "Energy Intake"
+    var_prefix:       "kcal"
+    var_maize:        "kcal_individuo_dia_maiz"
+    var_non_maize:    "kcal_individuo_dia_no_maiz"
+    units:            "kcal/day"
+    script_number:    "03_07"
+    model_filename:   "03_07_energy_models.rds"
+    outlier_quantile: 0.75
+    outlier_label:    "Q3 + 1.5×IQR"
+    distribution_fn:  "determine_distribution_energy"
+    overview_text: >
+      This script develops predictive models for energy intake (maize vs
+      non-maize sources) using ENCOVI 2023 data. Energy intake is
+      fundamental for child growth and development, making it a key
+      indicator for nutritional assessment.

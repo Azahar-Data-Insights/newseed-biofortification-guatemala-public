@@ -1,0 +1,24 @@
+# ==============================================================================
+#  Project environment variables — template
+# ==============================================================================
+#
+#   1. Copy this file to .Renviron (without the .template extension).
+#   2. Fill in your own values.
+#   3. .Renviron is listed in .gitignore and must never be committed.
+#
+# ==============================================================================
+
+# --- Telegram pipeline notifications ------------------------------------------
+# The orchestrators post start and end notifications for unattended runs.
+# Leave the three variables empty to disable notifications entirely.
+
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_THREAD_ID=
+
+# --- Pipeline -----------------------------------------------------------------
+# When "true", the heavy chunks guarded by a conditional eval are executed.
+# The project orchestrator sets it to "true" automatically. Set it to "false"
+# to render a single .qmd without running its heavy chunks.
+
+PIPELINE_EXECUTE_HEAVY=true

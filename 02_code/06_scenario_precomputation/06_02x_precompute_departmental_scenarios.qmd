@@ -1,0 +1,2624 @@
+---
+title: "Precompute Departmental Scenarios (`r params$seed_label`, `r params$subsidy_label`, `r params$pathway_label` Pathway)"
+subtitle: "`r if (params$pathway == 'pco') 'Biofortification impact simulation across penetration levels using pre-computed nutritional profiles (GAM-based stunting model)' else 'Biofortification impact simulation across penetration levels using Gunaratna et al. (2010) meta-analysis effect size'`"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+params:
+  # Seed identification
+  seed_year: "2022"
+  seed_label: "2022 Seed"
+  seed_suffix: "s22"
+  # Subsidy identification
+  subsidy_label: "Current subsidy"
+  subsidy_suffix: "sub00"
+  # Pathway identification
+  pathway: "pco"
+  pathway_label: "Covariate"
+---
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Setup: Load packages, configure environment, resolve parameters
+# =============================================================================
+
+# Clean environment (preserve params injected by Quarto)
+rm(list = setdiff(ls(), "params"))
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  gt,                 # Professional table formatting
+  glue,               # String formatting
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to keep namespace clean):
+#   skimr   - skim_without_charts() in Phase F data quality validation
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# --- Resolve parameters into local variables -------------------------------
+
+# Seed
+seed_year     <- params$seed_year
+seed_label    <- params$seed_label
+seed_suffix   <- params$seed_suffix
+
+# Subsidy
+subsidy_label  <- params$subsidy_label
+subsidy_suffix <- params$subsidy_suffix
+
+# Pathway
+pathway       <- params$pathway
+pathway_label <- params$pathway_label
+
+# Seed code for plot/table titles (e.g., "S22"). Derived from seed_suffix
+# to keep seed_variants.yml unchanged: no additional field required.
+seed_code <- toupper(seed_suffix)
+
+# Composite file prefix for all output artefacts (parquet + web_resources rds)
+file_prefix <- paste0("06_02_", seed_suffix, "_", subsidy_suffix, "_", pathway)
+
+# Pathway-specific settings
+age_var    <- if (pathway == "pco") "edad_mes_nino" else "edad_meses"
+is_pco     <- pathway == "pco"
+
+# scenarios/
+ensure_output_dir(here("01_data", "02_processed", "scenarios"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Overview
+
+> **Seed `r seed_code` · `r subsidy_label` · `r pathway_label` Pathway** — This script corresponds to the Seed `r params$seed_year` (`r seed_code`) scenario under the **`r subsidy_label`** subsidy regime and the `r tolower(pathway_label)` pathway. The methodology is identical across all 18 combinations (3 seeds x 3 subsidy regimes x 2 pathways); differences arise from the upstream yield factors (seed) and the upstream seed-price structure (subsidy regime) that together shape the farmer adoption ranking and economic metrics.
+
+This script calculates departmental-level impact metrics across 11 biofortification penetration scenarios (0% to 100% in 10% increments). It combines farmer adoption data with the `r if (is_pco) "synthetic child population" else "ENCOVI child population"` to estimate nutrient and stunting outcomes under different market penetration levels.
+
+Penetration is implemented through the continuous adoption model: each farmer has a per-farmer entry point (`p_entry`) and a behavioural profile (`S`, `M`, `L`), which together determine the conversion ratio $r_i(p)$ at each national penetration level $p$. At the farmer's entry point, the conversion ratio equals the profile-specific floor; it then rises along a sigmoid curve towards 1 as $p$ increases. At full penetration ($p = 1$), all farmers have $r_i(1) = 1$ by construction. Economically scalable quantities (production, land, income, seed costs, subsidy flows) are weighted by $r_i(p)$, while farmer counts reflect pool membership (a farmer either has entered the pool or has not).
+
+## Main Operations
+
+1. Load calibrated model configuration for continuous adoption curves (02_05 output)
+2. Define helper functions for scenario simulation pipeline
+3. Load `r if (is_pco) "synthetic population with pre-calculated baseline and QPM nutritional/stunting profiles (from 04_08)" else "ENCOVI children with pre-calculated baseline and QPM nutritional/stunting profiles (from 05_06)"`, farmer data, market baseline, and saturation scenarios
+4. Calculate baseline metrics at 0% penetration (no biofortification)
+5. For each penetration level (10% to 100%):
+   - Filter adopting farmers using `p_entry <= p` and compute per-farmer conversion ratio $r_i(p)$
+   - Calculate economic metrics by department, weighting scalable quantities by $r_i(p)$
+   - Retrieve pre-calculated departmental coverage from saturation scenarios
+   - Assign biofortification flag to children using hierarchical priority
+   - Select pre-calculated baseline or QPM nutritional values based on flag
+   - Aggregate nutritional and stunting metrics by department
+6. Combine all scenarios and calculate change metrics relative to baseline
+7. Export departmental scenario data for Shiny dashboard
+
+## Methodological Notes
+
+**Pre-Calculated Nutrient and Stunting Profiles**: Baseline and QPM nutrient profiles (intake, bioavailability, inadequacy, nutritional index) and GAM-based stunting outcomes are pre-computed in `r if (is_pco) "Script 04_08" else "Script 05_06"`. The simulation loop selects between `*_baseline` and `*_qpm` columns based on biofortification assignment, enabling efficient scenario computation without on-the-fly recalculation.
+
+**Pre-computability of GAM Impact**: The GAM-based stunting impact is pre-computed because every quantity the delta ZLEN requires is fixed per-child:
+
+- **Baseline and QPM indices** — `nutritional_index_bio_baseline` and `nutritional_index_bio_qpm` depend only on the child's maize intake and the biofortification factors, which are constant.
+- **Fitted response** — the GAM is evaluated at each index, holding the child's age and sex at their observed values, all of which are constant.
+
+Therefore, `delta_zlen_qpm`, the difference between the two fitted values, is a fixed per-child parameter.
+
+**Continuous Adoption Model**: At each national penetration level $p$, every farmer with $p_{\text{entry}} \leq p$ is in the adoption pool. The effective contribution of farmer $i$ to any scalable economic quantity is `quantity_i * weight_calibrated_i * r_i(p)`, where $r_i(p)$ is the profile-specific sigmoid conversion ratio from `apply_adoption_curve()`. Farmer counts (number of adopters) are not scaled by $r_i$: a farmer either has entered the pool or has not.
+
+**Subsidy Variables**: The seven monetary subsidy columns (`cost_seeds_bio_no_subsidy`, `cost_seeds_bio_current_regime`, `subsidy_amount_absolute`, `newseed_subsidy`, `producer_absorption`, `subsidy_reduction_cost`, `newseed_savings_vs_current`) are computed at farmer level in Script 02_04 and propagated through Script 02_06. This script aggregates them by department using the same `r_i(p)` weighting applied to all scalable economic quantities.
+
+**Hierarchical Biofortification Assignment**: Children are assigned biofortified maize consumption following a priority hierarchy that reflects realistic distribution patterns. The assignment follows a hierarchy based on each household's likelihood of accessing locally-produced biofortified maize, prioritizing in descending order: cereal-producing farm households, other farming households, households of agricultural workers, rural non-agricultural households, and urban households. Within each tier, assignment is randomized until the departmental coverage target is reached.
+
+**Data-linkage limitation:** ENCOVI (farmer survey) and SIVESNU (child anthropometry) cannot be linked at the household level as they share no common identifier. Children of adopting farmers cannot therefore be identified deterministically. The hierarchy uses observable proxies (head-of-household occupation, rural/urban residence) to approximate the probability of biofortified maize access under realistic distribution patterns.
+
+**Pre-calculated Coverage**: Departmental coverage at each penetration level is retrieved from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`, which already applied the gravity-based redistribution model, so the same redistribution carries across all scenarios.
+
+# Phase A: Helper Functions
+
+## A1. Load Model Configuration
+
+Load the calibrated continuous-adoption model configuration from Script 02_05. Extract the six per-profile parameters (floors and steepness coefficients) consumed by `apply_adoption_curve()` in the simulation loop.
+
+```{r}
+#| label: a1-load-model-config
+
+# =============================================================================
+# A1. Load Model Configuration for Continuous Adoption Curves
+# =============================================================================
+
+model_config <- readRDS(
+  here("01_data", "02_processed", "models",
+       "02_05_likely_adopters_model_config.rds")
+)
+
+# Extract continuous adoption parameters
+floor_S <- model_config$continuous$floor_S
+floor_M <- model_config$continuous$floor_M
+floor_L <- model_config$continuous$floor_L
+k_S     <- model_config$continuous$k_S
+k_M     <- model_config$continuous$k_M
+k_L     <- model_config$continuous$k_L
+```
+
+```{r}
+#| label: tbl-a1-model-config
+#| tbl-cap: "Continuous adoption model parameters"
+
+# =============================================================================
+# Table: Model Configuration Summary
+# =============================================================================
+
+tibble(
+  Parameter = c("floor_S", "floor_M", "floor_L", "k_S", "k_M", "k_L"),
+  Value     = c(floor_S, floor_M, floor_L, k_S, k_M, k_L),
+  Profile   = c("Small", "Medium", "Large", "Small", "Medium", "Large"),
+  Role      = c(rep("Floor (conversion ratio at entry)", 3),
+                rep("Steepness (sigmoid shape)", 3))
+) |>
+  gt() |>
+  tab_header(
+    title = "Continuous Adoption Model Parameters",
+    subtitle = glue("Source: 02_05_likely_adopters_model_config.rds")
+  ) |>
+  fmt_number(columns = Value, decimals = 2) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+## A2. Filter Adopters by Penetration Level
+
+At each national penetration level $p$, farmers with $p_{\text{entry}} \leq p$ are admitted to the adoption pool. For each admitted farmer, the per-farmer conversion ratio $r_i(p)$ is computed via `apply_adoption_curve()`.
+
+**Parameters:**
+
+- `df_farmers`: Data frame of ranked farmers with `p_entry` and `profile`
+- `penetration`: National penetration level (0-1)
+
+**Returns:** Data frame of admitted farmers with `r_i` column appended.
+
+```{r}
+#| label: a2-filter-adopters
+
+# =============================================================================
+# A2. Filter Adopters by Penetration Level (Continuous Adoption Model)
+# =============================================================================
+
+filter_adopters_by_penetration <- function(df_farmers, penetration) {
+
+  df_adopters <- df_farmers |>
+    filter(p_entry <= penetration) |>
+    mutate(
+      r_i = apply_adoption_curve(penetration, p_entry, profile,
+                                 floor_S, floor_M, floor_L,
+                                 k_S, k_M, k_L)
+    )
+
+  return(df_adopters)
+}
+```
+
+## A3. Calculate Economic Metrics by Department
+
+Aggregate economic impact metrics for adopting farmers by department. Scalable quantities (land, production, income, seed costs, subsidy flows) are weighted by `r_i(p)` and `weight_calibrated`. Farmer counts reflect pool membership and are weighted by `weight_calibrated` only.
+
+**Parameters:**
+
+- `df_adopters`: Data frame of farmers adopting at current penetration level, with `r_i` column
+
+**Returns:** Data frame with one row per department containing:
+
+- `n_farmers_bio`: Total adopting farmers (weighted)
+- `n_hybrid_bio`: Hybrid segment adopters (weighted)
+- `n_opv_bio`: OPV/Criollo segment adopters (weighted)
+- `land_bio_mz`: Total biofortified land in manzanas (weighted, scaled by `r_i`)
+- `income_increment_total`: Total additional income in GTQ (weighted, scaled by `r_i`)
+- `income_increment_median`: Median effective income increment per farmer
+- `production_increment_total`: Total additional production in qq (weighted, scaled by `r_i`)
+- `cost_seeds_increment_total`: Total seed cost difference in GTQ (weighted, scaled by `r_i`)
+- `cost_seeds_bio_no_subsidy_total`: Total unsubsidized biofortified seed cost (GTQ, weighted, scaled by `r_i`)
+- `cost_seeds_bio_current_regime_total`: Total farmer-paid biofortified seed cost under active regime (GTQ, weighted, scaled by `r_i`)
+- `subsidy_amount_absolute_total`: Total monetary value of the subsidy (GTQ, weighted, scaled by `r_i`)
+- `newseed_subsidy_total`: Portion of the total subsidy paid by NewSeed (GTQ, weighted, scaled by `r_i`)
+- `producer_absorption_total`: Portion of the total subsidy absorbed by the seed producer (GTQ, weighted, scaled by `r_i`)
+- `subsidy_reduction_cost_total`: Extra cost transferred to farmers under subsidy reduction (GTQ, weighted, scaled by `r_i`)
+- `newseed_savings_vs_current_total`: NewSeed's savings versus the current subsidy regime (GTQ, weighted, scaled by `r_i`)
+
+```{r}
+#| label: a3-calculate-economic
+
+# =============================================================================
+# A3. Calculate Economic Metrics by Department (Continuous Adoption Model)
+# =============================================================================
+
+calculate_economic_by_department <- function(df_adopters) {
+
+  # Conversion factor: manzanas to hectares
+  FACTOR_MZ_TO_HA <- 0.7
+
+  df_economic <- df_adopters |>
+    summarise(
+
+      # -----------------------------------------------------------------------
+      # Farmer counts by segment (survey-weighted, NOT scaled by r_i)
+      # A farmer either has entered the adoption pool or has not.
+      # -----------------------------------------------------------------------
+
+      n_farmers_bio = sum(weight_calibrated, na.rm = TRUE),
+
+      n_hybrid_bio = sum(
+        if_else(segment_final != "OPV/Criollo", weight_calibrated, 0),
+        na.rm = TRUE
+      ),
+
+      n_opv_bio = sum(
+        if_else(segment_final == "OPV/Criollo", weight_calibrated, 0),
+        na.rm = TRUE
+      ),
+
+      # -----------------------------------------------------------------------
+      # Land area in manzanas (survey-weighted, scaled by r_i)
+      # At penetration p, farmer i converts land_wtcorn * r_i(p) manzanas.
+      # -----------------------------------------------------------------------
+
+      land_bio_mz = sum(land_wtcorn * r_i * weight_calibrated, na.rm = TRUE),
+      land_bio_ha = sum(land_wtcorn * r_i * weight_calibrated, na.rm = TRUE) * FACTOR_MZ_TO_HA,
+
+      # -----------------------------------------------------------------------
+      # Income metrics (scaled by r_i)
+      # Total is weighted (population estimate), median is the typical
+      # effective per-farmer increment at this penetration level.
+      # -----------------------------------------------------------------------
+
+      income_increment_total = sum(
+        income_increment * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      income_increment_median = median(income_increment * r_i, na.rm = TRUE),
+
+      # -----------------------------------------------------------------------
+      # Production increment in quintales (survey-weighted, scaled by r_i)
+      # -----------------------------------------------------------------------
+
+      production_increment_total = sum(
+        production_increment * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      production_biofortified_total = sum(
+        production_biofortified * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      # -----------------------------------------------------------------------
+      # Seed cost increment in GTQ (survey-weighted, scaled by r_i)
+      # Represents additional cost farmers pay for biofortified seed,
+      # proportional to the fraction of land converted.
+      # -----------------------------------------------------------------------
+
+      cost_seeds_increment_total = sum(
+        cost_seeds_increment * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      # -----------------------------------------------------------------------
+      # Subsidy block (survey-weighted, GTQ, scaled by r_i)
+      #
+      # All subsidy variables are computed at farmer level in Script 02_04
+      # and propagated through Script 02_06. At penetration p, the
+      # effective monetary flow for farmer i is quantity_i * r_i(p),
+      # reflecting the fraction of land under biofortified seed.
+      #
+      # Linear identities preserved at aggregate level:
+      #   cost_seeds_bio_no_subsidy_total =
+      #     cost_seeds_bio_current_regime_total + subsidy_amount_absolute_total
+      #     + subsidy_reduction_cost_total
+      #   subsidy_amount_absolute_total =
+      #     newseed_subsidy_total + producer_absorption_total
+      #   newseed_savings_vs_current_total =
+      #     producer_absorption_total + subsidy_reduction_cost_total
+      # -----------------------------------------------------------------------
+
+      cost_seeds_bio_no_subsidy_total = sum(
+        cost_seeds_bio_no_subsidy * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      cost_seeds_bio_current_regime_total = sum(
+        cost_seeds_bio_current_regime * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      subsidy_amount_absolute_total = sum(
+        subsidy_amount_absolute * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      newseed_subsidy_total = sum(
+        newseed_subsidy * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      producer_absorption_total = sum(
+        producer_absorption * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      subsidy_reduction_cost_total = sum(
+        subsidy_reduction_cost * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      newseed_savings_vs_current_total = sum(
+        newseed_savings_vs_current * r_i * weight_calibrated,
+        na.rm = TRUE
+      ),
+
+      .by = departamento
+    )
+
+  return(df_economic)
+}
+```
+
+## A4. Assign Biofortification Using Hierarchical Priority
+
+Assign biofortified maize consumption to children following a hierarchical priority system that reflects realistic distribution patterns. Within each department, children are prioritized according to their household's likelihood of accessing locally-produced biofortified maize, and assignment within each tier is randomized at the household level until the departmental coverage target is reached.
+
+The function respects survey weights (`weight_calibrated`), ensuring that the weighted proportion of children receiving biofortified maize matches the departmental coverage target.
+
+**Parameters:**
+
+- `df_children`: Children population data frame with pre-calculated baseline and QPM profiles
+- `df_coverage`: Data frame with `departamento` and `coverage_pct` (0-100 scale)
+- `seed`: Random seed for reproducibility
+
+**Returns:** Data frame with added `flag_biofortified` column (1 = receives biofortified, 0 = does not).
+
+```{r}
+#| label: a4-assign-biofortification
+
+# =============================================================================
+# A4. Assign Biofortification Using Hierarchical Priority
+# =============================================================================
+
+if (is_pco) {
+  assign_biofortification_hierarchical <- function(df_children,
+                                                    df_coverage,
+                                                    seed = 789) {
+
+    set.seed(seed)
+
+    # ===========================================================================
+    # STEP 1: Assign priority groups and random tie-breaker
+    # ===========================================================================
+
+    df_with_priority <- df_children |>
+      mutate(
+        priority_group = case_when(
+          ocupacion_hogar == "Granjero cereales"    ~ 1L,
+          ocupacion_hogar == "Granjero otros"       ~ 2L,
+          ocupacion_hogar == "Trabajador del campo" ~ 3L,
+          ruralurbano == "Rural"                    ~ 4L,
+          ruralurbano == "Urbano"                   ~ 5L,
+          TRUE                                      ~ 5L
+        ),
+        random_tie = runif(n())
+      )
+
+    # ===========================================================================
+    # STEP 2: Join coverage data
+    # ===========================================================================
+
+    df_with_coverage <- df_with_priority |>
+      left_join(
+        df_coverage |>
+          select(departamento, coverage_pct) |>
+          mutate(coverage_frac = coverage_pct / 100),
+        by = "departamento"
+      )
+
+    # ===========================================================================
+    # STEP 3: Sort by department, priority, and random tie-breaker
+    # ===========================================================================
+
+    df_sorted <- df_with_coverage |>
+      arrange(departamento, priority_group, random_tie)
+
+    # ===========================================================================
+    # STEP 4: Calculate cumulative weights and assign biofortification flag
+    # Children are assigned until departmental coverage target is reached
+    # ===========================================================================
+
+    df_assigned <- df_sorted |>
+      mutate(
+        weight_cumsum = cumsum(weight_calibrated),
+        weight_total = sum(weight_calibrated),
+        weight_target = coverage_frac * weight_total,
+        .by = departamento
+      ) |>
+      mutate(
+        flag_biofortified = if_else(weight_cumsum <= weight_target, 1L, 0L)
+      )
+
+    # ===========================================================================
+    # STEP 5: Clean up auxiliary columns
+    # ===========================================================================
+
+    df_result <- df_assigned |>
+      select(
+        -priority_group, -random_tie, -weight_cumsum, -weight_total,
+        -weight_target, -coverage_pct, -coverage_frac
+      )
+
+    return(df_result)
+  }
+} else {
+  assign_biofortification_hierarchical <- function(df_children,
+                                                    df_coverage,
+                                                    seed = 789) {
+
+    set.seed(seed)
+
+    # ===========================================================================
+    # STEP 1: Assign random tie-breaker (per household)
+    # ===========================================================================
+
+    df_with_tie <- df_children |>
+      mutate(random_tie = runif(1), .by = no_hogar)
+
+    # ===========================================================================
+    # STEP 2: Join coverage data
+    # ===========================================================================
+
+    df_with_coverage <- df_with_tie |>
+      left_join(
+        df_coverage |>
+          select(departamento, coverage_pct) |>
+          mutate(coverage_frac = coverage_pct / 100),
+        by = "departamento"
+      )
+
+    # ===========================================================================
+    # STEP 3: Sort by department, priority level, and random tie-breaker
+    # ===========================================================================
+
+    df_sorted <- df_with_coverage |>
+      arrange(departamento, priority_level, random_tie)
+
+    # ===========================================================================
+    # STEP 4: Calculate cumulative weights and assign biofortification flag
+    # Children are assigned until departmental coverage target is reached
+    # ===========================================================================
+
+    df_assigned <- df_sorted |>
+      mutate(
+        weight_cumsum = cumsum(weight_calibrated),
+        weight_total = sum(weight_calibrated),
+        weight_target = coverage_frac * weight_total,
+        .by = departamento
+      ) |>
+      mutate(
+        flag_biofortified = if_else(weight_cumsum <= weight_target, 1L, 0L)
+      )
+
+    # ===========================================================================
+    # STEP 5: Clean up auxiliary columns
+    # ===========================================================================
+
+    df_result <- df_assigned |>
+      select(
+        -random_tie, -weight_cumsum, -weight_total,
+        -weight_target, -coverage_pct, -coverage_frac
+      )
+
+    return(df_result)
+  }
+}
+```
+
+## A5. Select Pre-Calculated Nutritional Values by Biofortification Status
+
+For each child, select the appropriate pre-calculated nutrient profile based on biofortification assignment. Children with `flag_biofortified == 1` receive QPM values; children with `flag_biofortified == 0` retain baseline values.
+
+All nutrient intake, bioavailability, inadequacy, and stunting outcomes are pre-computed in `r if (is_pco) "Script 04_08" else "Script 05_06"`. This function selects the appropriate profile for each child based on biofortification assignment.
+
+**Mapped Variables (baseline -> QPM):**
+
+| Output Variable | Baseline Source | QPM Source |
+|----------------|-----------------|------------|
+| `fe_mg_total` | `fe_mg_total_baseline` | `fe_mg_total_qpm` |
+| `zn_mg_total` | `zn_mg_total_baseline` | `zn_mg_total_qpm` |
+| `prot_g_total` | `prot_g_total_baseline` | `prot_g_total_qpm` |
+| `fe_absorbed_mg` | `fe_absorbed_mg_baseline` | `fe_absorbed_mg_qpm` |
+| `taz_mg` | `taz_mg_baseline` | `taz_mg_qpm` |
+| `hfa_calculated` | `r if (is_pco) "hfa_calculated" else "hfa"` | `r if (is_pco) "hfa_calculated_qpm" else "hfa_qpm"` |
+| `zlen_predicted` | `r if (is_pco) "zlen_predicted" else "haz_calibrated"` | `r if (is_pco) "zlen_predicted_qpm" else "haz_qpm"` |
+
+**Parameters:**
+
+- `df_children`: Data frame with `flag_biofortified` and pre-calculated `*_baseline`/`*_qpm` columns
+
+**Returns:** Data frame with scenario-specific nutrient variables selected.
+
+```{r}
+#| label: a5-select-nutritional-values
+
+# =============================================================================
+# A5. Select Pre-Calculated Nutritional Values by Biofortification Status
+# =============================================================================
+
+if (is_pco) {
+  select_nutritional_by_flag <- function(df_children) {
+
+    df_selected <- df_children |>
+      mutate(
+        # =======================================================================
+        # TOTAL INTAKE (before absorption)
+        # =======================================================================
+
+        fe_mg_total = if_else(
+          flag_biofortified == 1L, fe_mg_total_qpm, fe_mg_total_baseline
+        ),
+        zn_mg_total = if_else(
+          flag_biofortified == 1L, zn_mg_total_qpm, zn_mg_total_baseline
+        ),
+        prot_g_total = if_else(
+          flag_biofortified == 1L, prot_g_total_qpm, prot_g_total_baseline
+        ),
+
+        # =======================================================================
+        # ABSORBED INTAKE
+        # =======================================================================
+
+        fe_absorbed_mg = if_else(
+          flag_biofortified == 1L, fe_absorbed_mg_qpm, fe_absorbed_mg_baseline
+        ),
+        taz_mg = if_else(
+          flag_biofortified == 1L, taz_mg_qpm, taz_mg_baseline
+        ),
+
+        # =======================================================================
+        # MAIZE-SOURCE ENERGY
+        # Energy content of maize is unchanged by biofortification (factor = 1.0),
+        # so ene_kcal_maiz remains the same regardless of assignment.
+        # =======================================================================
+
+        ene_kcal_maiz = ene_kcal_maiz,
+
+        # =======================================================================
+        # TOTAL ENERGY
+        # Energy is unchanged by biofortification (factor = 1.0 for energy),
+        # so total energy intake is the same as baseline for all children.
+        # =======================================================================
+
+        ene_kcal_total = ene_kcal_maiz + ene_kcal_nomaiz,
+
+        # =======================================================================
+        # STUNTING OUTCOMES (pre-computed in 04_08 via GAM)
+        # =======================================================================
+
+        hfa_calculated = if_else(
+          flag_biofortified == 1L, hfa_calculated_qpm, hfa_calculated
+        ),
+        zlen_predicted = if_else(
+          flag_biofortified == 1L, zlen_predicted_qpm, zlen_predicted
+        )
+      )
+
+    return(df_selected)
+  }
+} else {
+  select_nutritional_by_flag <- function(df_children) {
+
+    df_selected <- df_children |>
+      mutate(
+        # =======================================================================
+        # TOTAL INTAKE (before absorption)
+        # =======================================================================
+
+        fe_mg_total = if_else(
+          flag_biofortified == 1L, fe_mg_total_qpm, fe_mg_total_baseline
+        ),
+        zn_mg_total = if_else(
+          flag_biofortified == 1L, zn_mg_total_qpm, zn_mg_total_baseline
+        ),
+        prot_g_total = if_else(
+          flag_biofortified == 1L, prot_g_total_qpm, prot_g_total_baseline
+        ),
+
+        # =======================================================================
+        # ABSORBED INTAKE
+        # =======================================================================
+
+        fe_absorbed_mg = if_else(
+          flag_biofortified == 1L, fe_absorbed_mg_qpm, fe_absorbed_mg_baseline
+        ),
+        taz_mg = if_else(
+          flag_biofortified == 1L, taz_mg_qpm, taz_mg_baseline
+        ),
+
+        # =======================================================================
+        # TOTAL ENERGY
+        # =======================================================================
+
+        ene_kcal_total = if_else(
+          flag_biofortified == 1L, ene_kcal_total_qpm, ene_kcal_total_baseline
+        ),
+
+        # =======================================================================
+        # MAIZE-SOURCE ENERGY
+        # =======================================================================
+
+        ene_kcal_maiz = kcal_individuo_dia_maiz,
+
+        # =======================================================================
+        # STUNTING OUTCOMES (pre-computed in 05_06 via GAM)
+        # =======================================================================
+
+        hfa_calculated = if_else(
+          flag_biofortified == 1L, hfa_qpm, hfa
+        ),
+        zlen_predicted = if_else(
+          flag_biofortified == 1L, haz_qpm, haz_calibrated
+        )
+      )
+
+    return(df_selected)
+  }
+}
+```
+
+## A6. Aggregate Nutritional Metrics by Department
+
+Aggregate nutritional and stunting outcomes by department using survey-weighted calculations. This function produces the departmental summary statistics required for the Shiny dashboard.
+
+**Metrics calculated:**
+
+| Category | Metrics |
+|----------|---------|
+| Stunting | `stunting_pct`, `mean_zlen`, `n_children` |
+| Zinc | `mean_zinc`, `zinc_inad_pct`, `zinc_inad_under12_pct`, `zinc_inad_12to35_pct`, `zinc_inad_36to59_pct` |
+| Iron | `mean_iron`, `iron_inad_pct`, `iron_inad_under36_pct`, `iron_inad_36to59_pct` |
+| Protein | `mean_protein`, `protein_inad_pct`, `protein_inad_under36_pct`, `protein_inad_36to59_pct` |
+| Quantiles | Zinc/Iron/Protein quantiles (0, 25, 50, 75, 100) by age group |
+
+**Inadequacy Thresholds (absorbed values):**
+
+| Nutrient | Age Group | Threshold | Source |
+|----------|-----------|-----------|--------|
+| Zinc | < 12 months | 0.732 mg/day | EFSA, 2014 |
+| Zinc | 12-35 months | 1.074 mg/day | EFSA, 2014 |
+| Zinc | 36-59 months | 1.390 mg/day | EFSA, 2014 |
+| Iron | All ages | 0.5 mg/day | Allen et al., 2020 / EFSA |
+| Protein | < 36 months | 13 g/day | WHO/FAO |
+| Protein | 36-59 months | 19 g/day | WHO/FAO |
+
+**Sources:**
+
+- **Zinc**: EFSA, 2014. Scientific Opinion on Dietary Reference Values for zinc. EFSA Journal 2014;12(10):3844. https://efsa.onlinelibrary.wiley.com/doi/epdf/10.2903/j.efsa.2014.3844
+- **Iron**: Allen et al., 2020. https://pubmed.ncbi.nlm.nih.gov/31701998/ and WHO/FAO, 2006. https://www.who.int/publications/i/item/9241594012
+- **Protein**: WHO/FAO protein requirements for young children.
+
+**Survey design note:**
+
+```{r}
+#| echo: false
+#| output: asis
+
+if (is_pco) {
+  cat("Bootstrap expansion in Script 03_08 broke the original cluster structure. Survey design uses `ids = 1` (simple random sampling) with `weight_calibrated` as weights.")
+} else {
+  cat("Survey design uses `ids = ~upm` (primary sampling units) with `weight_calibrated` as weights.")
+}
+```
+
+**Parameters:**
+
+- `df_children`: Data frame with scenario-specific nutritional values (from A5)
+
+**Returns:** Data frame with one row per department containing all aggregated metrics.
+
+```{r}
+#| label: a6-aggregate-nutritional
+
+# =============================================================================
+# A6. Aggregate Nutritional Metrics by Department
+# =============================================================================
+
+aggregate_nutritional_by_department <- function(df_children) {
+
+  # Zinc thresholds by age group (3 levels)
+  ZINC_THRESHOLD_UNDER12 <- 0.732
+  ZINC_THRESHOLD_12TO35  <- 1.074
+  ZINC_THRESHOLD_36TO59  <- 1.390
+
+
+  # Iron threshold (uniform across ages)
+  IRON_THRESHOLD <- 0.5
+
+  # Protein thresholds by age group (2 levels)
+  PROT_THRESHOLD_UNDER36 <- 13
+  PROT_THRESHOLD_36TO59  <- 19
+
+  # Maize energy-to-weight conversion factor (kcal per gram)
+  # Source: INCAP Food Composition Table — nixtamalized maize (tortilla)
+  MAIZE_KCAL_PER_G <- 3.6
+
+  # ===========================================================================
+  # STEP 1: Create survey design object
+  # ===========================================================================
+
+  svy_design <- if (is_pco) {
+    df_children |>
+      as_survey_design(
+        ids = 1,
+        weights = weight_calibrated,
+        strata = NULL
+      )
+  } else {
+    df_children |>
+      as_survey_design(
+        ids = upm,
+        weights = weight_calibrated,
+        strata = NULL
+      )
+  }
+
+  # ===========================================================================
+  # STEP 2: Calculate stunting metrics by department
+  # ===========================================================================
+
+  df_stunting <- svy_design |>
+    group_by(departamento) |>
+    summarise(
+      stunting_pct = survey_mean(
+        hfa_calculated == 1L,
+        na.rm = TRUE,
+        vartype = NULL
+      ),
+      mean_zlen = survey_mean(
+        zlen_predicted,
+        na.rm = TRUE,
+        vartype = NULL
+      ),
+      n_children = survey_total(1, vartype = NULL),
+      n_children_biofortified = survey_total(
+        flag_biofortified,
+        vartype = NULL
+      )
+    ) |>
+    mutate(stunting_pct = stunting_pct * 100)
+
+  # ===========================================================================
+  # STEP 3: Calculate mean nutritional intake by department
+  # ===========================================================================
+
+  df_nutrition_means <- svy_design |>
+    group_by(departamento) |>
+    summarise(
+      # Total intake (before absorption)
+      mean_zinc_total = survey_mean(zn_mg_total, na.rm = TRUE, vartype = NULL),
+      mean_iron_total = survey_mean(fe_mg_total, na.rm = TRUE, vartype = NULL),
+      # Absorbed intake
+      mean_zinc = survey_mean(taz_mg, na.rm = TRUE, vartype = NULL),
+      mean_iron = survey_mean(fe_absorbed_mg, na.rm = TRUE, vartype = NULL),
+      mean_protein = survey_mean(prot_g_total, na.rm = TRUE, vartype = NULL),
+      # Consumption tab: maize intake in grams (from energy, factor = 1.0)
+      maize_g_day_mean = survey_mean(
+        ene_kcal_maiz / MAIZE_KCAL_PER_G,
+        na.rm = TRUE, vartype = NULL
+      ),
+      # Energy tab: total energy intake (baseline, factor = 1.0)
+      mean_energy = survey_mean(ene_kcal_total, na.rm = TRUE, vartype = NULL)
+    )
+
+  # ---------------------------------------------------------------------------
+  # Energy by age group (dashboard display)
+  # ---------------------------------------------------------------------------
+
+  df_energy_under36 <- svy_design |>
+    filter(.data[[age_var]] < 36) |>
+    group_by(departamento) |>
+    summarise(
+      mean_energy_under36 = survey_mean(
+        ene_kcal_total, na.rm = TRUE, vartype = NULL
+      )
+    )
+
+  df_energy_36to59 <- svy_design |>
+    filter(.data[[age_var]] >= 36) |>
+    group_by(departamento) |>
+    summarise(
+      mean_energy_36to59 = survey_mean(
+        ene_kcal_total, na.rm = TRUE, vartype = NULL
+      )
+    )
+
+  # ===========================================================================
+  # STEP 4: Calculate overall inadequacy rates by department
+  # ===========================================================================
+
+  df_inad_overall <- svy_design |>
+    mutate(
+      # Zinc inadequacy: 3 age groups
+      zinc_inadequate = case_when(
+        .data[[age_var]] < 12 & taz_mg < ZINC_THRESHOLD_UNDER12 ~ 1L,
+        .data[[age_var]] >= 12 & .data[[age_var]] < 36 & taz_mg < ZINC_THRESHOLD_12TO35 ~ 1L,
+        .data[[age_var]] >= 36 & taz_mg < ZINC_THRESHOLD_36TO59 ~ 1L,
+        TRUE ~ 0L
+      ),
+      # Iron inadequacy: uniform threshold
+      iron_inadequate = if_else(fe_absorbed_mg < IRON_THRESHOLD, 1L, 0L),
+      # Protein inadequacy: 2 age groups
+      protein_inadequate = case_when(
+        .data[[age_var]] < 36 & prot_g_total < PROT_THRESHOLD_UNDER36 ~ 1L,
+        .data[[age_var]] >= 36 & prot_g_total < PROT_THRESHOLD_36TO59 ~ 1L,
+        TRUE ~ 0L
+      )
+    ) |>
+    group_by(departamento) |>
+    summarise(
+      zinc_inad_pct = survey_mean(
+        zinc_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100,
+      iron_inad_pct = survey_mean(
+        iron_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100,
+      protein_inad_pct = survey_mean(
+        protein_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  # ===========================================================================
+  # STEP 5: Calculate inadequacy rates by age group - ZINC (3 groups)
+  # ===========================================================================
+
+  # Group 1: < 12 months
+  df_zinc_under12 <- svy_design |>
+    filter(.data[[age_var]] < 12) |>
+    mutate(zinc_inadequate = if_else(taz_mg < ZINC_THRESHOLD_UNDER12, 1L, 0L)) |>
+    group_by(departamento) |>
+    summarise(
+      zinc_inad_under12_pct = survey_mean(
+        zinc_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  # Group 2: 12-35 months
+  df_zinc_12to35 <- svy_design |>
+    filter(.data[[age_var]] >= 12 & .data[[age_var]] < 36) |>
+    mutate(zinc_inadequate = if_else(taz_mg < ZINC_THRESHOLD_12TO35, 1L, 0L)) |>
+    group_by(departamento) |>
+    summarise(
+      zinc_inad_12to35_pct = survey_mean(
+        zinc_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  # Group 3: 36-59 months
+  df_zinc_36to59 <- svy_design |>
+    filter(.data[[age_var]] >= 36) |>
+    mutate(zinc_inadequate = if_else(taz_mg < ZINC_THRESHOLD_36TO59, 1L, 0L)) |>
+    group_by(departamento) |>
+    summarise(
+      zinc_inad_36to59_pct = survey_mean(
+        zinc_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  # ===========================================================================
+  # STEP 6: Calculate inadequacy rates by age group - IRON (uniform, but 2 groups for dashboard)
+  # ===========================================================================
+
+  df_iron_under36 <- svy_design |>
+    filter(.data[[age_var]] < 36) |>
+    mutate(iron_inadequate = if_else(fe_absorbed_mg < IRON_THRESHOLD, 1L, 0L)) |>
+    group_by(departamento) |>
+    summarise(
+      iron_inad_under36_pct = survey_mean(
+        iron_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  df_iron_36to59 <- svy_design |>
+    filter(.data[[age_var]] >= 36) |>
+    mutate(iron_inadequate = if_else(fe_absorbed_mg < IRON_THRESHOLD, 1L, 0L)) |>
+    group_by(departamento) |>
+    summarise(
+      iron_inad_36to59_pct = survey_mean(
+        iron_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  # ===========================================================================
+  # STEP 7: Calculate inadequacy rates by age group - PROTEIN (2 groups)
+  # ===========================================================================
+
+  df_prot_under36 <- svy_design |>
+    filter(.data[[age_var]] < 36) |>
+    mutate(protein_inadequate = if_else(prot_g_total < PROT_THRESHOLD_UNDER36, 1L, 0L)) |>
+    group_by(departamento) |>
+    summarise(
+      protein_inad_under36_pct = survey_mean(
+        protein_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  df_prot_36to59 <- svy_design |>
+    filter(.data[[age_var]] >= 36) |>
+    mutate(protein_inadequate = if_else(prot_g_total < PROT_THRESHOLD_36TO59, 1L, 0L)) |>
+    group_by(departamento) |>
+    summarise(
+      protein_inad_36to59_pct = survey_mean(
+        protein_inadequate,
+        na.rm = TRUE,
+        vartype = NULL
+      ) * 100
+    )
+
+  # ===========================================================================
+  # STEP 8: Calculate quantiles for children under 36 months
+  # ===========================================================================
+
+  df_quantiles_under36 <- svy_design |>
+    filter(.data[[age_var]] < 36) |>
+    group_by(departamento) |>
+    summarise(
+      zinc_under36 = survey_quantile(
+        taz_mg,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      iron_total_under36 = survey_quantile(
+        fe_mg_total,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      iron_under36 = survey_quantile(
+        fe_absorbed_mg,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      protein_under36 = survey_quantile(
+        prot_g_total,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      maize_g_under36 = survey_quantile(
+        ene_kcal_maiz / MAIZE_KCAL_PER_G,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      energy_under36 = survey_quantile(
+        ene_kcal_total,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      )
+    )
+
+  # ===========================================================================
+  # STEP 9: Calculate quantiles for children 36-59 months
+  # ===========================================================================
+
+  df_quantiles_36to59 <- svy_design |>
+    filter(.data[[age_var]] >= 36) |>
+    group_by(departamento) |>
+    summarise(
+      zinc_36to59 = survey_quantile(
+        taz_mg,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      iron_total_36to59 = survey_quantile(
+        fe_mg_total,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      iron_36to59 = survey_quantile(
+        fe_absorbed_mg,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      protein_36to59 = survey_quantile(
+        prot_g_total,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      maize_g_36to59 = survey_quantile(
+        ene_kcal_maiz / MAIZE_KCAL_PER_G,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      ),
+      energy_36to59 = survey_quantile(
+        ene_kcal_total,
+        quantiles = c(0, 0.25, 0.50, 0.75, 1.0),
+        na.rm = TRUE, vartype = NULL
+      )
+    )
+
+  # ===========================================================================
+  # STEP 10: Join all metrics into single departmental summary
+  # ===========================================================================
+
+  df_aggregated <- df_stunting |>
+    left_join(df_nutrition_means, by = "departamento") |>
+    left_join(df_inad_overall, by = "departamento") |>
+    # Zinc by age (3 groups)
+    left_join(df_zinc_under12, by = "departamento") |>
+    left_join(df_zinc_12to35, by = "departamento") |>
+    left_join(df_zinc_36to59, by = "departamento") |>
+    # Iron by age (2 groups, same threshold)
+    left_join(df_iron_under36, by = "departamento") |>
+    left_join(df_iron_36to59, by = "departamento") |>
+    # Protein by age (2 groups)
+    left_join(df_prot_under36, by = "departamento") |>
+    left_join(df_prot_36to59, by = "departamento") |>
+    # Energy by age (2 groups, for EER gap)
+    left_join(df_energy_under36, by = "departamento") |>
+    left_join(df_energy_36to59, by = "departamento") |>
+    # Quantiles
+    left_join(df_quantiles_under36, by = "departamento") |>
+    left_join(df_quantiles_36to59, by = "departamento")
+
+  # ===========================================================================
+  # STEP 11: Apply Tukey whisker limits for boxplot visualization
+  # Zinc is excluded: Miller equation already constrains absorption range.
+  # Only q00 (min) and q100 (max) are replaced by Tukey fences;
+  # q25, q50, q75 remain unchanged. This affects visualization only —
+  # inadequacy calculations and stunting models are not impacted.
+  # Reference: Tukey, J.W. (1977). Exploratory Data Analysis. Addison-Wesley.
+  # ===========================================================================
+
+  df_aggregated <- df_aggregated |>
+    mutate(
+      # --- Iron: children under 36 months ---
+      iron_under36_iqr  = iron_under36_q75 - iron_under36_q25,
+      iron_under36_q00  = pmax(iron_under36_q00,
+                               iron_under36_q25 - 1.5 * iron_under36_iqr),
+      iron_under36_q100 = pmin(iron_under36_q100,
+                               iron_under36_q75 + 1.5 * iron_under36_iqr),
+
+      # --- Iron: children 36-59 months ---
+      iron_36to59_iqr  = iron_36to59_q75 - iron_36to59_q25,
+      iron_36to59_q00  = pmax(iron_36to59_q00,
+                              iron_36to59_q25 - 1.5 * iron_36to59_iqr),
+      iron_36to59_q100 = pmin(iron_36to59_q100,
+                              iron_36to59_q75 + 1.5 * iron_36to59_iqr),
+
+      # --- Iron total: children under 36 months ---
+      iron_total_under36_iqr  = iron_total_under36_q75 - iron_total_under36_q25,
+      iron_total_under36_q00  = pmax(iron_total_under36_q00,
+                                     iron_total_under36_q25 - 1.5 *
+                                       iron_total_under36_iqr),
+      iron_total_under36_q100 = pmin(iron_total_under36_q100,
+                                     iron_total_under36_q75 + 1.5 *
+                                       iron_total_under36_iqr),
+
+      # --- Iron total: children 36-59 months ---
+      iron_total_36to59_iqr  = iron_total_36to59_q75 - iron_total_36to59_q25,
+      iron_total_36to59_q00  = pmax(iron_total_36to59_q00,
+                                    iron_total_36to59_q25 - 1.5 * iron_total_36to59_iqr),
+      iron_total_36to59_q100 = pmin(iron_total_36to59_q100,
+                                    iron_total_36to59_q75 + 1.5 * iron_total_36to59_iqr),
+
+      # --- Protein: children under 36 months ---
+      protein_under36_iqr  = protein_under36_q75 - protein_under36_q25,
+      protein_under36_q00  = pmax(protein_under36_q00,
+                                  protein_under36_q25 - 1.5 * protein_under36_iqr),
+      protein_under36_q100 = pmin(protein_under36_q100,
+                                  protein_under36_q75 + 1.5 * protein_under36_iqr),
+
+      # --- Protein: children 36-59 months ---
+      protein_36to59_iqr  = protein_36to59_q75 - protein_36to59_q25,
+      protein_36to59_q00  = pmax(protein_36to59_q00,
+                                 protein_36to59_q25 - 1.5 * protein_36to59_iqr),
+      protein_36to59_q100 = pmin(protein_36to59_q100,
+                                 protein_36to59_q75 + 1.5 * protein_36to59_iqr),
+
+      # --- Maize consumption: children under 36 months ---
+      maize_g_under36_iqr  = maize_g_under36_q75 - maize_g_under36_q25,
+      maize_g_under36_q00  = pmax(maize_g_under36_q00,
+                                  maize_g_under36_q25 - 1.5 * maize_g_under36_iqr),
+      maize_g_under36_q100 = pmin(maize_g_under36_q100,
+                                  maize_g_under36_q75 + 1.5 * maize_g_under36_iqr),
+
+      # --- Maize consumption: children 36-59 months ---
+      maize_g_36to59_iqr  = maize_g_36to59_q75 - maize_g_36to59_q25,
+      maize_g_36to59_q00  = pmax(maize_g_36to59_q00,
+                                 maize_g_36to59_q25 - 1.5 * maize_g_36to59_iqr),
+      maize_g_36to59_q100 = pmin(maize_g_36to59_q100,
+                                 maize_g_36to59_q75 + 1.5 * maize_g_36to59_iqr),
+
+      # --- Energy: children under 36 months ---
+      energy_under36_iqr  = energy_under36_q75 - energy_under36_q25,
+      energy_under36_q00  = pmax(energy_under36_q00,
+                                 energy_under36_q25 - 1.5 * energy_under36_iqr),
+      energy_under36_q100 = pmin(energy_under36_q100,
+                                 energy_under36_q75 + 1.5 * energy_under36_iqr),
+
+      # --- Energy: children 36-59 months ---
+      energy_36to59_iqr  = energy_36to59_q75 - energy_36to59_q25,
+      energy_36to59_q00  = pmax(energy_36to59_q00,
+                                energy_36to59_q25 - 1.5 * energy_36to59_iqr),
+      energy_36to59_q100 = pmin(energy_36to59_q100,
+                                energy_36to59_q75 + 1.5 * energy_36to59_iqr)
+    ) |>
+    # Remove IQR helper columns (not needed in final output)
+    select(-ends_with("_iqr"))
+
+  return(df_aggregated)
+}
+```
+
+---
+
+# Phase B: Data Loading
+
+This phase loads all required datasets for scenario simulation:
+
+1. **`r if (is_pco) "Synthetic population" else "ENCOVI children"`**: Children 6-59 months with pre-calculated baseline and QPM nutritional/stunting profiles (from `r if (is_pco) "04_08" else "05_06"`)
+2. **Farmer adoption data**: Ranked farmers with economic metrics, adoption scores, per-farmer entry penetration `p_entry`, and behavioural profile (from 02_06)
+3. **Market baseline**: Departmental baseline metrics (farmers, land, consumption) (from 06_01)
+4. **Saturation scenarios**: Pre-calculated coverage by department x penetration level (from 06_01)
+
+## B1. Load `r if (is_pco) "Synthetic Population with Pre-Computed Profiles" else "ENCOVI Children with Pre-Computed Profiles"`
+
+```{r}
+#| echo: false
+#| output: asis
+
+if (is_pco) {
+  cat("Load the synthetic population from Script 04_08, which contains pre-calculated baseline and QPM nutritional profiles (intake, bioavailability, inadequacy, nutritional index) and GAM-based stunting outcomes. This dataset enables efficient scenario simulation by selecting between `*_baseline` and `*_qpm` columns rather than recalculating on-the-fly.")
+} else {
+  cat("Load the ENCOVI children from Script 05_06, which contains pre-calculated baseline and QPM nutritional profiles and GAM-based stunting outcomes.")
+}
+```
+
+```{r}
+#| label: b1-load-children-population
+
+# =============================================================================
+# B1. Load Children Data
+# =============================================================================
+
+if (is_pco) {
+  df_children_raw <- read_parquet(
+    here("01_data", "02_processed",
+         "scenarios", "04_08_baseline_qpm_demographics.parquet")
+  ) |>
+    left_join(
+      read_parquet(
+        here("01_data", "02_processed",
+             "scenarios", "04_08_baseline_qpm_profiles.parquet")
+      ),
+      by = c("synthetic_id", "departamento", "weight_calibrated")
+    )
+} else {
+  df_children_raw <- read_parquet(
+    here("01_data", "02_processed",
+         "transfer", "05_06_encovi_children_priority.parquet")
+  )
+}
+```
+
+## B2. Load Farmer Adoption Data
+
+Load farmer-level data with adoption scores, economic metrics, per-farmer entry penetration point (`p_entry`), and behavioural profile (`profile`) from Script `r paste0("02_06_", seed_suffix, "_", subsidy_suffix)`. The parquet integrates the seed-specific yield assumptions and the subsidy-specific seed prices applied in Script `r paste0("02_04_", seed_suffix, "_", subsidy_suffix)`, including the seven monetary subsidy decomposition columns computed in Phase E of Script 02_04.
+
+Farmers are sorted by `adoption_score` (descending). The per-farmer entry penetration point `p_entry` is already present in the parquet; filtering adopters at each penetration level uses `p_entry <= p` and then computes the conversion ratio $r_i(p)$ via `apply_adoption_curve()`.
+
+```{r}
+#| label: b2-load-farmer-data
+
+# =============================================================================
+# B2. Load Farmer Adoption Data
+# =============================================================================
+
+df_farmers_raw <- read_parquet(
+  here("01_data", "02_processed",
+       "scenarios", paste0("02_06_", seed_suffix, "_", subsidy_suffix,
+                           "_farmers_adoption_scores.parquet"))
+)
+
+# ===========================================================================
+# Sort by adoption score (best candidates first). The entry penetration
+# point p_entry and behavioural profile are already present in the parquet.
+# ===========================================================================
+
+df_farmers_ranked <- df_farmers_raw |>
+  arrange(desc(adoption_score))
+```
+
+## B3. Load Market Baseline
+
+Load departmental baseline metrics from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`. This dataset contains static departmental characteristics that serve as denominators for penetration percentage calculations.
+
+```{r}
+#| label: b3-load-market-baseline
+
+# =============================================================================
+# B3. Load Market Baseline
+# =============================================================================
+
+df_market_baseline <- read_parquet(
+  here("01_data", "02_processed",
+       "scenarios", paste0("06_01_", seed_suffix, "_", subsidy_suffix,
+                           "_market_baseline.parquet"))
+)
+```
+
+## B4. Load Saturation Scenarios
+
+Load pre-calculated departmental coverage across penetration levels from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`. The original dataset contains 101 levels (0-100% in 1% increments); we filter to the 11 levels needed for scenario simulation (0%, 10%, 20%... 100%).
+
+**Key insight:** The gravity-based redistribution is already applied in this dataset. Each row represents the final coverage a department achieves after surplus production flows through the gravity model network.
+
+```{r}
+#| label: b4-load-saturation
+
+# =============================================================================
+# B4. Load Saturation Scenarios
+# =============================================================================
+
+df_saturation_raw <- read_parquet(
+  here("01_data", "02_processed",
+       "scenarios", paste0("06_01_", seed_suffix, "_", subsidy_suffix,
+                           "_saturation_scenarios.parquet"))
+)
+
+# ===========================================================================
+# FILTER TO 11 PENETRATION LEVELS
+# Levels: 0%, 10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90%, 100%
+# ===========================================================================
+
+df_saturation <- df_saturation_raw |>
+  filter(
+    near(penetration, 0.0) | near(penetration, 0.1) | near(penetration, 0.2) |
+    near(penetration, 0.3) | near(penetration, 0.4) | near(penetration, 0.5) |
+    near(penetration, 0.6) | near(penetration, 0.7) | near(penetration, 0.8) |
+    near(penetration, 0.9) | near(penetration, 1.0)
+  )
+
+# Clean up raw data
+rm(df_saturation_raw)
+```
+
+---
+
+# Phase C: Baseline Calculations
+
+Calculate baseline metrics at 0% penetration (no biofortification). The `r if (is_pco) "synthetic" else "ENCOVI"` population already contains pre-calculated baseline nutritional and stunting profiles, so we select baseline values and aggregate directly.
+
+## C1. Prepare Baseline Nutrient Variables
+
+Select baseline nutritional values for all children (no biofortification). This maps the pre-calculated baseline columns to the variable names expected by the aggregation function.
+
+```{r}
+#| label: c1-prepare-baseline
+
+# =============================================================================
+# C1. Prepare Baseline Nutritional Variables
+# =============================================================================
+
+if (is_pco) {
+  df_baseline <- df_children_raw |>
+    mutate(
+      # Map baseline columns to aggregation-expected names
+      fe_mg_total        = fe_mg_total_baseline,
+      zn_mg_total        = zn_mg_total_baseline,
+      prot_g_total       = prot_g_total_baseline,
+      fe_absorbed_mg     = fe_absorbed_mg_baseline,
+      taz_mg             = taz_mg_baseline,
+      ene_kcal_maiz      = ene_kcal_maiz,
+      ene_kcal_total     = ene_kcal_maiz + ene_kcal_nomaiz,
+      # hfa_calculated and zlen_predicted already represent baseline values
+      hfa_calculated     = hfa_calculated,
+      zlen_predicted     = zlen_predicted,
+      # No biofortified assignment exists at 0% penetration
+      flag_biofortified  = 0L
+    )
+} else {
+  df_baseline <- df_children_raw |>
+    mutate(
+      # Map baseline columns to aggregation-expected names
+      fe_mg_total        = fe_mg_total_baseline,
+      zn_mg_total        = zn_mg_total_baseline,
+      prot_g_total       = prot_g_total_baseline,
+      ene_kcal_total     = ene_kcal_total_baseline,
+      fe_absorbed_mg     = fe_absorbed_mg_baseline,
+      taz_mg             = taz_mg_baseline,
+      ene_kcal_maiz      = kcal_individuo_dia_maiz,
+      hfa_calculated     = hfa,
+      zlen_predicted     = haz_calibrated,
+      # No biofortified assignment exists at 0% penetration
+      flag_biofortified  = 0L
+    )
+}
+```
+
+## C2. Aggregate Baseline by Department
+
+Aggregate baseline metrics using the `aggregate_nutritional_by_department()` function. This produces the reference values for calculating improvements at each penetration level.
+
+```{r}
+#| label: c2-aggregate-baseline
+
+# =============================================================================
+# C2. Aggregate Baseline by Department
+# =============================================================================
+
+df_baseline_departmental <- aggregate_nutritional_by_department(df_baseline) |>
+  mutate(penetration = 0, .before = everything())
+```
+
+```{r}
+#| label: tbl-c2-baseline-summary
+#| tbl-cap: "Baseline Metrics by Department (0% Penetration)"
+
+# =============================================================================
+# Baseline Summary Table
+# =============================================================================
+
+df_tbl_c2 <- df_baseline_departmental |>
+  select(
+    departamento, n_children,
+    stunting_pct, mean_zlen,
+    zinc_inad_pct, iron_inad_pct, protein_inad_pct
+  ) |>
+  arrange(desc(stunting_pct))
+
+export(df_tbl_c2, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c2_baseline_summary.rds")))
+
+df_tbl_c2 |>
+  gt() |>
+  tab_header(
+    title = "Baseline Nutritional Metrics by Department",
+    subtitle = glue("0% biofortification penetration — Seed: {seed_code} | Pathway: {pathway_label}")
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_children = "Children (N)",
+    stunting_pct = "Stunting (%)",
+    mean_zlen = if (is_pco) "Mean ZLEN" else "Mean HAZ",
+    zinc_inad_pct = "Zinc Inad. (%)",
+    iron_inad_pct = "Iron Inad. (%)",
+    protein_inad_pct = "Protein Inad. (%)"
+  ) |>
+  fmt_number(columns = n_children, decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = c(stunting_pct, zinc_inad_pct, iron_inad_pct, protein_inad_pct), decimals = 1) |>
+  fmt_number(columns = mean_zlen, decimals = 2) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  tab_style(
+    style = cell_fill(color = "#ffcccc"),
+    locations = cells_body(columns = stunting_pct, rows = stunting_pct > 50)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffffcc"),
+    locations = cells_body(columns = stunting_pct, rows = stunting_pct > 30 & stunting_pct <= 50)
+  ) |>
+  tab_source_note(
+    source_note = glue("Seed: {seed_code} | Pathway: {pathway_label}. Inadequacy thresholds: EFSA (absorbed zinc), Allen et al. 2020 (absorbed iron), WHO/FAO (protein). Stunting: HAZ < -2 (WHO). {if (is_pco) 'Source: Synthetic population from SIVESNU x ENCOVI.' else 'Source: ENCOVI 2023.'}")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_c2)
+```
+
+## C3. Calculate Baseline Economic Metrics
+
+At 0% penetration, no farmers adopt biofortified seed. Economic baseline contains departmental totals from market baseline with zero biofortification metrics.
+
+```{r}
+#| label: c3-baseline-economic
+
+# =============================================================================
+# C3. Calculate Baseline Economic Metrics
+# =============================================================================
+
+df_baseline_economic <- df_market_baseline |>
+  select(
+    departamento, population,
+    n_farmers_total, n_farmers_hybrid, n_farmers_opv,
+    land_ha_total, consumption_fsi_qq
+  ) |>
+  mutate(
+    penetration = 0,
+
+    # Biofortification metrics (all zero at baseline)
+    n_farmers_bio = 0,
+    n_hybrid_bio = 0,
+    n_opv_bio = 0,
+    land_bio_mz = 0,
+    land_bio_ha = 0,
+    income_increment_total = 0,
+    income_increment_median = 0,
+    production_increment_total = 0,
+    production_biofortified_total = 0,
+    cost_seeds_increment_total = 0,
+
+    # Subsidy block (all zero at baseline: no adopters, no monetary flows)
+    cost_seeds_bio_no_subsidy_total = 0,
+    cost_seeds_bio_current_regime_total = 0,
+    subsidy_amount_absolute_total = 0,
+    newseed_subsidy_total = 0,
+    producer_absorption_total = 0,
+    subsidy_reduction_cost_total = 0,
+    newseed_savings_vs_current_total = 0,
+
+    # Coverage (0% at baseline)
+    coverage_pct = 0,
+
+    .after = departamento
+  )
+```
+
+## C4. Combine Baseline Datasets
+
+Join economic and nutritional baseline metrics into single departmental reference table.
+
+```{r}
+#| label: c4-combine-baseline
+
+# =============================================================================
+# C4. Combine Baseline Datasets
+# =============================================================================
+
+df_scenario_baseline <- df_baseline_economic |>
+  left_join(
+    df_baseline_departmental |> select(-penetration),
+    by = "departamento"
+  )
+```
+
+---
+
+# Phase D: Scenario Simulation
+
+Simulate biofortification impact across 10 penetration levels (10% to 100%). For each level:
+
+1. Filter adopting farmers using `p_entry <= p` and compute per-farmer conversion ratio $r_i(p)$
+2. Calculate economic impact by department, weighting scalable quantities by $r_i(p)$
+3. Get pre-calculated coverage from saturation scenarios
+4. Assign biofortification to children hierarchically
+5. Select pre-calculated baseline or QPM values per child
+6. Aggregate nutritional metrics by department
+7. Combine economic and nutritional results
+
+The loop produces one row per department per penetration level, which is then combined with baseline for the final output.
+
+## D1. Define Scenario Simulation Wrapper
+
+This function orchestrates the complete simulation pipeline for a single penetration level by chaining all Phase A functions in sequence:
+
+1. **A2**: Filter adopting farmers by `p_entry <= p` and compute $r_i(p)$
+2. **A3**: Calculate economic metrics by department (scalable quantities weighted by $r_i$)
+3. **Coverage**: Retrieve pre-calculated departmental coverage from saturation scenarios
+4. **A4**: Assign biofortification flag to children hierarchically
+5. **A5**: Select pre-calculated nutritional values by flag
+6. **A6**: Aggregate nutritional metrics by department
+7. **Combine**: Join economic and nutritional results
+
+**Parameters:**
+
+- `pen`: Penetration level (0-1)
+- `df_farmers`: Ranked farmer data with `p_entry` and `profile`
+- `df_saturation`: Pre-calculated saturation scenarios from 06_01
+- `df_children`: `r if (is_pco) "Synthetic population with pre-calculated profiles (from 04_08)" else "ENCOVI children with pre-calculated profiles (from 05_06)"`
+- `df_departments`: Reference list of all 22 departments
+- `df_market_baseline`: Market baseline for reference variables
+- `seed`: Random seed for hierarchical assignment reproducibility
+
+**Returns:** Data frame with one row per department containing economic and nutritional metrics at the specified penetration level.
+
+```{r}
+#| label: d1-simulation-wrapper
+
+# =============================================================================
+# D1. Define Scenario Simulation Wrapper
+# =============================================================================
+
+simulate_scenario <- function(pen,
+                              df_farmers,
+                              df_saturation,
+                              df_children,
+                              df_departments,
+                              df_market_baseline,
+                              seed = 789) {
+
+  # ===========================================================================
+  # STEP 1: Filter adopting farmers and compute r_i(p) (A2)
+  # ===========================================================================
+
+  df_adopters <- filter_adopters_by_penetration(
+    df_farmers = df_farmers,
+    penetration = pen
+  )
+
+  # ===========================================================================
+  # STEP 2: Calculate economic metrics by department (A3)
+  # ===========================================================================
+
+  df_economic <- calculate_economic_by_department(df_adopters)
+
+  # ===========================================================================
+  # STEP 3: Retrieve pre-calculated coverage from saturation scenarios
+  # ===========================================================================
+
+  df_coverage <- df_saturation |>
+    filter(near(penetration, pen)) |>
+    select(departamento, coverage_pct)
+
+  # ===========================================================================
+  # STEP 4: Assign biofortification flag hierarchically (A4)
+  # ===========================================================================
+
+  df_assigned <- assign_biofortification_hierarchical(
+    df_children = df_children,
+    df_coverage = df_coverage,
+    seed = seed
+  )
+
+  # ===========================================================================
+  # STEP 5: Select pre-calculated nutritional values by flag (A5)
+  # ===========================================================================
+
+  df_selected <- select_nutritional_by_flag(df_assigned)
+
+  # ===========================================================================
+  # STEP 6: Aggregate nutritional metrics by department (A6)
+  # ===========================================================================
+
+  df_nutritional <- aggregate_nutritional_by_department(df_selected)
+
+  # ===========================================================================
+  # STEP 7: Prepare market baseline reference variables
+  # ===========================================================================
+
+  df_market_ref <- df_market_baseline |>
+    mutate(departamento = as.character(departamento)) |>
+    select(
+      departamento,
+      population,
+      n_farmers_total,
+      n_farmers_hybrid,
+      n_farmers_opv,
+      land_ha_total,
+      consumption_fsi_qq
+    )
+
+  # ===========================================================================
+  # STEP 8: Combine economic + market_ref + coverage + nutritional
+  # Ensure all 22 departments are present (left_join with reference)
+  # ===========================================================================
+
+  df_result <- df_departments |>
+    left_join(df_market_ref, by = "departamento") |>
+    left_join(df_economic, by = "departamento") |>
+    left_join(df_coverage, by = "departamento") |>
+    left_join(df_nutritional, by = "departamento") |>
+    mutate(
+      penetration = pen,
+      .before = everything()
+    ) |>
+    # Replace NA economic metrics with 0 for departments without adopters
+    mutate(
+      across(
+        c(n_farmers_bio, n_hybrid_bio, n_opv_bio,
+          land_bio_mz, land_bio_ha,
+          income_increment_total, income_increment_median,
+          production_increment_total, production_biofortified_total,
+          cost_seeds_increment_total,
+          # Subsidy block
+          cost_seeds_bio_no_subsidy_total,
+          cost_seeds_bio_current_regime_total,
+          subsidy_amount_absolute_total,
+          newseed_subsidy_total,
+          producer_absorption_total,
+          subsidy_reduction_cost_total,
+          newseed_savings_vs_current_total),
+        ~ replace_na(.x, 0)
+      )
+    )
+
+  return(df_result)
+}
+```
+
+## D2. Execute Scenario Simulation
+
+Execute the simulation wrapper across 10 penetration levels (10% to 100%). The baseline (0%) was already calculated in Phase C and will be combined in the next step.
+
+```{r}
+#| label: d2-execute-simulation
+
+# =============================================================================
+# D2. Execute Scenario Simulation
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Reference list of departments, so all 22 appear in the output
+# ---------------------------------------------------------------------------
+
+df_departments_ref <- df_market_baseline |>
+  select(departamento) |>
+  mutate(departamento = as.character(departamento))
+
+# ---------------------------------------------------------------------------
+# Define penetration levels to simulate (0% already calculated as baseline)
+# ---------------------------------------------------------------------------
+
+penetration_levels_to_simulate <- seq(0.1, 1.0, by = 0.1)
+
+# ---------------------------------------------------------------------------
+# Execute simulation across all penetration levels
+# ---------------------------------------------------------------------------
+
+df_scenarios_simulated <- map_dfr(
+  penetration_levels_to_simulate,
+  ~ simulate_scenario(
+    pen = .x,
+    df_farmers = df_farmers_ranked,
+    df_saturation = df_saturation,
+    df_children = df_children_raw,
+    df_departments = df_departments_ref,
+    df_market_baseline = df_market_baseline,
+    seed = 789
+  ),
+  .progress = TRUE
+)
+
+# Clean up
+rm(df_departments_ref, penetration_levels_to_simulate)
+```
+
+## D3. Combine All Scenarios
+
+Combine baseline (0% penetration) with simulated scenarios (10%-100%) into a single dataset.
+
+The final dataset contains 242 rows (22 departments x 11 penetration levels) with complete economic and nutritional metrics.
+
+```{r}
+#| label: d3-combine-scenarios
+
+# =============================================================================
+# D3. Combine All Scenarios
+# =============================================================================
+
+df_scenarios_all <- bind_rows(
+  df_scenario_baseline,
+  df_scenarios_simulated
+) |>
+  arrange(penetration, departamento)
+```
+
+## D4. Validation: Scenario Progression
+
+Validate that scenario simulation produces expected patterns:
+
+1. Stunting rate should decrease as penetration increases
+2. Economic metrics (farmers, land, production) should increase monotonically; net income may plateau or decrease at high penetration as less suitable adopters (High segment with yield losses) enter the pool
+3. All 22 departments present at each penetration level
+4. Coverage values should match pre-calculated saturation scenarios
+
+```{r}
+#| label: tbl-d4-scenario-progression
+#| tbl-cap: "National scenario progression across penetration levels"
+
+# =============================================================================
+# D4. Validation: Scenario Progression Summary
+# =============================================================================
+
+df_tbl_d4 <- df_scenarios_all |>
+  summarise(
+    n_departments = n_distinct(departamento),
+    n_farmers_bio = sum(n_farmers_bio, na.rm = TRUE),
+    mean_coverage = mean(coverage_pct, na.rm = TRUE),
+    stunting_pct = weighted.mean(stunting_pct, n_children, na.rm = TRUE),
+    mean_zlen = weighted.mean(mean_zlen, n_children, na.rm = TRUE),
+    zinc_inad_pct = weighted.mean(zinc_inad_pct, n_children, na.rm = TRUE),
+    iron_inad_pct = weighted.mean(iron_inad_pct, n_children, na.rm = TRUE),
+    .by = penetration
+  ) |>
+  arrange(penetration)
+
+export(df_tbl_d4, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_d4_scenario_progression.rds")))
+
+df_tbl_d4 |>
+  gt() |>
+  tab_header(
+    title = "National Metrics by Penetration Level",
+    subtitle = glue("Validation of scenario simulation progression — Seed: {seed_code} | Pathway: {pathway_label}")
+  ) |>
+  cols_label(
+    penetration = "Penetration",
+    n_departments = "Depts",
+    n_farmers_bio = "Farmers Bio",
+    mean_coverage = "Mean Coverage",
+    stunting_pct = "Stunting (%)",
+    mean_zlen = if (is_pco) "Mean ZLEN" else "Mean HAZ",
+    zinc_inad_pct = "Zinc Inad. (%)",
+    iron_inad_pct = "Iron Inad. (%)"
+  ) |>
+  fmt_percent(columns = penetration, decimals = 0) |>
+  fmt_number(columns = n_farmers_bio, decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = mean_coverage, decimals = 1, pattern = "{x}%") |>
+  fmt_number(columns = c(stunting_pct, zinc_inad_pct, iron_inad_pct), decimals = 1) |>
+  fmt_number(columns = mean_zlen, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(columns = stunting_pct, rows = penetration == 1)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = stunting_pct, rows = penetration == 0)
+  ) |>
+  tab_source_note(
+    source_note = glue("Seed: {seed_code} | Pathway: {pathway_label}. Expected: Stunting decreases, coverage increases, all 22 departments present at each level.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_d4)
+```
+
+
+---
+
+# Phase E: Final Processing
+
+This phase prepares the final dataset for export by calculating change metrics relative to baseline, adding derived variables required for the Overview table, and validating schema completeness.
+
+## E1. Calculate Change Metrics
+
+Calculate improvement metrics by comparing each scenario to the baseline (0% penetration). Change metrics follow the convention: positive values indicate improvement (e.g., stunting reduction, inadequacy reduction).
+
+```{r}
+#| label: e1-calculate-change-metrics
+
+# =============================================================================
+# E1. Calculate Change Metrics Relative to Baseline
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Extract baseline values (penetration = 0) for reference
+# ---------------------------------------------------------------------------
+
+df_baseline_reference <- df_scenarios_all |>
+ filter(penetration == 0) |>
+ select(
+   departamento,
+   # Stunting baseline
+   stunting_pct_baseline = stunting_pct,
+   mean_zlen_baseline = mean_zlen,
+   # Nutritional baseline - TOTAL INTAKE
+   mean_zinc_total_baseline = mean_zinc_total,
+   mean_iron_total_baseline = mean_iron_total,
+   # Nutritional baseline - ABSORBED INTAKE
+   mean_zinc_baseline = mean_zinc,
+   mean_iron_baseline = mean_iron,
+   mean_protein_baseline = mean_protein,
+   # Consumption and energy baseline
+   maize_g_day_mean_baseline = maize_g_day_mean,
+   mean_energy_baseline = mean_energy,
+   mean_energy_under36_baseline = mean_energy_under36,
+   mean_energy_36to59_baseline = mean_energy_36to59,
+   # Inadequacy baseline
+   zinc_inad_pct_baseline = zinc_inad_pct,
+   iron_inad_pct_baseline = iron_inad_pct,
+   protein_inad_pct_baseline = protein_inad_pct
+ )
+
+# ---------------------------------------------------------------------------
+# Join baseline and calculate change metrics
+# ---------------------------------------------------------------------------
+
+df_scenarios_with_changes <- df_scenarios_all |>
+ left_join(df_baseline_reference, by = "departamento") |>
+ mutate(
+   # === STUNTING CHANGE ===
+   # Positive = improvement (fewer stunted children)
+   stunting_change_pp = stunting_pct_baseline - stunting_pct,
+   stunting_change_pct = if_else(
+     stunting_pct_baseline > 0,
+     (stunting_pct_baseline - stunting_pct) / stunting_pct_baseline * 100,
+     0
+   ),
+   zlen_change = mean_zlen - mean_zlen_baseline,
+
+   # === NUTRITIONAL INTAKE CHANGE ===
+   zinc_change_pct = if_else(
+     mean_zinc_baseline > 0,
+     (mean_zinc - mean_zinc_baseline) / mean_zinc_baseline * 100,
+     0
+   ),
+   iron_change_pct = if_else(
+     mean_iron_baseline > 0,
+     (mean_iron - mean_iron_baseline) / mean_iron_baseline * 100,
+     0
+   ),
+   protein_change_pct = if_else(
+     mean_protein_baseline > 0,
+     (mean_protein - mean_protein_baseline) / mean_protein_baseline * 100,
+     0
+   ),
+
+   # === INADEQUACY CHANGE ===
+   # Positive = improvement (fewer inadequate children)
+   zinc_inad_change_pp = zinc_inad_pct_baseline - zinc_inad_pct,
+   iron_inad_change_pp = iron_inad_pct_baseline - iron_inad_pct,
+   protein_inad_change_pp = protein_inad_pct_baseline - protein_inad_pct
+ )
+
+# Clean up
+rm(df_baseline_reference)
+```
+
+## E2. Add Derived Variables for Overview Table
+
+Add unit conversions and calculated fields required for the Overview table. This includes conversion from local units (manzanas, quintales, GTQ) to international units (hectares, metric tons), and calculation of subsidy costs.
+
+**Unit Conversions:**
+
+| From | To | Factor |
+|------|----|--------|
+| Manzanas (mz) | Hectares (ha) | x 0.7 |
+| Quintales (qq) | Metric Tons (MT) | x 0.04536 |
+
+**Food System Nutrient Additions:**
+
+The additional quantity of iron and zinc incorporated into the food system through biofortification is calculated from the total volume of QPM maize consumed (all ages, not limited to children 6-59 months) and the incremental nutrient content of biofortified varieties relative to conventional maize.
+
+| Parameter | Iron | Zinc | Source |
+|-----------|------|------|--------|
+| Content in conventional maize | 2.71 mg/100g | 2.21 mg/100g | INCAP Food Composition Table |
+| Biofortification factor | 1.19 (+19%) | 1.38 (+38%) | Semilla Nueva Standard Report, July-December 2020 |
+| Incremental content | 0.51 mg/100g | 0.84 mg/100g | = content x (factor - 1) |
+
+$$\text{Nutrient added (kg/yr)} = \text{bio\_consumed\_mt} \times 10^6
+ \times \frac{\text{content (mg/g)} \times (\text{factor} - 1)}{10^6}$$
+
+This metric represents the gross nutrient addition to the food supply chain before absorption. It is independent of bioavailability assumptions and provides a direct measure of biofortification reach at the food system level.
+
+```{r}
+#| label: e2-add-derived-variables
+
+# =============================================================================
+# E2. Add Derived Variables for Overview Table
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Unit conversion factors
+# ---------------------------------------------------------------------------
+
+FACTOR_MZ_TO_HA <- 0.7
+FACTOR_QQ_TO_MT <- 0.04536
+
+# Food System Nutrient Additions
+# Nutrient content of raw white maize (Source: INCAP Food Composition Table)
+# Biofortification factors (Source: Semilla Nueva Standard Report 2020)
+FE_MG_PER_G_MAIZE <- 2.71 / 100   # 0.0271 mg iron per gram of maize
+ZN_MG_PER_G_MAIZE <- 2.21 / 100   # 0.0221 mg zinc per gram of maize
+FACTOR_FE <- 1.19                   # QPM iron factor (+19%)
+FACTOR_ZN <- 1.38                   # QPM zinc factor (+38%)
+
+# ---------------------------------------------------------------------------
+# Join with market baseline to get consumption_fsi_mt (if not already present)
+# Note: Variables n_farmers_*, land_ha_total already exist in scenarios
+# ---------------------------------------------------------------------------
+
+df_scenarios_enriched <- df_scenarios_with_changes |>
+  left_join(
+    df_market_baseline |>
+      mutate(departamento = as.character(departamento)) |>
+      select(
+        departamento,
+        # Only select variables NOT already in scenarios
+        consumption_fsi_mt
+      ),
+    by = "departamento"
+  ) |>
+  # ---------------------------------------------------------------------------
+  # Calculate derived variables
+  # ---------------------------------------------------------------------------
+  mutate(
+    # === LAND CONVERSIONS ===
+    land_bio_pct = if_else(
+      land_ha_total > 0,
+      land_bio_ha / land_ha_total * 100,
+      0
+    ),
+
+    # === FARMER PERCENTAGES ===
+    farmers_bio_pct = if_else(
+      n_farmers_total > 0,
+      n_farmers_bio / n_farmers_total * 100,
+      0
+    ),
+    hybrid_bio_pct = if_else(
+      n_farmers_hybrid > 0,
+      n_hybrid_bio / n_farmers_hybrid * 100,
+      0
+    ),
+    opv_bio_pct = if_else(
+      n_farmers_opv > 0,
+      n_opv_bio / n_farmers_opv * 100,
+      0
+    ),
+
+    # === PRODUCTION CONVERSIONS ===
+    production_increment_mt = production_increment_total * FACTOR_QQ_TO_MT,
+    production_biofortified_mt = production_biofortified_total * FACTOR_QQ_TO_MT,
+
+    # === INCOME PER FARMER ===
+    income_per_farmer_total = if_else(
+      n_farmers_total > 0,
+      income_increment_total / n_farmers_total,
+      0
+    ),
+    income_per_farmer_adopter = if_else(
+      n_farmers_bio > 0,
+      income_increment_total / n_farmers_bio,
+      0
+    ),
+
+    # === CONSUMPTION (from saturation scenarios) ===
+    bio_consumed_mt = consumption_fsi_mt * (coverage_pct / 100),
+    n_people_biofortified = population * (coverage_pct / 100),
+
+    # === CHILDREN 6-59 MONTHS CONSUMING BIOFORTIFIED MAIZE ===
+    children_coverage_pct = if_else(
+      n_children > 0,
+      n_children_biofortified / n_children * 100,
+      0
+    ),
+
+    # === FOOD SYSTEM NUTRIENT ADDITIONS ===
+    iron_added_kg_year = bio_consumed_mt * FE_MG_PER_G_MAIZE * (FACTOR_FE - 1),
+    zinc_added_kg_year = bio_consumed_mt * ZN_MG_PER_G_MAIZE * (FACTOR_ZN - 1),
+
+    # === STUNTING ABSOLUTE NUMBERS ===
+    n_stunted_baseline = n_children * (stunting_pct_baseline / 100),
+    n_stunted_scenario = n_children * (stunting_pct / 100),
+    n_stunting_averted = n_stunted_baseline - n_stunted_scenario,
+
+    # === INADEQUACY ABSOLUTE NUMBERS ===
+    n_zinc_inad_baseline = n_children * (zinc_inad_pct_baseline / 100),
+    n_zinc_inad_scenario = n_children * (zinc_inad_pct / 100),
+    n_zinc_inad_averted = n_zinc_inad_baseline - n_zinc_inad_scenario,
+
+    n_iron_inad_baseline = n_children * (iron_inad_pct_baseline / 100),
+    n_iron_inad_scenario = n_children * (iron_inad_pct / 100),
+    n_iron_inad_averted = n_iron_inad_baseline - n_iron_inad_scenario,
+
+    n_protein_inad_baseline = n_children * (protein_inad_pct_baseline / 100),
+    n_protein_inad_scenario = n_children * (protein_inad_pct / 100),
+    n_protein_inad_averted = n_protein_inad_baseline - n_protein_inad_scenario
+  )
+
+# Clean up
+rm(FACTOR_MZ_TO_HA, FACTOR_QQ_TO_MT,
+   FE_MG_PER_G_MAIZE, ZN_MG_PER_G_MAIZE, FACTOR_FE, FACTOR_ZN)
+```
+
+## E3. Select and Order Final Variables
+
+Select and reorder variables for the final export schema. Variables are organized by category to facilitate downstream use in Shiny dashboard and Overview table generation.
+
+```{r}
+#| label: e3-select-final-variables
+
+# =============================================================================
+# E3. Select and Order Final Variables
+# =============================================================================
+
+df_scenarios_final <- df_scenarios_enriched |>
+  mutate(
+    # Subsidy identifiers (constant across all rows for this combo,
+    # added explicitly so the parquet is self-describing for the dashboard)
+    subsidy_scenario      = !!subsidy_label,
+    subsidy_suffix        = !!subsidy_suffix,
+    subsidy_reduction_pct = as.integer(
+      sub("^sub", "", !!subsidy_suffix)
+    )
+  ) |>
+  select(
+    # =========================================================================
+    # IDENTIFIERS
+    # =========================================================================
+    penetration,
+    departamento,
+    subsidy_scenario,
+    subsidy_suffix,
+    subsidy_reduction_pct,
+
+    # =========================================================================
+    # FARMER METRICS
+    # =========================================================================
+    n_farmers_total,
+    n_farmers_bio,
+    farmers_bio_pct,
+    n_farmers_hybrid,
+    n_hybrid_bio,
+    hybrid_bio_pct,
+    n_farmers_opv,
+    n_opv_bio,
+    opv_bio_pct,
+
+    # =========================================================================
+    # LAND METRICS
+    # =========================================================================
+    land_ha_total,
+    land_bio_mz,
+    land_bio_ha,
+    land_bio_pct,
+
+    # =========================================================================
+    # ECONOMIC METRICS
+    # =========================================================================
+    income_increment_total,
+    income_increment_median,
+    income_per_farmer_total,
+    income_per_farmer_adopter,
+    cost_seeds_increment_total,
+    production_increment_total,
+    production_increment_mt,
+    production_biofortified_total,
+    production_biofortified_mt,
+
+    # =========================================================================
+    # SUBSIDY METRICS (GTQ, survey-weighted, adopter aggregates)
+    # =========================================================================
+    cost_seeds_bio_no_subsidy_total,
+    cost_seeds_bio_current_regime_total,
+    subsidy_amount_absolute_total,
+    newseed_subsidy_total,
+    producer_absorption_total,
+    subsidy_reduction_cost_total,
+    newseed_savings_vs_current_total,
+
+    # =========================================================================
+    # COVERAGE METRICS
+    # =========================================================================
+    coverage_pct,
+    consumption_fsi_mt,
+    bio_consumed_mt,
+    # Food System Nutrient Additions
+    iron_added_kg_year,
+    zinc_added_kg_year,
+
+    # =========================================================================
+    # TOTAL POPULATION (Consumption tab — Total Population view)
+    # =========================================================================
+    population,
+    n_people_biofortified,
+
+    # =========================================================================
+    # CONSUMPTION METRICS (Consumption tab)
+    # =========================================================================
+    maize_g_day_mean_baseline,
+    maize_g_day_mean,
+
+    # =========================================================================
+    # ENERGY METRICS (Energy tab)
+    # =========================================================================
+    mean_energy_baseline,
+    mean_energy,
+    # Age-group means and baselines
+    mean_energy_under36_baseline,
+    mean_energy_under36,
+    mean_energy_36to59_baseline,
+    mean_energy_36to59,
+
+    # =========================================================================
+    # CHILD POPULATION
+    # =========================================================================
+    n_children,
+    n_children_biofortified,
+    children_coverage_pct,
+
+    # =========================================================================
+    # STUNTING METRICS
+    # =========================================================================
+    # Baseline
+    stunting_pct_baseline,
+    n_stunted_baseline,
+    mean_zlen_baseline,
+    # Scenario
+    stunting_pct,
+    n_stunted_scenario,
+    mean_zlen,
+    # Change
+    stunting_change_pp,
+    stunting_change_pct,
+    n_stunting_averted,
+    zlen_change,
+
+    # =========================================================================
+    # ZINC METRICS
+    # =========================================================================
+    # Mean intake
+    mean_zinc_total_baseline,
+    mean_zinc_total,
+    mean_zinc_baseline,
+    mean_zinc,
+    zinc_change_pct,
+    # Overall inadequacy
+    zinc_inad_pct_baseline,
+    zinc_inad_pct,
+    zinc_inad_change_pp,
+    # Absolute counts
+    n_zinc_inad_baseline,
+    n_zinc_inad_scenario,
+    n_zinc_inad_averted,
+    # Age-specific inadequacy rates
+    zinc_inad_under12_pct,
+    zinc_inad_12to35_pct,
+    zinc_inad_36to59_pct,
+
+    # =========================================================================
+    # IRON METRICS
+    # =========================================================================
+    # Mean intake
+    mean_iron_total_baseline,
+    mean_iron_total,
+    mean_iron_baseline,
+    mean_iron,
+    iron_change_pct,
+    # Overall inadequacy
+    iron_inad_pct_baseline,
+    iron_inad_pct,
+    iron_inad_change_pp,
+    # Absolute counts
+    n_iron_inad_baseline,
+    n_iron_inad_scenario,
+    n_iron_inad_averted,
+    # Age-specific inadequacy rates
+    iron_inad_under36_pct,
+    iron_inad_36to59_pct,
+
+    # =========================================================================
+    # PROTEIN METRICS
+    # =========================================================================
+    # Mean intake
+    mean_protein_baseline,
+    mean_protein,
+    protein_change_pct,
+    # Overall inadequacy
+    protein_inad_pct_baseline,
+    protein_inad_pct,
+    protein_inad_change_pp,
+    # Absolute counts
+    n_protein_inad_baseline,
+    n_protein_inad_scenario,
+    n_protein_inad_averted,
+    # Age-specific inadequacy rates
+    protein_inad_under36_pct,
+    protein_inad_36to59_pct,
+
+    # =========================================================================
+    # QUANTILES FOR BOXPLOTS (by age group)
+    # =========================================================================
+    # Zinc quantiles
+    starts_with("zinc_under36_"),
+    starts_with("zinc_36to59_"),
+    # Iron quantiles
+    starts_with("iron_under36_"),
+    starts_with("iron_36to59_"),
+    # Iron total quantiles
+    starts_with("iron_total_under36_"),
+    starts_with("iron_total_36to59_"),
+    # Protein quantiles
+    starts_with("protein_under36_"),
+    starts_with("protein_36to59_"),
+    # Maize consumption quantiles (Consumption tab)
+    starts_with("maize_g_under36_"),
+    starts_with("maize_g_36to59_"),
+    # Energy quantiles (Energy tab)
+    starts_with("energy_under36_"),
+    starts_with("energy_36to59_")
+
+  ) |>
+  arrange(departamento, penetration)
+```
+
+## E4. Validate Schema Completeness
+
+Verify that all required variables for Overview's table and Shiny dashboard are present in the final dataset.
+
+```{r}
+#| label: e4-schema-validation
+#| tbl-cap: "Schema validation summary"
+
+# =============================================================================
+# E4. Schema Validation
+# =============================================================================
+
+# Define required variables by category
+required_vars <- list(
+  "Identifiers" = c("penetration", "departamento",
+                    "subsidy_scenario", "subsidy_suffix", "subsidy_reduction_pct"),
+
+  "Farmers" = c("n_farmers_total", "n_farmers_bio", "farmers_bio_pct",
+                "n_farmers_hybrid", "n_hybrid_bio", "hybrid_bio_pct",
+                "n_farmers_opv", "n_opv_bio", "opv_bio_pct"),
+
+  "Land" = c("land_ha_total", "land_bio_mz", "land_bio_ha", "land_bio_pct"),
+
+  "Economic" = c("income_increment_total", "income_increment_median",
+                 "income_per_farmer_total", "income_per_farmer_adopter",
+                 "cost_seeds_increment_total",
+                 "production_increment_total", "production_increment_mt"),
+
+  "Subsidy" = c("cost_seeds_bio_no_subsidy_total",
+                "cost_seeds_bio_current_regime_total",
+                "subsidy_amount_absolute_total",
+                "newseed_subsidy_total",
+                "producer_absorption_total",
+                "subsidy_reduction_cost_total",
+                "newseed_savings_vs_current_total"),
+
+  "Coverage" = c("coverage_pct", "consumption_fsi_mt", "bio_consumed_mt",
+                 "iron_added_kg_year", "zinc_added_kg_year"),
+
+  "Population" = c("population", "n_people_biofortified"),
+
+  "Consumption" = c("maize_g_day_mean_baseline", "maize_g_day_mean"),
+
+  "Energy" = c("mean_energy_baseline", "mean_energy",
+               "mean_energy_under36_baseline", "mean_energy_under36",
+               "mean_energy_36to59_baseline", "mean_energy_36to59"),
+
+  "Children" = c("n_children", "n_children_biofortified",
+                 "children_coverage_pct"),
+
+  "Stunting" = c("stunting_pct_baseline", "stunting_pct", "stunting_change_pp",
+                 "stunting_change_pct", "n_stunted_baseline", "n_stunted_scenario",
+                 "n_stunting_averted", "mean_zlen_baseline", "mean_zlen", "zlen_change"),
+
+  "Zinc" = c("mean_zinc_baseline", "mean_zinc", "zinc_change_pct",
+             "zinc_inad_pct_baseline", "zinc_inad_pct", "zinc_inad_change_pp",
+             "n_zinc_inad_baseline", "n_zinc_inad_scenario", "n_zinc_inad_averted",
+             "zinc_inad_under12_pct", "zinc_inad_12to35_pct", "zinc_inad_36to59_pct"),
+
+  "Iron" = c("mean_iron_baseline", "mean_iron", "iron_change_pct",
+             "iron_inad_pct_baseline", "iron_inad_pct", "iron_inad_change_pp",
+             "n_iron_inad_baseline", "n_iron_inad_scenario", "n_iron_inad_averted",
+             "iron_inad_under36_pct", "iron_inad_36to59_pct"),
+
+  "Protein" = c("mean_protein_baseline", "mean_protein", "protein_change_pct",
+                "protein_inad_pct_baseline", "protein_inad_pct", "protein_inad_change_pp",
+                "n_protein_inad_baseline", "n_protein_inad_scenario", "n_protein_inad_averted",
+                "protein_inad_under36_pct", "protein_inad_36to59_pct"),
+
+  "Quantiles_Zinc" = c("zinc_under36_q00", "zinc_under36_q25", "zinc_under36_q50",
+                       "zinc_under36_q75", "zinc_under36_q100",
+                       "zinc_36to59_q00", "zinc_36to59_q25", "zinc_36to59_q50",
+                       "zinc_36to59_q75", "zinc_36to59_q100"),
+
+  "Quantiles_Iron" = c("iron_under36_q00", "iron_under36_q25", "iron_under36_q50",
+                       "iron_under36_q75", "iron_under36_q100",
+                       "iron_36to59_q00", "iron_36to59_q25", "iron_36to59_q50",
+                       "iron_36to59_q75", "iron_36to59_q100"),
+
+  "Quantiles_Iron_Total" = c("iron_total_under36_q00", "iron_total_under36_q25",
+                              "iron_total_under36_q50", "iron_total_under36_q75",
+                              "iron_total_under36_q100",
+                              "iron_total_36to59_q00", "iron_total_36to59_q25",
+                              "iron_total_36to59_q50", "iron_total_36to59_q75",
+                              "iron_total_36to59_q100"),
+
+  "Quantiles_Protein" = c("protein_under36_q00", "protein_under36_q25", "protein_under36_q50",
+                          "protein_under36_q75", "protein_under36_q100",
+                          "protein_36to59_q00", "protein_36to59_q25", "protein_36to59_q50",
+                          "protein_36to59_q75", "protein_36to59_q100"),
+
+  "Quantiles_Maize_g" = c("maize_g_under36_q00", "maize_g_under36_q25", "maize_g_under36_q50",
+                           "maize_g_under36_q75", "maize_g_under36_q100",
+                           "maize_g_36to59_q00", "maize_g_36to59_q25", "maize_g_36to59_q50",
+                           "maize_g_36to59_q75", "maize_g_36to59_q100"),
+
+  "Quantiles_Energy" = c("energy_under36_q00", "energy_under36_q25", "energy_under36_q50",
+                          "energy_under36_q75", "energy_under36_q100",
+                          "energy_36to59_q00", "energy_36to59_q25", "energy_36to59_q50",
+                          "energy_36to59_q75", "energy_36to59_q100")
+)
+
+# Check presence of each variable
+df_validation <- map_dfr(names(required_vars), function(group) {
+  vars <- required_vars[[group]]
+  tibble(
+    Category = group,
+    Required = length(vars),
+    Present = sum(vars %in% names(df_scenarios_final)),
+    Missing = paste(setdiff(vars, names(df_scenarios_final)), collapse = ", ")
+  )
+}) |>
+  mutate(
+    Status = if_else(Required == Present, "Complete", "Incomplete"),
+    Missing = if_else(Missing == "", "\u2014", Missing)
+  )
+
+# Display validation table
+df_validation |>
+  gt() |>
+  tab_header(
+    title = "Schema Validation Summary",
+    subtitle = glue("Required variables for Overview table, Shiny dashboard, and boxplots — Seed: {seed_code} | Pathway: {pathway_label}")
+  ) |>
+  cols_label(
+    Category = "Category",
+    Required = "Required",
+    Present = "Present",
+    Missing = "Missing Variables",
+    Status = "Status"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(columns = Status, rows = Status == "Complete")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = Status, rows = Status == "Incomplete")
+  ) |>
+  grand_summary_rows(
+    columns = c(Required, Present),
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = glue("Seed: {seed_code} | Pathway: {pathway_label}. Final dataset: {nrow(df_scenarios_final)} rows x {ncol(df_scenarios_final)} columns")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(required_vars, df_validation)
+```
+
+---
+
+# Phase F: Export
+
+Export the final departmental scenarios dataset for use in Shiny dashboard and downstream aggregation scripts.
+
+## F1. Data Quality Validation
+
+Validate data integrity before export using comprehensive summary statistics. This step provides a complete overview of the final scenario dataset, ensuring no missing values exist and all metrics fall within expected ranges.
+
+```{r}
+#| label: f1-data-quality-validation
+
+# =============================================================================
+# F1. Data Quality Validation
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Generate skim summary
+# ---------------------------------------------------------------------------
+
+df_skim_numeric <- skimr::skim_without_charts(df_scenarios_final) |>
+ filter(skim_type == "numeric") |>
+ select(
+    Variable = skim_variable,
+    Missing = n_missing,
+    Complete = complete_rate,
+    Mean = numeric.mean,
+    SD = numeric.sd,
+    Min = numeric.p0,
+    Q25 = numeric.p25,
+    Median = numeric.p50,
+    Q75 = numeric.p75,
+    Max = numeric.p100
+ )
+
+# ---------------------------------------------------------------------------
+# Export skim summary for traceability
+# ---------------------------------------------------------------------------
+
+export(df_skim_numeric, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_f1_skim_summary.rds")))
+
+# ---------------------------------------------------------------------------
+# Table: Numeric Variables
+# ---------------------------------------------------------------------------
+
+df_skim_numeric |>
+ gt() |>
+ tab_header(
+    title = "Numeric Variables Summary",
+    subtitle = glue("Seed: {seed_code} | Pathway: {pathway_label} — {nrow(df_skim_numeric)} numeric variables in dataset")
+ ) |>
+ fmt_percent(columns = Complete, decimals = 1) |>
+ fmt_number(columns = c(Mean, SD, Min, Q25, Median, Q75, Max), decimals = 2) |>
+ tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Missing, rows = Missing == 0)
+ ) |>
+ tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = Missing, rows = Missing > 0)
+ ) |>
+ tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+ )
+
+# Clean up
+rm(df_skim_numeric)
+```
+
+## F2. Export Departmental Scenarios
+
+Export the complete scenario dataset containing 242 rows (22 departments x 11 penetration levels) with all metrics required for visualization and analysis.
+
+```{r}
+#| label: f2-export-departmental-scenarios
+
+# =============================================================================
+# F2. Export Departmental Scenarios
+# =============================================================================
+
+write_parquet(
+  df_scenarios_final,
+  here("01_data", "02_processed",
+       "scenarios", paste0(file_prefix, "_departmental_scenarios.parquet"))
+)
+```
+
+---
+
+# Notes
+
+## Processing Summary
+
+This script generates pre-computed departmental scenarios for the Shiny dashboard, simulating biofortification impact across 11 penetration levels (0% to 100% in 10% increments). The output dataset contains 242 rows (22 departments x 11 levels) with comprehensive metrics for economic impact, nutrient intake, and stunting outcomes.
+
+**Pipeline stages:**
+
+1. **Farmer filtering**: Farmers with `p_entry <= p` are admitted to the adoption pool; each receives a per-farmer conversion ratio $r_i(p)$ via `apply_adoption_curve()`
+2. **Economic aggregation**: Survey-weighted totals for adopting farmers, with scalable quantities (land, production, income, seed costs, subsidy flows) weighted by $r_i(p)$
+3. **Coverage retrieval**: Pre-calculated departmental coverage from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)` (includes gravity-based redistribution)
+4. **Child assignment**: Hierarchical biofortification assignment based on `r if (is_pco) "household occupation" else "pre-existing priority level"`
+5. **Profile selection**: Pre-calculated baseline or QPM nutritional values selected per child based on biofortification flag (from Script `r if (is_pco) "04_08" else "05_06"`)
+6. **Aggregation**: Survey-weighted departmental summaries for all outcome metrics
+
+## Pre-Computed Profiles
+
+Scenario simulation uses pre-computed baseline and QPM profiles from Script `r if (is_pco) "04_08" else "05_06"`. This design provides:
+
+- **Computational efficiency**: Miller equation, iron absorption, z-score normalization, and GAM derivative calculations are resolved once upstream and reused across the scenario iterations
+- **Consistency**: Baseline and QPM profiles are computed once and remain fixed across all scenarios
+- **Focused simulation loop**: The `simulate_scenario()` wrapper operates directly on the pre-computed profiles, without the GAM model, normalization parameters, or biofortification factor constants
+
+The output schema matches the standard Shiny dashboard schema.
+
+## Continuous Adoption Model
+
+The per-farmer conversion ratio $r_i(p) = \text{sigmoid\_curve}(p, p_{\text{entry}}, \text{floor}_{\text{profile}}, k_{\text{profile}})$ determines the fraction of each farmer's economic activity that is realized at penetration $p$. The model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05. At the farmer's entry point, the conversion ratio equals the profile-specific floor; at full penetration ($p = 1$), all farmers have $r_i(1) = 1$ by construction.
+
+Scalable economic quantities (land, production, income, seed costs, subsidy flows) are aggregated as $\sum_i \text{quantity}_i \times r_i(p) \times w_i$, where $w_i$ is the survey-calibrated weight. Farmer counts reflect pool membership: a farmer either has entered the pool ($p_{\text{entry}} \leq p$) or has not.
+
+## Subsidy Variables
+
+The seven monetary subsidy columns consumed in this script are computed at farmer level in Script 02_04 (Phase E) and propagated through the 02_06 parquet. No local subsidy calculations are performed in this script. The departmental aggregates preserve the linear identities established upstream: `cost_seeds_bio_no_subsidy_total = cost_seeds_bio_current_regime_total + subsidy_amount_absolute_total + subsidy_reduction_cost_total`, `subsidy_amount_absolute_total = newseed_subsidy_total + producer_absorption_total`, and `newseed_savings_vs_current_total = producer_absorption_total + subsidy_reduction_cost_total`.
+
+## Hierarchical Assignment Priority
+
+Children are assigned biofortified maize consumption following a household-level hierarchy that reflects realistic distribution patterns. Priority is granted in descending order to: cereal-producing farm households, other farming households, households of agricultural workers, rural non-agricultural households, and urban households. Within each tier, assignment is randomized until the departmental coverage target is reached.
+
+## Key Variables Created
+
+### Economic Variables
+
+| Variable | Description | Unit |
+|----------|-------------|------|
+| `n_farmers_bio` | Adopting farmers (weighted) | count |
+| `land_bio_ha` | Biofortified land area | hectares |
+| `income_increment_total` | Total additional income | GTQ |
+| `income_per_farmer_total` | Avg income benefit per department farmer | GTQ |
+| `income_per_farmer_adopter` | Avg income benefit per adopting farmer | GTQ |
+
+### Nutritional Variables
+
+| Variable | Description | Unit |
+|----------|-------------|------|
+| `mean_zinc` | Mean absorbed zinc (TAZ) | mg/day |
+| `mean_iron` | Mean absorbed iron | mg/day |
+| `mean_protein` | Mean PDCAAS-adjusted protein | g/day |
+| `*_inad_pct` | Inadequacy prevalence | % |
+| `*_inad_averted` | Cases of inadequacy averted | count |
+
+### Stunting Variables
+
+| Variable | Description | Unit |
+|----------|-------------|------|
+| `stunting_pct` | Stunting prevalence | % |
+| `stunting_change_pp` | Reduction vs baseline | percentage points |
+| `n_stunting_averted` | Cases of stunting averted | count |
+| `mean_zlen` | Mean height-for-age z-score | SD units |
+
+### Seed Variant and Subsidy Regime
+
+This script processes the **Seed `r params$seed_year` (`r seed_code`)** scenario under the **`r subsidy_label`** subsidy regime and the **`r tolower(pathway_label)` pathway**. The yield improvement factors by farmer segment and the seed price structure are embedded in the upstream economic impact calculation (Script `r paste0("02_04_", seed_suffix, "_", subsidy_suffix)`) and propagated through the adoption score (Script `r paste0("02_06_", seed_suffix, "_", subsidy_suffix)`). The nutritional biofortification factors (iron x1.19, zinc x1.38, protein x1.94) are properties of QPM maize varieties and remain identical across all combinations. Differences in stunting outcomes between combinations arise exclusively from the economic pathway: yield factors and seed prices shape the farmer adoption ranking, the production volumes, the departmental coverage, and the child assignment.
+
+## Limitations
+
+1. **Static adoption hierarchy**: Assignment priority is fixed and does not model dynamic market penetration patterns
+
+2. **No within-household variation**: All children in a household receive the same biofortification status
+
+3. **Uniform biofortification factors**: All biofortified maize assumed to have identical nutrient improvements regardless of variety or growing conditions
+
+4. **Cross-sectional stunting model**: Predictions represent point-in-time associations, not longitudinal growth trajectories
+
+5. **No uncertainty quantification**: Point estimates only; confidence intervals would require bootstrap or Monte Carlo methods (planned for Phase 2.0)

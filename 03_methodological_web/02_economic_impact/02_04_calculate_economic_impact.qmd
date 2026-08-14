@@ -1,0 +1,1260 @@
+---
+title: "Economic Impact Calculation"
+subtitle: "Module 2: Economic Impact"
+---
+
+## Why Calculate Economic Impact?
+
+The ultimate goal of farmer segmentation is to estimate the economic consequences of biofortified seed adoption. Different farmer segments will experience different outcomes:
+
+- **Non-hybrid farmers** see the largest yield increase and take on the largest rise in seed cost, since they start from near-zero seed expenditure
+- **Low segment farmers** gain from the yield increase with no change in seed costs
+- **Mid segment farmers** see a small yield increase alongside a seed cost saving
+- **High segment farmers** face a yield reduction that the seed cost saving offsets in part
+
+This module calculates individual farmer level economic impacts using a counterfactual approach: comparing each farmer's projected situation under biofortified adoption against their current baseline.
+
+The figures presented here correspond to the **baseline scenario** combining the **2022 biofortified seed variety** (currently deployed in the field) with the **current subsidy regime** as of April 2026. Alternative seed variants and subsidy regimes are evaluated in the Shiny dashboard.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by
+# framework 02_04 under the baseline variant: seed S22, subsidy sub00).
+
+tbl_a2_economic_parameters <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_a2_economic_parameters.rds"),
+  trust = TRUE
+)
+
+tbl_a3_reference_prices <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_a3_reference_prices.rds"),
+  trust = TRUE
+)
+
+tbl_a5_subsidy_reference <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_a5_subsidy_reference.rds"),
+  trust = TRUE
+)
+
+tbl_b3_market_position <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_b3_market_position.rds"),
+  trust = TRUE
+)
+
+tbl_b4_position_by_segment <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_b4_position_by_segment.rds"),
+  trust = TRUE
+)
+
+tbl_c1_current_economics_segment <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_c1_current_economics_segment.rds"),
+  trust = TRUE
+)
+
+tbl_c1_aggregate_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_c1_aggregate_summary.rds"),
+  trust = TRUE
+)
+
+tbl_d2_production_changes <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_d2_production_changes.rds"),
+  trust = TRUE
+)
+
+tbl_d2_projected_economics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_d2_projected_economics.rds"),
+  trust = TRUE
+)
+
+tbl_d2_comparison <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_d2_comparison.rds"),
+  trust = TRUE
+)
+
+tbl_e2_subsidy_benefits_segment <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_e2_subsidy_benefits_segment.rds"),
+  trust = TRUE
+)
+
+tbl_e2_subsidy_national_totals <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_e2_subsidy_national_totals.rds"),
+  trust = TRUE
+)
+
+tbl_e3_subsidy_decomposition <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_e3_subsidy_decomposition.rds"),
+  trust = TRUE
+)
+
+tbl_f2_impact_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_f2_impact_distribution.rds"),
+  trust = TRUE
+)
+
+tbl_f2_benefit_decomposition <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_f2_benefit_decomposition.rds"),
+  trust = TRUE
+)
+
+tbl_f2_national_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_f2_national_summary.rds"),
+  trust = TRUE
+)
+
+tbl_g1_distribution_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_g1_distribution_summary.rds"),
+  trust = TRUE
+)
+
+tbl_g2_edge_cases <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_04_s22_sub00_tbl_g2_edge_cases.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Pipeline configuration constants (baseline scenario S22 sub00).
+# These are not computed outputs; they encode methodological choices
+# fixed in the framework header parameters and the reference YAML files.
+
+# Market position classification threshold (Phase B): tolerance for
+# defining functional zero in sale and purchase shares, accommodating
+# measurement error inherent in 15-day recall surveys.
+epsilon_market <- 0.05
+
+# Reference biofortified seed price under no subsidy (Q/mz), defined in
+# subsidy_variants.yml. Used in Phase E to quantify the absolute monetary
+# value of the subsidy received by each farmer.
+bio_cost_no_subsidy_per_mz <- 547
+
+# Reference biofortified seed price under the current regime (Q/mz),
+# defined in subsidy_variants.yml. Used in Phase E to compute the
+# reduction cost in subsidy variants other than the current regime.
+# Under the baseline scenario (current regime), this equals the price
+# effectively paid by the farmer.
+bio_cost_current_regime_per_mz <- 305
+
+# Winner / Loser threshold for impact classification (Phase F):
+# absolute Q value below which a farmer is considered Neutral.
+neutral_threshold_q <- 50
+```
+
+
+## Counterfactual Methodology
+
+The economic impact model follows a **counterfactual approach**: for each farmer, we calculate:
+
+1. **Current economic situation** — Income from sales + value of self-consumption − input costs, at the conventional and non-hybrid seed prices applicable to the current subsidy regime.
+2. **Projected situation with biofortified seed** — Same calculation with adjusted yields and the biofortified seed price applicable to the current subsidy regime.
+3. **Economic impact** — Difference between projected and current net income.
+4. **Subsidy benefit** — Monetary value of the subsidy received by each farmer, expressed both as an absolute value (relative to the unsubsidized commercial reference price) and as a delta relative to the current subsidy regime.
+
+### Economic Logic
+
+- **Sellers** benefit from increased production × sale price.
+- **Non-sellers** benefit from increased self-consumption value × purchase price.
+- **All farmers** face a change in seed costs that depends jointly on segment and subsidy regime.
+
+The model assumes non-seed input costs remain constant, as biofortified varieties do not require different agronomic practices.
+
+
+## Economic Parameters
+
+Two parameter families enter the impact calculation: per-segment **seed costs**, conventional and biofortified, and per-segment **yield change factors**. Seed costs come from the subsidy regime configuration, here the current regime; yield change factors from the seed variant configuration, here the 2022 seed.
+
+```{r}
+#| label: tbl-a2-economic-parameters
+#| tbl-cap: "Economic Parameters for Impact Calculation"
+
+tbl_a2_economic_parameters |>
+  gt() |>
+  tab_header(
+    title = "Economic Parameters by Farmer Segment",
+    subtitle = "Seed costs (Q/mz) and yield change factors — 2022 Seed, Current subsidy"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    seed_cost_conventional = "Conventional",
+    seed_cost_biofortified = "Biofortified",
+    seed_cost_change = "Change",
+    yield_change_factor = "Factor",
+    yield_change_pct = "Change"
+  ) |>
+  tab_spanner(
+    label = "Seed Cost (Q/mz)",
+    columns = c(seed_cost_conventional, seed_cost_biofortified, seed_cost_change)
+  ) |>
+  tab_spanner(
+    label = "Yield",
+    columns = c(yield_change_factor, yield_change_pct)
+  ) |>
+  fmt_number(
+    columns = c(seed_cost_conventional, seed_cost_biofortified, seed_cost_change),
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = yield_change_factor,
+    decimals = 3
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = seed_cost_change, rows = seed_cost_change < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = seed_cost_change, rows = seed_cost_change > 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** Semilla Nueva refined seed prices and yield data. Green = cost reduction; Red = cost increase.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Reference Prices
+
+Reference prices are computed data-driven from ENCOVI 2023 (MAGA-calibrated) using survey-weighted medians:
+
+1. **Sale price** — Median per-quintal price across selling households, using `revenue / qty_sold_qq` for households flagged `is_seller == 1`.
+2. **Purchase price** — Median per-quintal valuation proxy across self-consuming households, computed as `value_household / qty_household_qq`.
+3. **Shadow price** — Simple average of sale and purchase prices (price-band midpoint), applied to autarkic households whose maize neither enters nor leaves the market.
+
+The purchase price represents the opportunity cost of consuming own production rather than buying maize from the market, and is used to value self-consumption for net buyers in Phases C and D.
+
+```{r}
+#| label: tbl-a3-reference-prices
+#| tbl-cap: "Reference Prices for Economic Valuation"
+
+tbl_a3_reference_prices |>
+  gt() |>
+  tab_header(
+    title = "Reference Prices for Economic Impact Calculation",
+    subtitle = "Survey-weighted median prices (Q/qq)"
+  ) |>
+  cols_label(
+    price_type = "Price Type",
+    value_qq = "Value (Q/qq)",
+    n_observations = "N (observations)",
+    source = "Calculation"
+  ) |>
+  fmt_number(columns = value_qq, decimals = 1) |>
+  fmt_number(columns = n_observations, decimals = 0, sep_mark = ",") |>
+  sub_missing(columns = n_observations, missing_text = "—") |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Sale price applies to net-seller households. Purchase price applies to net-buyer households. Shadow price applies to autarkic households (no market participation) and represents the price-band midpoint.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Subsidy Regime Reference
+
+The current subsidy regime, in effect as of April 2026, fixes the biofortified seed price paid by farmers at a uniform level across all segments. The reference unsubsidized commercial price anchors the absolute monetary value of the subsidy, quantified in the subsidy benefit section below.
+
+```{r}
+#| label: tbl-a5-subsidy-reference
+#| tbl-cap: "Subsidy Regime Reference"
+
+tbl_a5_subsidy_reference |>
+  gt() |>
+  tab_header(
+    title = "Subsidy Regime Reference",
+    subtitle = "Configuration in effect for this run — Current subsidy"
+  ) |>
+  cols_label(
+    field = "Field",
+    value = "Value"
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** Semilla Nueva refined subsidy values, April 2026.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Market Position Classification
+
+Each farmer household is classified by its position in the maize market based on observed sale and purchase volumes. This classification feeds the differential valuation of self-consumption applied in subsequent phases: net sellers value retained production at the sale price (foregone revenue), net buyers at the purchase price (avoided expenditure), and autarkic households at the shadow price (price-band midpoint, since no observed market price applies).
+
+**Classification logic.** For each household, three shares are computed against total maize volume (sold + purchased + retained for own consumption): sale share, purchase share, and retained share. A tolerance threshold `epsilon = 5%` defines functional zero, accommodating measurement error inherent in 15-day recall surveys. Mixed-quadrant households (positive sale and positive purchase) are resolved by the sign of their net market position: functional sellers when positive, functional buyers when negative, autarkic when zero.
+
+```{r}
+#| label: tbl-b3-market-position-distribution
+#| tbl-cap: "Distribution of Market Positions Across the Farmer Population"
+
+tbl_b3_market_position |>
+  gt() |>
+  tab_header(
+    title = "Market Position Distribution",
+    subtitle = paste0("Survey-weighted, threshold epsilon = ",
+                      scales::percent(epsilon_market))
+  ) |>
+  cols_label(
+    market_position = "Market position",
+    n_unweighted = "N (raw)",
+    weighted_n = "N (weighted)",
+    pct_weighted = "% weighted",
+    median_qty_sold = "Sold",
+    median_qty_purchased = "Purchased",
+    median_qty_household = "Household",
+    price_applied = "Price applied (Q/qq)"
+  ) |>
+  tab_spanner(
+    label = "Median maize volume (qq/year)",
+    columns = c(median_qty_sold, median_qty_purchased, median_qty_household)
+  ) |>
+  fmt_number(columns = c(n_unweighted, weighted_n), decimals = 0, sep_mark = ",") |>
+  fmt_number(columns = pct_weighted, decimals = 1, pattern = "{x}%") |>
+  fmt_number(
+    columns = c(median_qty_sold, median_qty_purchased, median_qty_household),
+    decimals = 2
+  ) |>
+  fmt_number(columns = price_applied, decimals = 1) |>
+  tab_source_note(
+    source_note = md(paste0(
+      "**Source:** ENCOVI 2023 modules 13A (food consumption) and 16B ",
+      "(agricultural production), MAGA-calibrated. Threshold epsilon = ",
+      scales::percent(epsilon_market),
+      " of total maize volume defines functional zero for sale and purchase shares."
+    ))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-b4-market-position-by-segment
+#| tbl-cap: "Market Position Distribution by Farmer Segment"
+
+tbl_b4_position_by_segment |>
+  gt() |>
+  tab_header(
+    title = "Market Position by Farmer Segment",
+    subtitle = "% within each segment (survey-weighted)"
+  ) |>
+  cols_label(segment_final = "Segment") |>
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023, MAGA-calibrated. Rows sum to 100% (within-segment shares).")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Why Market Position Matters
+The differential pricing applied to self-consumption is the bridge between observed market behavior and economic valuation. Net sellers, net buyers, and autarkic households each face a distinct opportunity cost for their own consumed maize: sale price (foregone revenue), purchase price (avoided expenditure), or shadow price (price-band midpoint). Without this classification, all self-consumption would be valued at a single price and the heterogeneity across segments would be lost.
+:::
+
+
+## Current Economic Baseline
+
+Establish the economic situation under the current seed technology, segment by segment. This baseline is the counterfactual against which biofortified adoption is compared.
+
+### Current Economic Situation by Segment
+
+```{r}
+#| label: tbl-c1-current-economics-segment
+#| tbl-cap: "Current Economic Situation by Farmer Segment"
+
+tbl_c1_current_economics_segment |>
+  gt() |>
+  tab_header(
+    title = "Current Economic Situation by Farmer Segment",
+    subtitle = "Survey-weighted medians (Q) under current seed technology"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers (N)",
+    pct_sellers = "% Sellers",
+    income_sales = "Sales",
+    value_self_consumption = "Self-Consumption",
+    value_gross = "Gross Value",
+    cost_seeds = "Seeds",
+    cost_other = "Other Inputs",
+    income_net = "Net Income",
+    pct_positive = "% Positive"
+  ) |>
+  tab_spanner(
+    label = "Income Components (Q)",
+    columns = c(income_sales, value_self_consumption, value_gross)
+  ) |>
+  tab_spanner(
+    label = "Costs (Q)",
+    columns = c(cost_seeds, cost_other)
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(income_sales, value_self_consumption, value_gross,
+                cost_seeds, cost_other, income_net),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = c(pct_positive, pct_sellers),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = income_net, rows = income_net > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = income_net, rows = income_net <= 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Seed costs are modeled by segment from Semilla Nueva refined prices (Q/mz × maize area) rather than taken from reported household seed expenditure (`exp_seeds`).")
+  ) |>
+  tab_footnote(
+    footnote = "Self-consumption is valued using the household-specific market-position price: sale price for net sellers, purchase price for net buyers, and the shadow price for autarkic households.",
+    locations = cells_column_labels(columns = value_self_consumption)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-note}
+## Subsistence Dominance Pattern
+A consistent pattern across all segments is that self-consumption dominates revenue from sales. Even among segments with the highest market participation, retained production for household consumption typically exceeds sold production. This pattern reflects the subsistence orientation of Guatemalan smallholder maize farming.
+:::
+
+### Aggregate National Value
+
+```{r}
+#| label: tbl-c1-aggregate-summary
+#| tbl-cap: "Aggregate Economic Value of White Maize Production"
+
+tbl_c1_aggregate_summary |>
+  select(category, metric_label, value, pct_of_gross) |>
+  gt(groupname_col = "category") |>
+  tab_header(
+    title = "Aggregate Economic Value of White Maize Production",
+    subtitle = "National totals under current seed technology (Guatemala, 2023)"
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value = "Value",
+    pct_of_gross = "% of Gross"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Farmers"),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} mz"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Production"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} qq"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = !str_detect(metric_label, "Farmers|Land|Production"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  fmt_number(columns = pct_of_gross, decimals = 1, pattern = "{x}%") |>
+  sub_missing(columns = pct_of_gross, missing_text = "") |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = str_detect(metric_label, "Total|Net Income"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e3f2fd"),
+    locations = cells_body(rows = str_detect(metric_label, "Total Gross Value"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(rows = str_detect(metric_label, "Net Income"))
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Self-consumption is valued using the household-specific market-position price: sale price for net sellers, purchase price for net buyers, and the shadow price for autarkic households.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.weight = "bold"
+  )
+```
+
+
+## Projected Economic Situation with Biofortified Seed
+
+Calculate the projected economic situation under biofortified seed adoption, applying segment-specific yield changes and the biofortified seed prices that correspond to the current subsidy regime.
+
+### Projected Changes by Segment
+
+```{r}
+#| label: tbl-d2-production-changes
+#| tbl-cap: "Projected Changes in Production and Costs by Segment"
+
+tbl_d2_production_changes |>
+  select(segment_final, n_farmers,
+         prod_current, prod_projected, prod_change_pct,
+         cost_seed_current, cost_seed_projected, cost_seed_change,
+         qty_sold_current, qty_sold_projected, qty_sold_change) |>
+  gt() |>
+  tab_header(
+    title = "Projected Changes with Biofortified Seed Adoption",
+    subtitle = "Production, seed costs, and sales quantity by segment — 2022 Seed, Current subsidy"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    prod_current = "Current",
+    prod_projected = "Projected",
+    prod_change_pct = "Change",
+    cost_seed_current = "Current",
+    cost_seed_projected = "Projected",
+    cost_seed_change = "Change",
+    qty_sold_current = "Current",
+    qty_sold_projected = "Projected",
+    qty_sold_change = "Change"
+  ) |>
+  tab_spanner(
+    label = "Production (qq/farmer)",
+    columns = c(prod_current, prod_projected, prod_change_pct)
+  ) |>
+  tab_spanner(
+    label = "Seed Cost (Q/farmer)",
+    columns = c(cost_seed_current, cost_seed_projected, cost_seed_change)
+  ) |>
+  tab_spanner(
+    label = "Quantity Sold (qq/farmer)",
+    columns = c(qty_sold_current, qty_sold_projected, qty_sold_change)
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(prod_current, prod_projected, qty_sold_current,
+                qty_sold_projected, qty_sold_change),
+    decimals = 1
+  ) |>
+  fmt_number(columns = prod_change_pct, decimals = 1, pattern = "{x}%") |>
+  fmt_number(
+    columns = c(cost_seed_current, cost_seed_projected, cost_seed_change),
+    decimals = 0
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = prod_change_pct, rows = prod_change_pct > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = prod_change_pct, rows = prod_change_pct < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = cost_seed_change, rows = cost_seed_change < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = cost_seed_change, rows = cost_seed_change > 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Yield factors from Semilla Nueva yield data and market analysis; seed prices from refined seed and subsidy values.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Projected Economic Situation by Segment
+
+```{r}
+#| label: tbl-d2-projected-economics
+#| tbl-cap: "Projected Economic Situation by Farmer Segment"
+
+tbl_d2_projected_economics |>
+  gt() |>
+  tab_header(
+    title = "Projected Economic Situation by Farmer Segment",
+    subtitle = "Survey-weighted medians (Q) under biofortified seed technology — 2022 Seed, Current subsidy"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers (N)",
+    income_sales = "Sales",
+    value_self_consumption = "Self-Consumption",
+    value_gross = "Gross Value",
+    cost_seeds = "Seeds",
+    cost_other = "Other Inputs",
+    income_net = "Net Income",
+    pct_positive = "% Positive"
+  ) |>
+  tab_spanner(
+    label = "Income Components (Q)",
+    columns = c(income_sales, value_self_consumption, value_gross)
+  ) |>
+  tab_spanner(
+    label = "Costs (Q)",
+    columns = c(cost_seeds, cost_other)
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(income_sales, value_self_consumption, value_gross,
+                cost_seeds, cost_other, income_net),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(columns = pct_positive, decimals = 1, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = income_net, rows = income_net > 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Biofortified seed price applies the current subsidy regime.")
+  ) |>
+  tab_footnote(
+    footnote = "Self-consumption is valued using the household-specific market-position price: sale price for net sellers, purchase price for net buyers, and the shadow price for autarkic households.",
+    locations = cells_column_labels(columns = value_self_consumption)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Current vs Projected Comparison
+
+```{r}
+#| label: tbl-d2-comparison
+#| tbl-cap: "Economic Comparison: Current vs Biofortified Adoption"
+
+tbl_d2_comparison |>
+  gt() |>
+  tab_header(
+    title = "Economic Impact: Current vs Biofortified Seed",
+    subtitle = "Net income comparison by farmer segment — 2022 Seed, Current subsidy (survey-weighted medians)"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    net_current = "Current",
+    net_projected = "Projected",
+    net_change = "Change (Q)",
+    net_change_pct = "Change (%)",
+    pct_positive_current = "Current",
+    pct_positive_projected = "Projected",
+    pct_positive_change = "Change"
+  ) |>
+  tab_spanner(
+    label = "Net Income (Q)",
+    columns = c(net_current, net_projected, net_change, net_change_pct)
+  ) |>
+  tab_spanner(
+    label = "% with Positive Income",
+    columns = c(pct_positive_current, pct_positive_projected, pct_positive_change)
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(net_current, net_projected, net_change),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(columns = net_change_pct, decimals = 1, pattern = "{x}%") |>
+  fmt_number(
+    columns = c(pct_positive_current, pct_positive_projected, pct_positive_change),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = net_change, rows = net_change > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = net_change, rows = net_change < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = pct_positive_change, rows = pct_positive_change > 0)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = c(net_change, net_change_pct))
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Impact calculated as projected minus current situation.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Subsidy Benefit Calculation
+
+Quantify the monetary value of the seed subsidy received by each farmer under the current regime. The framework distinguishes five complementary measures, all derived from the per-area prices declared in `subsidy_variants.yml`:
+
+| Measure | Interpretation |
+|---|---|
+| `subsidy_amount_absolute` | Absolute monetary value of the subsidy received, computed against the unsubsidized commercial reference price (`r bio_cost_no_subsidy_per_mz` Q/mz) and scaled by area planted. |
+| `subsidy_reduction_cost` | Additional out-of-pocket cost the farmer absorbs when a subsidy regime reduces the subsidy below the current regime. Zero under the current regime by construction. |
+| `newseed_subsidy` | Semilla Nueva's per-area direct financial commitment under the active regime, scaled by area planted. |
+| `producer_absorption` | Share of the absolute subsidy value covered by the local seed producer (intermediary) via improved producibility. Zero under the current regime by construction. |
+| `newseed_savings_vs_current` | Reduction in Semilla Nueva's per-farmer financial commitment when moving from the current regime to an alternative regime. Zero under the current regime by construction. |
+
+Two identities hold by construction:
+
+1. **Absolute subsidy decomposition** — `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total per-farmer subsidy value is jointly funded by Semilla Nueva (direct subsidy) and the local seed producer (improved producibility absorption). The farmer's out-of-pocket cost is **not** part of the subsidy by definition.
+2. **Reallocation of the Semilla Nueva saving** — `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. When Semilla Nueva reduces its commitment, the freed amount is reallocated between the local producer (who absorbs part via improved producibility) and the farmer (who pays the rest out of pocket).
+
+### Subsidy Benefit by Segment
+
+```{r}
+#| label: tbl-e2-subsidy-benefits-segment
+#| tbl-cap: "Subsidy Benefit by Farmer Segment"
+
+tbl_e2_subsidy_benefits_segment |>
+  gt() |>
+  tab_header(
+    title = "Subsidy Benefit by Farmer Segment",
+    subtitle = "Survey-weighted statistics (Q/farmer) — 2022 Seed, Current subsidy"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers     = "Farmers (N)",
+    abs_p25       = "P25",
+    abs_median    = "Median",
+    abs_p75       = "P75",
+    red_p25       = "P25",
+    red_median    = "Median",
+    red_p75       = "P75"
+  ) |>
+  tab_spanner(
+    label = "Absolute subsidy value (Q)",
+    columns = c(abs_p25, abs_median, abs_p75)
+  ) |>
+  tab_spanner(
+    label = "Reduction cost vs current (Q)",
+    columns = c(red_p25, red_median, red_p75)
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(abs_median, abs_p25, abs_p75,
+                red_median, red_p25, red_p75),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_source_note(
+    source_note = md(paste0(
+      "**Absolute value:** subsidy received relative to the unsubsidized reference price (",
+      bio_cost_no_subsidy_per_mz,
+      " Q/mz). **Reduction cost:** additional cost the farmer absorbs vs the current regime ",
+      "(zero by construction under the baseline regime)."
+    ))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### National Subsidy Totals
+
+```{r}
+#| label: tbl-e2-subsidy-national-totals
+#| tbl-cap: "National Subsidy Totals"
+
+tbl_e2_subsidy_national_totals |>
+  select(metric_label, value) |>
+  gt() |>
+  tab_header(
+    title = "National Subsidy Totals",
+    subtitle = "Population-weighted aggregates — 2022 Seed, Current subsidy"
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value        = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Farmers"),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} mz"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = !str_detect(metric_label, "^Total Farmers$|Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  tab_source_note(
+    source_note = md(paste0(
+      "**Reference unsubsidized biofortified price:** ", bio_cost_no_subsidy_per_mz, " Q/mz. ",
+      "**Reference current-regime biofortified price:** ", bio_cost_current_regime_per_mz, " Q/mz."
+    ))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Subsidy Cost Decomposition by Actor
+
+```{r}
+#| label: tbl-e3-subsidy-decomposition
+#| tbl-cap: "Subsidy Cost Decomposition by Actor"
+
+tbl_e3_subsidy_decomposition |>
+  select(metric_label, value) |>
+  gt() |>
+  tab_header(
+    title = "Subsidy Cost Decomposition by Actor",
+    subtitle = "Population-weighted aggregates — 2022 Seed, Current subsidy"
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value        = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "Land"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} mz"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(metric_label, "share"),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = !str_detect(metric_label, "Land|share"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = str_detect(metric_label, "^Total|^Semilla Nueva Savings|^Farmer extra"))
+  ) |>
+  tab_source_note(
+    source_note = md(
+      "**Total Subsidy Value** is jointly funded by Semilla Nueva (direct subsidy) and the local seed producer (improved producibility absorption); both shares sum to 100%. **Farmer extra cost** and **Semilla Nueva Savings vs Current Regime** are reported separately: the farmer's out-of-pocket cost is not part of the subsidy by definition, and Semilla Nueva's savings equal the producer absorption plus the farmer extra cost. All three are zero under the current regime by construction."
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Economic Impact Analysis
+
+Consolidate the per-farmer economic impact (projected minus current) into population-level distributions and benefit-source decomposition.
+
+### Impact Distribution by Segment
+
+```{r}
+#| label: tbl-f2-impact-distribution
+#| tbl-cap: "Economic Impact Distribution by Farmer Segment"
+
+tbl_f2_impact_distribution |>
+  gt() |>
+  tab_header(
+    title = "Economic Impact Distribution by Farmer Segment",
+    subtitle = paste0("Classification based on net income change — 2022 Seed, Current subsidy (±",
+                      neutral_threshold_q, " Q threshold)")
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    pct_winners = "Winners",
+    pct_losers = "Losers",
+    pct_neutral = "Neutral",
+    mean_increment = "Mean",
+    median_increment = "Median"
+  ) |>
+  tab_spanner(
+    label = "Impact Category (%)",
+    columns = c(pct_winners, pct_losers, pct_neutral)
+  ) |>
+  tab_spanner(
+    label = "Net Income Increment (Q)",
+    columns = c(mean_increment, median_increment)
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(pct_winners, pct_losers, pct_neutral),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(mean_increment, median_increment),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = pct_winners)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = pct_losers)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = mean_increment, rows = mean_increment > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = mean_increment, rows = mean_increment < 0)
+  ) |>
+  tab_source_note(
+    source_note = md(paste0(
+      "**Winners:** Net income increment > ", neutral_threshold_q,
+      " Q. **Losers:** Net income increment < -", neutral_threshold_q,
+      " Q. **Neutral:** Within ±", neutral_threshold_q, " Q."
+    ))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Benefit Source Decomposition
+
+```{r}
+#| label: tbl-f2-benefit-decomposition
+#| tbl-cap: "Decomposition of Economic Benefit by Source"
+
+tbl_f2_benefit_decomposition |>
+  gt() |>
+  tab_header(
+    title = "Decomposition of Economic Benefit by Source",
+    subtitle = "Survey-weighted mean contribution to net income change — 2022 Seed, Current subsidy (Q/farmer)"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_farmers = "Farmers",
+    from_sales = "Sales Change",
+    from_self_consumption = "Self-Consumption",
+    from_seed_savings = "Seed Savings",
+    total_benefit = "Total Benefit"
+  ) |>
+  tab_spanner(
+    label = "Benefit Source (Q)",
+    columns = c(from_sales, from_self_consumption, from_seed_savings)
+  ) |>
+  fmt_number(columns = n_farmers, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(from_sales, from_self_consumption, from_seed_savings, total_benefit),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = from_sales, rows = from_sales > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = from_sales, rows = from_sales < 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = from_seed_savings, rows = from_seed_savings > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = from_seed_savings, rows = from_seed_savings < 0)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = total_benefit)
+  ) |>
+  tab_source_note(
+    source_note = md("**Sales Change:** Δ(qty_sold × price_sale). **Seed Savings:** −(cost_bio − cost_conv). **Self-Consumption:** Δ(qty_retained × price_self_consumption); minimal change since household needs are fixed.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+::: {.callout-important}
+## Benefit Source Heterogeneity
+The economic mechanism differs by segment. For the non-hybrid segment,
+**yield-driven sales gains** carry the benefit: 2,902 Q/farmer against a seed
+cost that rises by 590 Q/farmer, since these farmers move from near-zero seed
+expenditure to the biofortified price. The Low and Mid segments follow the same
+pattern, with sales gains of 4,161 and 1,216 Q/farmer.
+
+The High segment is the one where the sign reverses. Its sales contribution is
+negative, at −368 Q/farmer, and only the **seed cost saving** of 474 Q/farmer
+is positive. Self-consumption is the third component: it is effectively zero in
+the first three segments, where household needs are met either way, and −403
+Q/farmer in the High segment, where the yield reduction of 13.8% eats into the
+quantity retained for the household.
+:::
+
+### National Impact Summary
+
+```{r}
+#| label: tbl-f2-national-summary
+#| tbl-cap: "National Economic Impact Summary"
+
+tbl_f2_national_summary |>
+  select(category, metric_label, value) |>
+  gt(groupname_col = "category") |>
+  tab_header(
+    title = "National Economic Impact Summary",
+    subtitle = "Population-weighted aggregates — 2022 Seed, Current subsidy"
+  ) |>
+  cols_label(
+    metric_label = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(category, "Population"),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(category, "Production"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "{x} qq"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = str_detect(category, "Income|Costs"),
+    decimals = 0,
+    sep_mark = ",",
+    pattern = "Q {x}"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = str_detect(metric_label, "Total|Change|Impact"))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.weight = "bold"
+  )
+```
+
+
+## Distribution Analysis
+
+Examine the distribution of economic impacts across the farmer population to characterize variability and identify edge cases.
+
+### Net Income Increment Distribution
+
+```{r}
+#| label: tbl-g1-distribution-summary
+#| tbl-cap: "Net Income Increment Distribution by Segment"
+
+tbl_g1_distribution_summary |>
+  gt() |>
+  tab_header(
+    title = "Net Income Increment Distribution by Segment",
+    subtitle = "Statistical summary of economic impact — 2022 Seed, Current subsidy (Q/farmer)"
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n = "N",
+    mean = "Mean",
+    median = "Median",
+    sd = "Std Dev",
+    p05 = "P5",
+    p25 = "P25",
+    p75 = "P75",
+    p95 = "P95",
+    min = "Min",
+    max = "Max"
+  ) |>
+  tab_spanner(label = "Central Tendency", columns = c(mean, median)) |>
+  tab_spanner(label = "Percentiles", columns = c(p05, p25, p75, p95)) |>
+  tab_spanner(label = "Extremes", columns = c(min, max)) |>
+  fmt_number(columns = n, decimals = 0, sep_mark = ",") |>
+  fmt_number(
+    columns = c(mean, median, sd, p05, p25, p75, p95, min, max),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(columns = median, rows = median > 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(columns = median, rows = median < 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**P5/P95:** 5th and 95th percentiles. Large spread indicates high variability in outcomes.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Edge Cases and Limitations
+
+```{r}
+#| label: tbl-g2-edge-cases
+#| tbl-cap: "Edge Cases and Limitations"
+
+tbl_g2_edge_cases |>
+  gt() |>
+  tab_header(
+    title = "Edge Cases and Limitations",
+    subtitle = "Identification of unusual cases for interpretation"
+  ) |>
+  cols_label(
+    case = "Edge Case",
+    count = "Records",
+    weighted_n = "Farmers (N)",
+    pct_of_total = "% of Total",
+    implication = "Implication"
+  ) |>
+  fmt_number(columns = c(count, weighted_n), decimals = 0, sep_mark = ",") |>
+  fmt_number(columns = pct_of_total, decimals = 2, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#fff3e0"),
+    locations = cells_body(rows = pct_of_total > 1)
+  ) |>
+  tab_source_note(
+    source_note = md("**Note:** Edge cases with >1% of population highlighted. These may warrant additional scrutiny.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Summary
+
+### Counterfactual Framework
+
+The economic impact model compares, for each farmer, the **current situation** (existing seed technology) against the **projected situation** (biofortified seed). The difference is the per-farmer net income increment, which aggregates into national-level outcomes via survey weights.
+
+### Key Findings
+
+1. **Segment-differentiated outcomes** — Yield increases concentrate in the lower-technology segments, at +31.6% for non-hybrid and +25.6% for Low, while seed cost savings concentrate in the higher ones, at 183 and 671 Q/mz for Mid and High. The net income increment changes sign across segments: positive for the first three, at a mean of 2,312, 4,161 and 1,538 Q/farmer, and negative for High at −297 Q/farmer.
+
+2. **Subsistence orientation** — Retained production exceeds marketed production even among net sellers, whose median is 11.5 qq kept against 6.3 qq sold, so the value of self-consumption carries most of the economic position of these households.
+
+3. **Market position matters** — The three positions are close to evenly split, at 32.6% net sellers, 32.0% net buyers and 35.5% autarkic. Pricing self-consumption at the sale, purchase or shadow price according to position is therefore material to the aggregate, and a uniform price would flatten it.
+
+4. **Subsidy decomposition** — Under the current regime the subsidy is funded entirely by Semilla Nueva, at `r bio_cost_no_subsidy_per_mz - bio_cost_current_regime_per_mz` Q/mz of direct commitment, with no producer subsidy absorption and no extra cost to the farmer. Alternative regimes move that burden between the three actors.
+
+### Limitations
+
+- Non-seed input costs assumed constant — biofortified varieties do not require different agronomic practices, but actual field experience may show modest deviations.
+- Self-consumption needs assumed fixed — household maize requirements respond to family size and food security context, not to seed technology.
+- Price reference points are population medians — segment-specific price differentiation (e.g., quality premiums) is not modeled.

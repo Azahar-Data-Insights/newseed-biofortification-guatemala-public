@@ -1,0 +1,1837 @@
+---
+title: "Stunting Continuous Model (Z-score)"
+subtitle: "Survey-weighted linear regression for HAZ prediction"
+date: last-modified
+author: "Azahar Data Insights"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Introduction
+
+This script develops a survey-weighted linear regression model to predict continuous height-for-age z-scores (HAZ, column `zlen`) from nutrient and sociodemographic predictors. The continuous specification provides the magnitude of stunting risk required by downstream synthetic population generation and biofortification impact simulation.
+
+## Objectives
+
+1. Calculate and save z-score normalization parameters for the six nutritional index components
+2. Construct a composite nutritional index from bioavailable nutrient variables
+3. Fit a survey-weighted linear regression model with polynomial terms
+4. Evaluate model performance using R², RMSE, and residual diagnostics
+5. Evaluate binary classification performance for stunting detection (HAZ < -2) using survey-weighted confusion matrix and ROC analysis
+6. Fit a GAM model capturing non-linear marginal effects of the biofortification-responsive nutritional index on HAZ
+7. Save trained models and normalization parameters for downstream simulation scripts
+
+
+# Setup
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Environment Setup
+# =============================================================================
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  survey,             # Complex survey methodology
+  srvyr,              # Tidy wrapper for survey package
+  mgcv,               # Generalized Additive Models (GAM)
+  gt,                 # Table formatting and presentation
+  glue,               # String interpolation
+  mirai,              # Persistent daemon pool for parallel GAM fits
+  RhpcBLASctl,        # BLAS/OpenMP thread control inside daemons
+  WeightedROC,        # Survey-weighted ROC curve and AUC
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to minimize memory footprint)
+# broom   — tidy() for model coefficient extraction
+# jtools  — summ() for model summary
+# gratia  — draw() for GAM diagnostics
+
+# Resolve namespace conflicts
+drop <- base::drop
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# models/
+ensure_output_dir(here("01_data", "02_processed", "models"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Preparation
+
+Load the prepared modeling dataset, apply outlier treatment, calculate and save the z-score normalization parameters for the nutritional index components, construct the composite nutritional index, and create the survey design.
+
+## A1. Load Training Data
+
+```{r}
+#| label: a1-load-data
+
+# =============================================================================
+# A1. Load Training Data
+# =============================================================================
+
+df_raw <- read_parquet(
+  here("01_data", "02_processed", 
+       "transfer", "04_05_sivesnu_stunting_modeling.parquet")
+)
+```
+
+## A2. Outlier Treatment for Nutrient Variables
+
+Apply directional outlier treatment to nutrient variables stratified by household food insecurity. Households are grouped into terciles of the FIES Rasch score, a measure of food access collected directly in SIVESNU. Within the most food-insecure tercile, upper outliers are pulled down to the stratum median; within the most food-secure tercile, lower outliers are pulled up to the stratum median. Intake estimates that are extreme relative to a household's observed food access reflect uncertainty in the transfer model predictions, and bounding them limits their influence on the z-score normalization parameters that govern the scale of the nutritional index.
+
+```{r}
+#| label: a2-outliers-nutritional-index
+
+# =============================================================================
+# A2. Outlier Treatment
+# =============================================================================
+
+# Define nutritional variables for index construction
+nutritional_vars_for_index <- c(
+  "fe_absorbed_mg",
+  "taz_mg",
+  "prot_g_total",
+  "lys_mg_total",
+  "trp_mg_total",
+  "ene_kcal_total"
+)
+
+# --- Define food insecurity strata from the FIES Rasch score ---
+
+df_stratified <- df_raw |>
+  mutate(
+    fies_stratum = cut(
+      fies_rasch_score,
+      breaks = quantile(fies_rasch_score, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+      include.lowest = TRUE,
+      labels = c("secure", "intermediate", "insecure")
+    )
+  )
+
+# --- Pivot to long format for stratified outlier treatment ---
+
+df_long <- df_stratified |>
+  pivot_longer(
+    cols = all_of(nutritional_vars_for_index),
+    names_to = "nutrient",
+    values_to = "value"
+  )
+
+# --- Calculate outlier parameters by food insecurity stratum and nutrient ---
+
+outlier_params <- df_long |>
+  summarize(
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    median_val = median(value, na.rm = TRUE),
+    upper_whisker = q3 + 1.5 * iqr,
+    lower_whisker = q1 - 1.5 * iqr,
+    .by = c(fies_stratum, nutrient)
+  )
+
+# --- Apply directional outlier replacement ---
+
+df_long_clean <- df_long |>
+  left_join(outlier_params, by = c("fies_stratum", "nutrient")) |>
+  mutate(
+    value = case_when(
+      # Most food-insecure: replace upper outliers with the stratum median
+      fies_stratum == "insecure" & value > upper_whisker ~ median_val,
+      # Most food-secure: replace lower outliers with the stratum median
+      fies_stratum == "secure" & value < lower_whisker ~ median_val,
+      TRUE ~ value
+    )
+  ) |>
+  select(-q1, -q3, -iqr, -median_val, -upper_whisker, -lower_whisker, -fies_stratum)
+
+# --- Pivot back to wide format ---
+
+df_wide_clean <- df_long_clean |>
+  pivot_wider(names_from = nutrient, values_from = value)
+
+# --- Merge cleaned nutritional variables back to main dataset ---
+
+df_outliers_treated <- df_raw |>
+  select(-all_of(nutritional_vars_for_index)) |>
+  left_join(df_wide_clean, by = setdiff(names(df_wide_clean), nutritional_vars_for_index))
+
+# Clean up
+rm(df_stratified, df_long, outlier_params, df_long_clean, df_wide_clean)
+```
+
+## A3. Nutritional Index Construction
+
+Calculate z-score normalization parameters (mean and standard deviation) for the six nutritional index components on the outlier-treated training data, persist them as a single `.rds` object, and apply the normalization to build the composite `nutritional_index`.
+
+The persisted parameter object is consumed downstream by the synthetic population generator (`04_07`), by the profile pre-computation script (`04_08`) and by the scenario simulation scripts (Module 06), so that the same normalization applies wherever the nutritional index is recomputed.
+
+```{r}
+#| label: a3-nutritional-index
+
+# =============================================================================
+# A3. Nutritional Index Construction with Z-Score Normalization
+# =============================================================================
+
+# --- Calculate z-score parameters from outlier-treated training data ---
+
+zscore_params <- map(nutritional_vars_for_index, function(var) {
+ list(
+   mean = mean(df_outliers_treated[[var]], na.rm = TRUE),
+   sd = sd(df_outliers_treated[[var]], na.rm = TRUE)
+ )
+}) |>
+ set_names(nutritional_vars_for_index)
+
+# --- Build normalization parameters object for export ---
+
+normalization_params <- list(
+ method = "zscore",
+ n_observations = nrow(df_outliers_treated),
+ components = zscore_params
+)
+
+# --- Apply z-score normalization ---
+
+df_model <- df_outliers_treated |>
+ mutate(
+   # Z-score normalization using training parameters
+   fe_zscore = (fe_absorbed_mg - zscore_params$fe_absorbed_mg$mean) / 
+               zscore_params$fe_absorbed_mg$sd,
+   zn_zscore = (taz_mg - zscore_params$taz_mg$mean) / 
+               zscore_params$taz_mg$sd,
+   prot_zscore = (prot_g_total - zscore_params$prot_g_total$mean) / 
+                 zscore_params$prot_g_total$sd,
+   lys_zscore = (lys_mg_total - zscore_params$lys_mg_total$mean) / 
+                zscore_params$lys_mg_total$sd,
+   trp_zscore = (trp_mg_total - zscore_params$trp_mg_total$mean) / 
+                zscore_params$trp_mg_total$sd,
+   kcal_zscore = (ene_kcal_total - zscore_params$ene_kcal_total$mean) / 
+                 zscore_params$ene_kcal_total$sd,
+   
+   # Composite index: mean of z-scores (equal weights)
+   nutritional_index = (fe_zscore + zn_zscore + prot_zscore + 
+                        lys_zscore + trp_zscore + kcal_zscore) / 6
+ ) |>
+ # Remove intermediate z-score columns
+ select(-fe_zscore, -zn_zscore, -prot_zscore, -lys_zscore, -trp_zscore, -kcal_zscore)
+
+# --- Save normalization parameters for downstream scripts ---
+
+saveRDS(
+ normalization_params,
+ here("01_data", "02_processed",
+      "models", "04_06_ni_zscore_normalization_params.rds")
+)
+
+# Clean up
+rm(df_outliers_treated, zscore_params, nutritional_vars_for_index)
+```
+
+```{r}
+#| label: tbl-a3-normalization-params
+#| tbl-cap: "Z-score normalization parameters for nutritional index components"
+
+# =============================================================================
+# A3. Verification Table: Normalization Parameters
+# =============================================================================
+
+df_tbl_a3 <- tibble(
+ Component = names(normalization_params$components),
+ Mean = map_dbl(normalization_params$components, "mean"),
+ SD = map_dbl(normalization_params$components, "sd")
+)
+
+export(df_tbl_a3, here("01_data", "02_processed", "web_resources", "04_06_tbl_a3_normalization_params.rds"))
+
+df_tbl_a3 |>
+ gt() |>
+ tab_header(
+   title = "Nutritional Index: Z-Score Normalization Parameters",
+   subtitle = glue("Calculated from N = {scales::comma(normalization_params$n_observations)} SIVESNU observations")
+ ) |>
+ fmt_number(columns = c(Mean, SD), decimals = 4) |>
+ cols_label(
+   Component = "Nutrient Component",
+   Mean = "Mean (μ)",
+   SD = "Std. Dev. (σ)"
+ ) |>
+ cols_align(align = "left", columns = Component) |>
+ cols_align(align = "right", columns = c(Mean, SD)) |>
+ tab_source_note(
+   source_note = "Parameters saved to: 04_06_ni_zscore_normalization_params.rds"
+ ) |>
+ tab_options(
+   table.font.size = px(12),
+   heading.title.font.size = px(14),
+   heading.subtitle.font.size = px(12)
+ )
+
+# Cleanup auxiliary objects
+rm(df_tbl_a3)
+```
+
+## A4. Create Survey Design
+
+```{r}
+#| label: a4-survey-design
+
+# =============================================================================
+# A4. Create Survey Design Object
+# =============================================================================
+
+survey_design <- df_model |>
+  as_survey_design(
+    ids = conglomerado,
+    weights = pesonino,
+    strata = NULL
+)
+```
+
+## A5. Multicollinearity Assessment
+
+This section assesses the correlation between `nutritional_index` and every Boruta-selected predictor. Variables with high correlation to NI may attenuate its coefficient through multicollinearity, reducing the model's sensitivity to nutritional changes in simulation scenarios. Variables exceeding the threshold `|r| > 0.45` are flagged for exclusion from the downstream formula construction.
+
+The exclusion set produced here is consumed by the formula builder in Phase B: any Boruta-confirmed variable crossing the threshold is dropped from the model formula, while mandatory predictors (including `nutritional_index` itself) bypass this filter.
+
+```{r}
+#| label: tbl-a5-multicollinearity
+#| tbl-cap: "Correlation of Boruta-selected predictors with nutritional_index"
+
+# =============================================================================
+# A5. Multicollinearity Assessment (data-driven, full Boruta universe)
+# =============================================================================
+
+# Load Boruta-selected variables exported by 04_05
+boruta_selected <- readRDS(
+  here("01_data", "02_processed", "models",
+       "04_05_boruta_selected_variables.rds")
+)
+
+# Correlation candidates: Boruta-selected variables present in the dataset
+# (excluding nutritional_index, which is the reference).
+correlation_candidates <- intersect(boruta_selected, names(df_model))
+correlation_candidates <- setdiff(correlation_candidates, "nutritional_index")
+
+# Coerce every candidate to numeric for Pearson correlation
+df_numeric_cor <- df_model |>
+  select(all_of(c("nutritional_index", correlation_candidates))) |>
+  mutate(across(everything(), ~ as.numeric(as.factor(.x))))
+
+# Correlation matrix and NI column
+cor_matrix_ni <- cor(df_numeric_cor, use = "pairwise.complete.obs")
+
+# Build correlation summary table
+df_cor_ni_full <- tibble(
+  variable    = rownames(cor_matrix_ni),
+  correlation = cor_matrix_ni[, "nutritional_index"]
+) |>
+  filter(variable != "nutritional_index") |>
+  arrange(desc(abs(correlation))) |>
+  mutate(
+    exclude = if_else(abs(correlation) > 0.45, "Yes", "No")
+  )
+
+# Identify variables to drop from the formula
+correlation_excluded_vars <- df_cor_ni_full |>
+  filter(exclude == "Yes") |>
+  pull(variable)
+
+# Export full correlation table for web resources
+export(
+  df_cor_ni_full,
+  here("01_data", "02_processed", "web_resources",
+       "04_06_tbl_a5_multicollinearity.rds")
+)
+
+# Display top 10 in the report (full table is exported above)
+df_cor_ni_full |>
+  head(10) |>
+  gt() |>
+  tab_header(
+    title = "Multicollinearity with Nutritional Index",
+    subtitle = "Top 10 correlated predictors (exclusion threshold: |r| > 0.45)"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    correlation = "Correlation (r)",
+    exclude = "Exclude"
+  ) |>
+  fmt_number(columns = correlation, decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = exclude, rows = exclude == "Yes")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(columns = exclude, rows = exclude == "No")
+  ) |>
+  tab_source_note(
+    source_note = glue(
+      "Variables flagged Yes are dropped from the model formula. ",
+      "Total dropped by this filter: {length(correlation_excluded_vars)}."
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean auxiliary objects (keep correlation_excluded_vars and boruta_selected
+# for Phase B)
+rm(df_numeric_cor, cor_matrix_ni, correlation_candidates)
+```
+
+---
+
+# Phase B: Model Specification and Fitting
+
+## B1. Build Model Formula (data-driven)
+
+The model formula is constructed automatically from the current state of the pipeline. No predictor list is hard-coded in this script; every term is the result of upstream selection and the univariate GAM evaluation documented in Phase B:
+
+- **Starting set**: the Boruta-selected variables exported by `04_05`.
+- **Correlation filter**: variables flagged as `Exclude = Yes` in section A5 are dropped to preserve the sensitivity of `nutritional_index` in simulation scenarios.
+- **Mandatory inclusion**: `nutritional_index` is always kept, bypassing the correlation filter.
+- **Polynomial degree**: for every numeric predictor, a univariate GAM is fitted against `zlen` and its effective degrees of freedom (edf) translate into the nearest admissible polynomial degree in {1, 2, 3}. Principal components (`pc_*`) are treated as linear by design.
+
+Univariate GAM fits are parallelized through a local mirai pool.
+
+```{r}
+#| label: b1-build-formula
+
+# =============================================================================
+# B1. Build Model Formula via build_stunting_formula()
+# =============================================================================
+
+# PCs are always linear (no semantic meaning for polynomials on components)
+pc_vars_linear <- grep("^pc_", names(df_model), value = TRUE)
+
+set.seed(789)
+
+formula_build <- build_stunting_formula(
+  data                 = df_model,
+  outcome              = "zlen",
+  boruta_vars          = boruta_selected,
+  mandatory_vars       = c("nutritional_index"),
+  correlation_excluded = correlation_excluded_vars,
+  weights              = df_model$pesonino,
+  family               = gaussian(),
+  k                    = 10,
+  edf_cuts             = c(1.3, 2.2),
+  linear_only          = pc_vars_linear
+)
+
+formula_zlen <- formula_build$formula
+```
+
+## B2. Formula Construction Audit
+
+The table below traces, variable by variable, the decision made by the formula builder. Two columns deserve special attention:
+
+**Action**: the bucket the variable falls into.
+
+- `dropped_correlation`: Boruta-selected but dropped because its correlation with `nutritional_index` exceeds the A5 exclusion threshold (`|r| > 0.45`). These variables are flagged in pink in the table.
+- `forced_linear`: variables forced to linear (polynomial degree 1) by the `linear_only` argument. Principal components are handled this way because applying polynomials to a linear combination of variables is not semantically meaningful. Flagged in blue.
+- `gam_inferred`: numeric variables whose polynomial degree (1, 2 or 3) was determined from the effective degrees of freedom (edf) of a univariate GAM fitted against the outcome.
+- `kept_categorical`: factor variables, entered as categorical terms in the formula (no polynomial applicable).
+
+**GAM Status**: the outcome of the univariate GAM evaluation.
+
+- `ok`: the GAM fitted cleanly and the polynomial degree was assigned from its edf.
+- `forced`: the variable bypassed the GAM (listed in `linear_only`); degree fixed at 1.
+- `categorical`: the variable is a factor; the GAM is not applicable.
+- `fit_failed`: the GAM call aborted (typically because a numeric predictor has too few distinct values for the spline basis). Degree falls back to 1. Variables that are conceptually categorical but stored as numeric codes (e.g. binary 1/2 codings) end up here; for a two-level code, the linear term spans the same contrast as the categorical one.
+- `edf_unavailable`: the GAM fitted but returned a non-finite edf. Degree falls back to 1. Rare.
+
+```{r}
+#| label: tbl-b2-formula-audit
+#| tbl-cap: "Audit trail of formula construction decisions"
+
+# =============================================================================
+# B2. Audit trail for formula construction
+# =============================================================================
+
+audit_df <- formula_build$audit
+
+# Export full audit for web resources
+export(
+  audit_df,
+  here("01_data", "02_processed", "web_resources",
+       "04_06_tbl_b2_formula_audit.rds")
+)
+
+audit_df |>
+  arrange(action, desc(!is.na(edf)), variable) |>
+  gt() |>
+  tab_header(
+    title = "Formula Construction Audit",
+    subtitle = glue(
+      "{formula_build$n_terms} terms in final formula ",
+      "(data-driven from Boruta + correlation filter + GAM edf)"
+    )
+  ) |>
+  cols_label(
+    variable = "Variable",
+    source   = "Source",
+    action   = "Action",
+    degree   = "Polynomial Degree",
+    edf      = "GAM edf",
+    status   = "GAM Status"
+  ) |>
+  fmt_number(columns = edf, decimals = 3) |>
+  sub_missing(columns = c(degree, edf), missing_text = "—") |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(rows = action == "dropped_correlation")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3E0"),
+    locations = cells_body(rows = action == "dropped_not_in_data")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = action == "forced_linear")
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+## B3. Fit Survey-Weighted Linear Regression
+
+```{r}
+#| label: b2-fit-model
+
+# =============================================================================
+# B2. Fit Survey-Weighted Linear Regression
+# =============================================================================
+
+model_zlen <- svyglm(
+  formula = formula_zlen,
+  design = survey_design,
+  family = gaussian(),
+  na.action = na.omit
+)
+```
+
+## B4. Model Summary
+
+```{r}
+#| label: b3-model-summary
+#| warning: FALSE
+
+# =============================================================================
+# B3. Model Summary Statistics
+# =============================================================================
+
+jtools::summ(model_zlen, model.coefs = FALSE)
+```
+
+## B5. Extract Fitted Values
+
+```{r}
+#| label: b4-fitted-values
+
+# =============================================================================
+# B4. Extract Fitted Values
+# =============================================================================
+
+model_results <- model_zlen$model |>
+  as_tibble() |>
+  mutate(
+    .fitted = fitted(model_zlen),
+    .resid = zlen - .fitted
+  )
+```
+
+## B6. Observed vs Predicted Plot
+
+```{r}
+#| label: fig-b5-observed-predicted
+#| fig-cap: "Observed vs predicted Z-scores"
+#| fig-width: 7
+#| fig-height: 5
+
+# =============================================================================
+# B5. Observed vs Predicted Scatter Plot
+# =============================================================================
+
+export(model_results |> select(.fitted, zlen), here("01_data", "02_processed", "web_resources", "04_06_fig_b5_observed_predicted.rds"))
+
+ggplot(model_results, aes(x = .fitted, y = zlen)) +
+  geom_point(alpha = 0.4, color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "#3AAF85") +
+  labs(
+    title = "Observed vs Predicted HAZ Z-scores",
+    subtitle = "Survey-weighted linear regression model",
+    x = "Predicted Z-score",
+    y = "Observed Z-score"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+---
+
+# Phase C: Model Evaluation
+
+## C1. Residuals Distribution
+
+```{r}
+#| label: fig-c1-residuals-histogram
+#| fig-cap: "Distribution of model residuals"
+#| fig-width: 7
+#| fig-height: 5
+
+# =============================================================================
+# C1. Residuals Histogram
+# =============================================================================
+
+export(model_results |> select(.resid), here("01_data", "02_processed", "web_resources", "04_06_fig_c1_residuals_histogram.rds"))
+
+ggplot(model_results, aes(x = .resid)) +
+  geom_histogram(bins = 40, fill = "#3AAF85", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Distribution of Residuals",
+    subtitle = "Should be approximately normal and centered at zero",
+    x = "Residual (Observed - Predicted)",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+## C2. Residuals vs Fitted
+
+```{r}
+#| label: fig-c2-residuals-fitted
+#| fig-cap: "Residuals vs fitted values"
+#| fig-width: 7
+#| fig-height: 5
+
+# =============================================================================
+# C2. Residuals vs Fitted Plot
+# =============================================================================
+
+export(model_results |> select(.fitted, .resid), here("01_data", "02_processed", "web_resources", "04_06_fig_c2_residuals_fitted.rds"))
+
+ggplot(model_results, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.4, color = "gray50") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#3AAF85") +
+  geom_smooth(method = "loess", 
+              formula = 'y ~ x',
+              se = FALSE, 
+              color = "#E53935", 
+              linewidth = 0.8) +
+  labs(
+    title = "Residuals vs Fitted Values",
+    subtitle = "Red line should be flat and close to zero",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+## C3. Performance Metrics
+
+```{r}
+#| label: tbl-c3-performance-metrics
+#| tbl-cap: "Model performance metrics"
+
+# =============================================================================
+# C3. Calculate Performance Metrics
+# =============================================================================
+
+# Calculate metrics (using manual residuals)
+rsq <- cor(model_results$zlen, model_results$.fitted)^2
+rmse <- sqrt(mean(model_results$.resid^2))
+mae <- mean(abs(model_results$.resid))
+n_obs <- nrow(model_results)
+
+# Create summary table
+df_tbl_c3 <- tibble(
+  Metric = c("R²", "RMSE", "MAE", "Observations"),
+  Value = c(
+    as.character(round(rsq, 3)),
+    as.character(round(rmse, 3)),
+    as.character(round(mae, 3)),
+    as.character(n_obs)
+  )
+)
+
+export(df_tbl_c3, here("01_data", "02_processed", "web_resources", "04_06_tbl_c3_performance_metrics.rds"))
+
+df_tbl_c3 |>
+  gt() |>
+  tab_header(
+    title = "ZLEN Linear Regression Model Performance",
+    subtitle = "Survey-weighted linear regression with polynomial terms"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_c3)
+```
+
+---
+
+# Phase D: Binary Stunting Classification Evaluation
+
+The continuous model produces predictions on the height-for-age z-score scale. Stunting is defined by the WHO threshold HAZ < -2. By dichotomising both the observed and the predicted z-scores at this threshold, the continuous model is evaluated as a binary classifier of stunting status. All metrics in this phase are survey-weighted (`pesonino`) so that they reflect the population of children aged 6-59 months in Guatemala rather than the unweighted sample.
+
+## D1. Derive Binary Stunting Status
+
+```{r}
+#| label: d1-derive-binary-status
+
+# =============================================================================
+# D1. Derive Binary Stunting Status
+# =============================================================================
+
+df_binary <- model_results |>
+  mutate(
+    pesonino           = as.numeric(model_zlen$prior.weights),
+    stunting_observed  = factor(
+      if_else(zlen < -2, "Stunted", "Not stunted"),
+      levels = c("Stunted", "Not stunted")
+    ),
+    stunting_predicted = factor(
+      if_else(.fitted < -2, "Stunted", "Not stunted"),
+      levels = c("Stunted", "Not stunted")
+    )
+  )
+
+df_prevalence <- df_binary |>
+  summarise(
+    prevalence_observed_unweighted = mean(stunting_observed == "Stunted"),
+    prevalence_observed_weighted   = sum(pesonino * (stunting_observed == "Stunted")) / sum(pesonino),
+    prevalence_predicted_weighted  = sum(pesonino * (stunting_predicted == "Stunted")) / sum(pesonino),
+    n_observations                 = n()
+  )
+
+df_tbl_d1 <- tibble(
+  Metric = c(
+    "Observations",
+    "Observed stunting prevalence (unweighted)",
+    "Observed stunting prevalence (survey-weighted)",
+    "Predicted stunting prevalence (survey-weighted)"
+  ),
+  Value = c(
+    as.character(df_prevalence$n_observations),
+    paste0(round(df_prevalence$prevalence_observed_unweighted * 100, 1), "%"),
+    paste0(round(df_prevalence$prevalence_observed_weighted * 100, 1), "%"),
+    paste0(round(df_prevalence$prevalence_predicted_weighted * 100, 1), "%")
+  )
+)
+
+export(df_tbl_d1, here("01_data", "02_processed", "web_resources", "04_06_tbl_d1_prevalence.rds"))
+
+df_tbl_d1 |>
+  gt() |>
+  tab_header(
+    title = "Stunting Prevalence: Observed vs Predicted",
+    subtitle = "WHO threshold ZLEN < -2"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_prevalence, df_tbl_d1)
+```
+
+## D2. Survey-Weighted Confusion Matrix
+
+```{r}
+#| label: tbl-d2-confusion-matrix
+#| tbl-cap: "Survey-weighted confusion matrix at WHO threshold ZLEN < -2"
+
+# =============================================================================
+# D2. Survey-Weighted Confusion Matrix
+# =============================================================================
+
+df_confusion <- df_binary |>
+  summarise(
+    .by = c(stunting_observed, stunting_predicted),
+    weighted_count = sum(pesonino)
+  ) |>
+  mutate(
+    cell_label = case_when(
+      stunting_observed == "Stunted"     & stunting_predicted == "Stunted"     ~ "True Positive",
+      stunting_observed == "Stunted"     & stunting_predicted == "Not stunted" ~ "False Negative",
+      stunting_observed == "Not stunted" & stunting_predicted == "Stunted"     ~ "False Positive",
+      stunting_observed == "Not stunted" & stunting_predicted == "Not stunted" ~ "True Negative"
+    )
+  )
+
+df_tbl_d2 <- df_confusion |>
+  select(stunting_observed, stunting_predicted, weighted_count) |>
+  pivot_wider(
+    names_from  = stunting_predicted,
+    values_from = weighted_count,
+    values_fill = 0
+  ) |>
+  rename(`Observed \\ Predicted` = stunting_observed)
+
+export(df_confusion, here("01_data", "02_processed", "web_resources", "04_06_tbl_d2_confusion_matrix.rds"))
+
+df_tbl_d2 |>
+  gt() |>
+  tab_header(
+    title = "Survey-Weighted Confusion Matrix",
+    subtitle = "Cell values are weighted counts (population estimates)"
+  ) |>
+  fmt_number(
+    columns = c(Stunted, `Not stunted`),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_align(align = "left",  columns = `Observed \\ Predicted`) |>
+  cols_align(align = "right", columns = c(Stunted, `Not stunted`)) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      columns = Stunted,
+      rows = `Observed \\ Predicted` == "Stunted"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(
+      columns = `Not stunted`,
+      rows = `Observed \\ Predicted` == "Not stunted"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(
+      columns = `Not stunted`,
+      rows = `Observed \\ Predicted` == "Stunted"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(
+      columns = Stunted,
+      rows = `Observed \\ Predicted` == "Not stunted"
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_d2)
+```
+
+## D3. Classification Performance Metrics
+
+```{r}
+#| label: tbl-d3-classification-metrics
+#| tbl-cap: "Survey-weighted classification metrics at WHO threshold"
+
+# =============================================================================
+# D3. Classification Performance Metrics
+# =============================================================================
+
+tp <- df_confusion |> filter(cell_label == "True Positive")  |> pull(weighted_count)
+tn <- df_confusion |> filter(cell_label == "True Negative")  |> pull(weighted_count)
+fp <- df_confusion |> filter(cell_label == "False Positive") |> pull(weighted_count)
+fn <- df_confusion |> filter(cell_label == "False Negative") |> pull(weighted_count)
+
+tp <- if_else(length(tp) == 0, 0, tp)
+tn <- if_else(length(tn) == 0, 0, tn)
+fp <- if_else(length(fp) == 0, 0, fp)
+fn <- if_else(length(fn) == 0, 0, fn)
+
+total_w <- tp + tn + fp + fn
+
+accuracy    <- (tp + tn) / total_w
+sensitivity <- tp / (tp + fn)
+specificity <- tn / (tn + fp)
+ppv         <- tp / (tp + fp)
+npv         <- tn / (tn + fn)
+f1_score    <- 2 * (ppv * sensitivity) / (ppv + sensitivity)
+
+prevalence  <- (tp + fn) / total_w
+expected    <- ((tp + fp) * (tp + fn) + (tn + fp) * (tn + fn)) / (total_w^2)
+kappa       <- (accuracy - expected) / (1 - expected)
+
+df_tbl_d3 <- tibble(
+  Metric = c(
+    "Accuracy",
+    "Sensitivity (Recall)",
+    "Specificity",
+    "Positive Predictive Value (Precision)",
+    "Negative Predictive Value",
+    "F1 Score",
+    "Cohen's Kappa"
+  ),
+  Value = c(
+    paste0(round(accuracy    * 100, 1), "%"),
+    paste0(round(sensitivity * 100, 1), "%"),
+    paste0(round(specificity * 100, 1), "%"),
+    paste0(round(ppv         * 100, 1), "%"),
+    paste0(round(npv         * 100, 1), "%"),
+    as.character(round(f1_score, 3)),
+    as.character(round(kappa,    3))
+  ),
+  Interpretation = c(
+    "Overall agreement between observed and predicted classification",
+    "Proportion of stunted children correctly identified",
+    "Proportion of non-stunted children correctly identified",
+    "Probability that a child predicted as stunted is truly stunted",
+    "Probability that a child predicted as non-stunted is truly non-stunted",
+    "Harmonic mean of precision and recall",
+    "Agreement beyond chance"
+  )
+)
+
+export(df_tbl_d3, here("01_data", "02_processed", "web_resources", "04_06_tbl_d3_classification_metrics.rds"))
+
+df_tbl_d3 |>
+  gt() |>
+  tab_header(
+    title = "Survey-Weighted Classification Metrics",
+    subtitle = "Binary stunting classification at threshold ZLEN < -2"
+  ) |>
+  cols_align(align = "left",  columns = c(Metric, Interpretation)) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric %in% c("Sensitivity (Recall)", "Specificity"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric %in% c("Sensitivity (Recall)", "Specificity"))
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_d3, tp, tn, fp, fn, total_w, accuracy, sensitivity, specificity,
+   ppv, npv, f1_score, prevalence, expected, kappa, df_confusion)
+```
+
+## D4. Survey-Weighted ROC Curve and AUC
+
+```{r}
+#| label: fig-d4-roc-curve
+#| fig-cap: "Survey-weighted ROC curve for stunting classification"
+#| fig-width: 8
+#| fig-height: 6
+
+# =============================================================================
+# D4. Survey-Weighted ROC Curve and AUC
+# =============================================================================
+
+# WeightedROC expects guess (continuous score), label (0/1), and weight.
+# Lower predicted ZLEN indicates higher stunting risk, so the score is
+# negated to align orientation with the conventional "higher score = positive"
+# convention required by WeightedROC.
+roc_input <- df_binary |>
+  transmute(
+    guess  = -.fitted,
+    label  = if_else(stunting_observed == "Stunted", 1L, 0L),
+    weight = pesonino
+  )
+
+roc_curve <- WeightedROC(
+  guess  = roc_input$guess,
+  label  = roc_input$label,
+  weight = roc_input$weight
+)
+
+auc_value <- WeightedAUC(roc_curve)
+
+# Identify the operating point closest to the WHO threshold (predicted ZLEN = -2,
+# i.e. negated score = 2) to display alongside the ROC curve
+roc_curve_annotated <- roc_curve |>
+  as_tibble() |>
+  mutate(
+    distance_to_threshold = abs(threshold - 2),
+    youden_j              = TPR - FPR
+  )
+
+operating_point_who <- roc_curve_annotated |>
+  slice_min(distance_to_threshold, n = 1, with_ties = FALSE)
+
+operating_point_youden <- roc_curve_annotated |>
+  slice_max(youden_j, n = 1, with_ties = FALSE)
+
+df_tbl_d4 <- tibble(
+  Metric = c(
+    "AUC (survey-weighted)",
+    "Sensitivity at WHO threshold",
+    "Specificity at WHO threshold",
+    "Sensitivity at Youden-optimal threshold",
+    "Specificity at Youden-optimal threshold",
+    "Youden-optimal predicted ZLEN cutoff"
+  ),
+  Value = c(
+    as.character(round(auc_value, 3)),
+    paste0(round(operating_point_who$TPR        * 100, 1), "%"),
+    paste0(round((1 - operating_point_who$FPR)  * 100, 1), "%"),
+    paste0(round(operating_point_youden$TPR     * 100, 1), "%"),
+    paste0(round((1 - operating_point_youden$FPR) * 100, 1), "%"),
+    as.character(round(-operating_point_youden$threshold, 3))
+  )
+)
+
+export(df_tbl_d4, here("01_data", "02_processed", "web_resources", "04_06_tbl_d4_auc_summary.rds"))
+export(roc_curve, here("01_data", "02_processed", "web_resources", "04_06_fig_d4_roc_curve_data.rds"))
+
+df_tbl_d4 |>
+  gt() |>
+  tab_header(
+    title = "ROC Analysis Summary",
+    subtitle = "Survey-weighted AUC and operating point comparison"
+  ) |>
+  cols_align(align = "left",  columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "AUC (survey-weighted)")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "AUC (survey-weighted)")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+ggplot(roc_curve, aes(x = FPR, y = TPR)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "azure4", linewidth = 0.4) +
+  geom_path(color = "#1B6CA8", linewidth = 1) +
+  geom_point(
+    data = operating_point_who,
+    aes(x = FPR, y = TPR),
+    color = "#3AAF85", size = 3
+  ) +
+  geom_point(
+    data = operating_point_youden,
+    aes(x = FPR, y = TPR),
+    color = "#E53935", size = 3
+  ) +
+  annotate(
+    "text",
+    x = operating_point_who$FPR + 0.04,
+    y = operating_point_who$TPR - 0.04,
+    label = "WHO threshold\n(ZLEN < -2)",
+    size = 3.2, color = "azure4", hjust = 0
+  ) +
+  annotate(
+    "text",
+    x = operating_point_youden$FPR + 0.04,
+    y = operating_point_youden$TPR + 0.04,
+    label = "Youden optimum",
+    size = 3.2, color = "azure4", hjust = 0
+  ) +
+  annotate(
+    "text",
+    x = 0.65, y = 0.15,
+    label = paste0("AUC = ", round(auc_value, 3)),
+    size = 4.5, color = "#1B6CA8", fontface = "bold"
+  ) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0.005, 0.005)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0.005, 0.005)) +
+  coord_equal() +
+  labs(
+    title    = "Survey-Weighted ROC Curve",
+    subtitle = "Binary stunting classification (ZLEN < -2)",
+    x        = "False Positive Rate (1 - Specificity)",
+    y        = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle    = element_text(size = 10, color = "azure4"),
+    axis.title       = element_text(size = 10, color = "azure4"),
+    axis.text        = element_text(size = 9,  color = "azure4")
+  )
+
+# Cleanup auxiliary objects
+rm(roc_input, roc_curve, roc_curve_annotated, operating_point_who,
+   operating_point_youden, auc_value, df_tbl_d4, df_binary)
+```
+
+::: {.callout-note}
+**Scope of evaluation.** All metrics in Phase D are computed in-sample on the training data (`model_results`) and represent an upper bound on the model's true classification performance. The metrics are survey-weighted using `pesonino` so that they reflect the population of children aged 6-59 months in Guatemala. The WHO threshold (HAZ < -2) is the operationally relevant cutoff for stunting classification; the Youden-optimal threshold is reported as a reference for the maximum classification capacity available from the predicted scores.
+:::
+
+---
+
+# Phase E: Variable Importance
+
+```{r}
+#| label: fig-d-variable-importance
+#| fig-cap: "Nutritional variables importance in Z-score model"
+#| fig-width: 10
+#| fig-height: 6
+
+# =============================================================================
+# Phase E: Variable Importance (Nutritional Terms Only)
+# =============================================================================
+
+df_importance_full <- broom::tidy(model_zlen) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    importance = abs(statistic),
+    term_type = case_when(
+      str_detect(term, "nutritional_index") ~ "Nutritional Index",
+      str_detect(term, "per_vegetales") ~ "Plant-food Percentage",
+      str_detect(term, "fies_rasch_score") ~ "Food Security (FIES)",
+      TRUE ~ "Other"
+    ),
+    term_clean = term |>
+      str_remove("poly\\(") |>
+      str_remove(", 3, raw = TRUE\\)") |>
+      str_replace(":", " × ")
+  ) |>
+  filter(term_type != "Other") |>
+  arrange(desc(importance))
+
+color_palette <- c(
+  "Nutritional Index" = "#E53935",
+  "Plant-food Percentage" = "#FB8C00", 
+  "Food Security (FIES)" = "#7CB342"
+)
+
+ggplot(df_importance_full, aes(x = importance, y = reorder(term_clean, importance), 
+                               fill = term_type)) +
+  geom_col(alpha = 0.8) +
+  geom_text(
+    aes(x = importance + max(importance) * 0.03, label = round(importance, 2)),
+    hjust = 0,
+    size = 3.5,
+    color = "azure4"
+  ) +
+  scale_fill_manual(values = color_palette, name = "Variable Type") +
+  labs(
+    title = "Nutritional Variables Importance in Z-score Model",
+    subtitle = "Absolute t-statistic for all nutritional terms",
+    x = "Absolute t-statistic",
+    y = ""
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line.x = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text.y = element_text(size = 9, color = "azure4"),
+    axis.text.x = element_text(size = 9, color = "azure4"),
+    legend.position = "bottom",
+    legend.title = element_text(size = 10, face = "bold", color = "azure4"),
+    legend.text = element_text(size = 9, color = "azure4")
+  )
+
+export(df_importance_full, here("01_data", "02_processed", "web_resources", "04_06_fig_d_variable_importance.rds"))
+
+# Clean up
+rm(df_importance_full, color_palette)
+```
+
+---
+
+# Phase F: Output Generation
+
+## F1. Save Model Objects
+
+```{r}
+#| label: e1-save-model
+
+# =============================================================================
+# E1. Save Trained Model and Associated Objects
+# =============================================================================
+
+# Save model object
+saveRDS(
+model_zlen,
+here("01_data", "02_processed", 
+     "models", "04_06_model_zlen.rds")
+)
+
+# Save model formula
+saveRDS(
+formula_zlen,
+here("01_data", "02_processed", 
+     "models", "04_06_formula_zlen.rds")
+)
+```
+
+## F2. Model Performance Summary
+
+```{r}
+#| label: tbl-e2-performance-summary
+#| tbl-cap: "Final model performance summary"
+
+# =============================================================================
+# E2. Model Performance Summary Table
+# =============================================================================
+
+df_tbl_e2 <- tibble(
+  Metric = c(
+    "R²",
+    "RMSE",
+    "MAE",
+    "Observations Used"
+  ),
+  Value = c(
+    as.character(round(rsq, 3)),
+    as.character(round(rmse, 3)),
+    as.character(round(mae, 3)),
+    as.character(n_obs)
+  )
+)
+
+export(df_tbl_e2, here("01_data", "02_processed", "web_resources", "04_06_tbl_e2_performance_summary.rds"))
+
+df_tbl_e2 |>
+  gt() |>
+  tab_header(
+    title = "ZLEN Continuous Model Performance",
+    subtitle = "Survey-weighted linear regression with polynomial terms"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_row_group(
+    label = "Model Fit",
+    rows = Metric %in% c("R²", "RMSE", "MAE")
+  ) |>
+  tab_row_group(
+    label = "Model Configuration",
+    rows = Metric == "Observations Used"
+  ) |>
+  tab_style(
+    style = cell_text(style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Metric == "R²")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_e2)
+```
+
+---
+
+# Phase G: GAM Effect Model for Impact Simulation
+
+This phase fits a Generalized Additive Model (GAM) to capture the non-linear relationship between nutritional index and HAZ, conditional on child age and sex. The GAM computes local marginal effects that vary across the NI distribution, capturing stronger effects for children with lower baseline nutrition.
+
+**Biofortification-Specific Index:** Impact simulation uses a nutritional index built from the four nutrients whose intake biofortified maize modifies:
+
+- Iron (absorbed)
+- Zinc (absorbed via Miller equation)
+- Lysine
+- Tryptophan
+
+Biofortified varieties raise the lysine and tryptophan content of the grain, and that amino acid profile is what determines the protein quality of a maize-based diet. Representing the mechanism through the two amino acids assigns the change to the quantities that carry it and gives each nutrient a single point of entry into the index.
+
+$$NI_{bio}^{nomaiz} = \frac{1}{4} \times (Fe_{absorbed,z} + Zn_{absorbed,z} + Lys_{z} + Trp_{z})$$
+
+**Non-maize basis.** The index is built exclusively from the **non-maize** sources of the calibrated block. The full model of Phase B uses the calibrated six-component `nutritional_index`; the two are independent objects.
+
+The basis is a question of identification. In these data the observable variation in maize-source nutrients is variation in *maize quantity*, and maize dependency is a marker of household resources: within the same socioeconomic stratum, a diet more skewed to maize accompanies a lower height-for-age z-score. The non-maize channel carries nutrients that arrive without that marker, and its association with the outcome is positive and of a magnitude consistent with the external evidence.
+
+QPM does not change how much maize a child eats; it changes the nutrient content of the maize already eaten. The increment is therefore treated downstream as **additional nutrient arriving in the non-maize pool**, which rests on the assumption that a milligram of iron acts the same whatever food carried it. Bioavailability is handled separately through the iron fraction and the Miller model, so that assumption applies to the quantity, not to its absorption.
+
+Two consequences are handled explicitly:
+
+- **The axis has its own normalization parameters**, computed here and exported separately. Scripts 04_07 and 04_08 rebuild the index from the receptor's own non-maize intake with these same parameters, so position and increment share the units the smooth was estimated in.
+- **Chispitas are inside the axis.** The supplementation contribution was added to `fe_mg_nomaiz` and `zn_mg_nomaiz` in script 04_02, and script 04_07 adds its departmental equivalent to the synthetic population, so the channel is present on both sides by construction.
+
+**Known limitation.** The smooth loses statistical significance once socioeconomic covariates enter the specification, so the fitted slope is a descriptive dose-response and not an identified causal effect. See the Notes.
+
+**Adjustment terms:** Age in months enters as a smooth and sex as a parametric term. Nutrient intake scales with body size and the height-for-age z-score follows its own age profile, so the index effect is estimated conditional on both.
+
+## G1. Calculate Biofortification-Specific Nutritional Index (Non-Maize Channel)
+
+```{r}
+#| label: f1-calculate-ni-bio
+
+# =============================================================================
+# F1. 4-Component Nutritional Index on the Non-Maize Channel
+# =============================================================================
+
+# --- Absorption parameters ---
+# Identical to those applied downstream in 04_07 and 04_08, so the axis the
+# GAM is fitted on and the axis it is evaluated on are constructed the same way.
+IRON_ABSORPTION <- 0.05    # Allen et al. (2020), high-phytate plant-based diets
+MILLER_K_T      <- 2.42    # Miller et al. (2015), saturation constant
+MILLER_A        <- 0.633   # age coefficient
+MILLER_E        <- 0.311   # age exponent
+
+# --- Absorption applied to the non-maize sources alone ---
+# fe_mg_nomaiz and zn_mg_nomaiz already carry the Chispitas contribution added
+# in script 04_02. The Miller model is evaluated on the non-maize zinc pool,
+# which is the same construction script 04_08 applies at simulation time; the
+# transformation being identical on both sides is what keeps the axis coherent.
+df_gam_nm <- df_model |>
+  mutate(
+    fe_absorbed_mg_nomaiz = fe_mg_nomaiz * IRON_ABSORPTION,
+
+    miller_age_nm = MILLER_A * (edad_mes_nino ^ MILLER_E),
+    miller_sum_nm = MILLER_K_T + miller_age_nm + zn_mg_nomaiz,
+    taz_mg_nomaiz = 0.5 * (miller_sum_nm -
+                           sqrt((miller_sum_nm ^ 2) -
+                                (4 * miller_age_nm * zn_mg_nomaiz)))
+  ) |>
+  select(-miller_age_nm, -miller_sum_nm)
+
+# --- Normalization parameters for the non-maize axis ---
+# Keyed by the non-maize variable names so the downstream reconstruction
+# cannot silently pair a parameter with a total-diet variable.
+ni_bio_nomaiz_params <- list(
+  fe_absorbed_mg_nomaiz = list(
+    mean = mean(df_gam_nm$fe_absorbed_mg_nomaiz, na.rm = TRUE),
+    sd   = sd(df_gam_nm$fe_absorbed_mg_nomaiz, na.rm = TRUE)
+  ),
+  taz_mg_nomaiz = list(
+    mean = mean(df_gam_nm$taz_mg_nomaiz, na.rm = TRUE),
+    sd   = sd(df_gam_nm$taz_mg_nomaiz, na.rm = TRUE)
+  ),
+  lys_mg_nomaiz = list(
+    mean = mean(df_gam_nm$lys_mg_nomaiz, na.rm = TRUE),
+    sd   = sd(df_gam_nm$lys_mg_nomaiz, na.rm = TRUE)
+  ),
+  trp_mg_nomaiz = list(
+    mean = mean(df_gam_nm$trp_mg_nomaiz, na.rm = TRUE),
+    sd   = sd(df_gam_nm$trp_mg_nomaiz, na.rm = TRUE)
+  )
+)
+
+# --- Build the index ---
+df_gam <- df_gam_nm |>
+  mutate(
+    fe_z_nm  = (fe_absorbed_mg_nomaiz - ni_bio_nomaiz_params$fe_absorbed_mg_nomaiz$mean) /
+               ni_bio_nomaiz_params$fe_absorbed_mg_nomaiz$sd,
+    taz_z_nm = (taz_mg_nomaiz - ni_bio_nomaiz_params$taz_mg_nomaiz$mean) /
+               ni_bio_nomaiz_params$taz_mg_nomaiz$sd,
+    lys_z_nm = (lys_mg_nomaiz - ni_bio_nomaiz_params$lys_mg_nomaiz$mean) /
+               ni_bio_nomaiz_params$lys_mg_nomaiz$sd,
+    trp_z_nm = (trp_mg_nomaiz - ni_bio_nomaiz_params$trp_mg_nomaiz$mean) /
+               ni_bio_nomaiz_params$trp_mg_nomaiz$sd,
+
+    # 4-component index on the non-maize axis
+    nutritional_index_bio_nomaiz = (fe_z_nm + taz_z_nm + lys_z_nm + trp_z_nm) / 4,
+
+    # Sex as a factor for the parametric adjustment term
+    sexo_factor = factor(
+      dplyr::case_when(
+        as.character(sexonino) %in% c("1", "Hombre") ~ "Hombre",
+        as.character(sexonino) %in% c("2", "Mujer")  ~ "Mujer",
+        TRUE ~ NA_character_
+      ),
+      levels = c("Hombre", "Mujer")
+    )
+  ) |>
+  select(-fe_z_nm, -taz_z_nm, -lys_z_nm, -trp_z_nm)
+
+rm(df_gam_nm)
+```
+
+## G2. Fit GAM Model
+
+```{r}
+#| label: f2-fit-gam
+
+# =============================================================================
+# F2. Fit GAM: ZLEN ~ s(age) + sex + s(nutritional_index_bio_nomaiz)
+# =============================================================================
+# The smooth term is named for the raw axis on purpose. Any downstream script
+# that fed this model a calibrated-scale index would fail on the missing
+# column rather than return a silently mis-scaled prediction.
+
+gam_zlen_ni <- gam(
+  zlen ~ s(edad_mes_nino, k = 10) + sexo_factor +
+    s(nutritional_index_bio_nomaiz, k = 10),
+  data = df_gam,
+  weights = pesonino,
+  method = "REML"
+)
+```
+
+```{r}
+#| label: tbl-f2-gam-fit-coverage
+#| tbl-cap: "Observations available for the response model"
+
+# =============================================================================
+# F2b. Estimation Sample Coverage
+# =============================================================================
+
+df_f2_coverage <- tibble(
+  Variable = c("zlen", "edad_mes_nino", "sexo_factor", "nutritional_index_bio_nomaiz"),
+  Observed = c(
+    sum(!is.na(df_gam$zlen)),
+    sum(!is.na(df_gam$edad_mes_nino)),
+    sum(!is.na(df_gam$sexo_factor)),
+    sum(!is.na(df_gam$nutritional_index_bio_nomaiz))
+  ),
+  Total = nrow(df_gam)
+) |>
+  mutate(Percent = 100 * Observed / Total)
+
+export(df_f2_coverage, here("01_data", "02_processed", "web_resources",
+                            "04_06_tbl_f2_gam_fit_coverage.rds"))
+
+df_f2_coverage |>
+  gt() |>
+  tab_header(
+    title = "Response Model Coverage",
+    subtitle = glue("Observations used in the fit: {scales::comma(nrow(gam_zlen_ni$model))}")
+  ) |>
+  fmt_number(columns = c(Observed, Total), decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = Percent, decimals = 1) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+rm(df_f2_coverage)
+```
+
+## G3. GAM Effect Visualization
+
+```{r}
+#| label: fig-f3-gam-effect
+#| fig-cap: "Effect of biofortification-specific nutritional index on ZLEN"
+#| fig-width: 8
+#| fig-height: 5
+
+# =============================================================================
+# F3. Visualize GAM Effect Curve
+# =============================================================================
+
+ni_range <- range(df_gam$nutritional_index_bio_nomaiz, na.rm = TRUE)
+ni_grid <- data.frame(
+  nutritional_index_bio_nomaiz = seq(ni_range[1], ni_range[2], length.out = 200),
+  # Adjustment terms held at reference values across the curve
+  edad_mes_nino = median(df_gam$edad_mes_nino, na.rm = TRUE),
+  sexo_factor = factor("Hombre", levels = levels(df_gam$sexo_factor))
+)
+
+ni_pred <- predict(gam_zlen_ni, newdata = ni_grid, type = "response", se.fit = TRUE)
+ni_grid$zlen_pred <- ni_pred$fit
+ni_grid$se <- ni_pred$se.fit
+ni_grid$lower <- ni_grid$zlen_pred - 1.96 * ni_grid$se
+ni_grid$upper <- ni_grid$zlen_pred + 1.96 * ni_grid$se
+
+export(ni_grid, here("01_data", "02_processed", "web_resources", "04_06_fig_f3_gam_effect.rds"))
+
+ggplot(ni_grid, aes(x = nutritional_index_bio_nomaiz, y = zlen_pred)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "grey70") +
+  geom_line(color = "#3AAF85", linewidth = 1.2) +
+  geom_hline(yintercept = -2, linetype = "dashed", color = "#E53935", linewidth = 0.8) +
+  annotate("text", x = max(ni_grid$nutritional_index_bio_nomaiz) - 1, y = -1.85,
+           label = "Stunting threshold (HAZ = -2)", color = "#E53935", size = 3) +
+  labs(
+    title = "Effect of Nutritional Index on ZLEN",
+    subtitle = "GAM smooth with 95% CI — 4-component index (Fe, Zn, Lys, Trp), raw signal",
+    x = "Nutritional Index (Biofortification-Responsive, raw signal)",
+    y = "Predicted ZLEN (HAZ)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+## G4. Marginal Effect (Derivative) Analysis
+
+```{r}
+#| label: fig-f4-marginal-effect
+#| fig-cap: "Marginal effect of NI on ZLEN across the distribution"
+#| fig-width: 8
+#| fig-height: 5
+
+# =============================================================================
+# F4. Calculate and Visualize Marginal Effects (Derivatives)
+# =============================================================================
+
+deriv_data <- gratia::derivatives(
+  gam_zlen_ni,
+  select = "s(nutritional_index_bio_nomaiz)",
+  data = ni_grid
+)
+
+# Fit simple linear model for comparison
+model_linear <- lm(zlen ~ edad_mes_nino + sexo_factor + nutritional_index_bio_nomaiz,
+                   data = df_gam, weights = pesonino)
+coef_linear <- coef(model_linear)["nutritional_index_bio_nomaiz"]
+
+export(deriv_data, here("01_data", "02_processed", "web_resources", "04_06_fig_f4_marginal_effect.rds"))
+
+ggplot(deriv_data, aes(x = nutritional_index_bio_nomaiz, y = .derivative)) +
+  geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci), alpha = 0.2, fill = "grey70") +
+  geom_line(color = "#3AAF85", linewidth = 1.2) +
+  geom_hline(yintercept = coef_linear, linetype = "dashed", color = "#E53935", linewidth = 0.8) +
+  annotate("text", x = min(deriv_data$nutritional_index_bio_nomaiz) + 0.5, y = coef_linear + 0.1,
+           label = paste0("Linear coef = ", round(coef_linear, 3)),
+           color = "#E53935", size = 3) +
+  labs(
+    title = "Marginal Effect of NI on ZLEN",
+    subtitle = "GAM derivative with 95% CI vs linear model coefficient — raw signal axis",
+    x = "Nutritional Index (Biofortification-Responsive, raw signal)",
+    y = "Marginal Effect (dZLEN/dNI)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "azure4"),
+    plot.subtitle = element_text(size = 10, color = "azure4"),
+    axis.line = element_line(color = "azure4"),
+    axis.title = element_text(size = 10, color = "azure4"),
+    axis.text = element_text(size = 9, color = "azure4")
+  )
+```
+
+## G5. GAM Model Verification
+
+```{r}
+#| label: tbl-f5-gam-verification
+#| tbl-cap: "GAM model verification and comparison with linear specification"
+
+# =============================================================================
+# F5. Console Verification of GAM Model
+# =============================================================================
+
+ni_stunted <- df_gam$nutritional_index_bio_nomaiz[df_gam$hfa == 1]
+ni_not_stunted <- df_gam$nutritional_index_bio_nomaiz[df_gam$hfa == 0]
+ni_stunted_median <- median(ni_stunted, na.rm = TRUE)
+
+# Get marginal effect at stunted median
+deriv_at_stunted <- gratia::derivatives(
+  gam_zlen_ni,
+  select = "s(nutritional_index_bio_nomaiz)",
+  data = data.frame(
+    nutritional_index_bio_nomaiz = ni_stunted_median,
+    # Adjustment terms held at reference values
+    edad_mes_nino = median(df_gam$edad_mes_nino, na.rm = TRUE),
+    sexo_factor = factor("Hombre", levels = levels(df_gam$sexo_factor))
+  )
+)
+marginal_at_stunted <- deriv_at_stunted$.derivative
+
+# Summary table
+df_tbl_f5 <- tibble(
+  Category = c(
+    "GAM Deviance Explained",
+    "GAM Effective DF",
+    "Linear Model Coefficient (NI)",
+    "GAM Mean Marginal Effect",
+    "Median NI (Stunted Children)",
+    "Median NI (Non-Stunted Children)",
+    "GAM Marginal Effect at Stunted Median",
+    "Ratio GAM/Linear at Stunted Median"
+  ),
+  Value = c(
+    paste0(round(summary(gam_zlen_ni)$dev.expl * 100, 1), "%"),
+    round(sum(gam_zlen_ni$edf), 2),
+    round(coef_linear, 4),
+    round(mean(deriv_data$.derivative), 4),
+    round(ni_stunted_median, 3),
+    round(median(ni_not_stunted, na.rm = TRUE), 3),
+    round(marginal_at_stunted, 4),
+    paste0(round(marginal_at_stunted / coef_linear, 2), "x")
+  )
+)
+
+export(df_tbl_f5, here("01_data", "02_processed", "web_resources", "04_06_tbl_f5_gam_verification.rds"))
+
+df_tbl_f5 |>
+  gt() |>
+  tab_header(
+    title = "GAM Model Verification",
+    subtitle = "4-component NI (Fe, Zn, Lys, Trp) on the raw signal — GAM vs linear"
+  ) |>
+  tab_row_group(label = "Model Fit", rows = 1:2) |>
+  tab_row_group(label = "Coefficient Comparison", rows = 3:4) |>
+  tab_row_group(label = "NI Distribution by Stunting Status", rows = 5:6) |>
+  tab_row_group(label = "Impact at Target Population", rows = 7:8) |>
+  cols_align(align = "left", columns = Category) |>
+  cols_align(align = "right", columns = Value) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = Category == "Ratio GAM/Linear at Stunted Median")
+  ) |>
+  tab_source_note(
+    source_note = "GAM captures stronger effects in low-NI range where stunted children are concentrated."
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(
+  ni_stunted,
+  ni_not_stunted,
+  ni_stunted_median,
+  deriv_at_stunted,
+  marginal_at_stunted,
+  df_tbl_f5
+)
+```
+
+## G6. Export GAM Model and Parameters
+
+```{r}
+#| label: f6-export-gam
+
+# =============================================================================
+# F6. Export GAM Model and Normalization Parameters
+# =============================================================================
+
+# Export GAM model
+saveRDS(
+  gam_zlen_ni,
+  here("01_data", "02_processed",
+       "models", "04_06_gam_zlen_ni.rds")
+)
+
+# --- Standalone normalization parameters for the non-maize axis ---
+# Scripts 04_07 and 04_08 rebuild nutritional_index_bio_nomaiz from the
+# receptor's own non-maize intake using this object. It is exported on its own,
+# alongside the 6-component parameters of section A3, so the two axes stay
+# separable: A3's file normalizes the calibrated total-diet variables, this one
+# the non-maize channel, and neither consumer has to reach into the GAM package
+# to find its parameters.
+ni_bio_nomaiz_normalization_params <- list(
+  method         = "zscore",
+  basis          = "non-maize channel of the calibrated block",
+  n_observations = nrow(df_gam),
+  absorption     = list(
+    iron_fraction = IRON_ABSORPTION,
+    miller_k_t    = MILLER_K_T,
+    miller_a      = MILLER_A,
+    miller_e      = MILLER_E
+  ),
+  miller_applied_to  = "non-maize zinc pool only",
+  chispitas_included = TRUE,
+  qpm_increment_enters = "non-maize pool",
+  components     = ni_bio_nomaiz_params
+)
+
+saveRDS(
+  ni_bio_nomaiz_normalization_params,
+  here("01_data", "02_processed",
+       "models", "04_06_ni_bio_nomaiz_normalization_params.rds")
+)
+
+# Export complete package for scenario application
+gam_export <- list(
+  model = gam_zlen_ni,
+  ni_range = ni_range,
+  linear_coef = coef_linear,
+  mean_marginal_effect = mean(deriv_data$.derivative),
+  normalization_params = ni_bio_nomaiz_params,
+  smooth_term = "nutritional_index_bio_nomaiz",
+  components = c("fe_absorbed_mg_nomaiz", "taz_mg_nomaiz",
+                 "lys_mg_nomaiz", "trp_mg_nomaiz"),
+  adjustment_terms = c("edad_mes_nino", "sexo_factor")
+)
+
+saveRDS(
+  gam_export,
+  here("01_data", "02_processed",
+       "models", "04_06_gam_zlen_ni_export.rds")
+)
+
+# Clean up
+rm(ni_grid, ni_pred, deriv_data, ni_range, coef_linear, gam_export, model_linear,
+   ni_bio_nomaiz_normalization_params)
+```
+
+---
+
+# Notes
+
+## Methodology
+
+### Model Specification
+
+Survey-weighted linear regression (Gaussian family) on the SIVESNU modeling dataset:
+
+- Polynomial terms (degree 1, 2 or 3) for continuous predictors, assigned automatically from the effective degrees of freedom of univariate GAM fits against `zlen`
+- Linear treatment for principal components (`pc_*`) — applying polynomial expansions to a linear combination of variables is not semantically meaningful
+- The Boruta-selected predictors filtered by the multicollinearity rule against `nutritional_index` (`|r| > 0.45`)
+- `nutritional_index` is forced into the formula as a mandatory predictor, regardless of the multicollinearity filter
+
+### Role in the Pipeline
+
+The continuous z-score model produces the magnitude of HAZ used downstream by the synthetic population generator (`04_07`). Stunting status at the individual level is derived in that script as `hfa_calculated = (zlen_predicted < -2)`.
+
+## GAM for Impact Simulation
+
+### Purpose
+
+The GAM model captures the non-linear relationship between nutritional index and HAZ for use in biofortification impact simulation. It provides local marginal effects that vary across the nutritional index distribution, while the survey-weighted linear model of Phase B serves population prediction.
+
+### Model Specification
+
+The GAM is fitted as:
+
+    ZLEN ~ s(edad_mes_nino, k = 10) + sexo_factor + s(nutritional_index_bio_nomaiz, k = 10)
+
+using REML estimation with survey weights. The smooth term `s()` uses thin plate regression splines to capture curvature in the relationship between the index and the outcome.
+
+### The Two Axes
+
+The script produces two nutritional indices that must not be interchanged:
+
+| | `nutritional_index` | `nutritional_index_bio_nomaiz` |
+|---|---|---|
+| Components | 6 (Fe abs, TAZ, protein, Lys, Trp, kcal) | 4 (Fe abs, TAZ, Lys, Trp) |
+| Sources | Whole diet, maize and non-maize | Non-maize only |
+| Basis | Calibrated block (post-QM, post-alignment) | Calibrated block, non-maize channel |
+| Built in | Section A3 | Section G1 |
+| Parameters | `04_06_ni_zscore_normalization_params.rds` | `04_06_ni_bio_nomaiz_normalization_params.rds` |
+| Consumer | Full survey-weighted model (Phase B) | GAM effect model (Phase G) |
+
+They are independent objects: the full model never sees the non-maize axis and the GAM never sees the six-component one. The smooth term carries the `_nomaiz` suffix in its name so that downstream scripts bind to the axis the model was fitted on.
+
+### Implementation in Impact Simulation
+
+For each child in the synthetic population, scripts 04_07 and 04_08 rebuild the index from the receptor's own non-maize intake using the exported parameters, then:
+
+1. Calculate the QPM index by adding the maize increment to the non-maize pool: `*_nomaiz + *_maiz × (FACTOR − 1)`
+2. Evaluate the GAM at the baseline and QPM index positions
+3. Estimate ZLEN change as the difference of the two fitted values
+4. Classify stunting status: HFA_new = 1 if (ZLEN_baseline + ΔZLEN < -2)
+
+Both the position and the increment are constructed on the non-maize axis with its own parameters, so the units of the fitted smooth and the units of the applied increment coincide.
+
+### Interpretation
+
+The marginal effect f'(NI) represents the expected change in HAZ per unit increase in nutritional index at a given point in the distribution. This allows the simulation to account for effects that vary with baseline nutrient status.
+
+### Limitations
+
+1. The GAM is intended for impact simulation, not individual-level HAZ prediction.
+
+2. Confidence intervals around marginal effects widen at distribution extremes.
+
+3. Impact estimates assume biofortification affects nutritional index components proportionally to established biofortification factors.
+
+4. **The dose-response is not identified.** The smooth loses statistical significance once socioeconomic covariates enter the specification, and the effect attenuates across the index range. The fitted slope is therefore descriptive: it summarises how the outcome varies with non-maize nutrient position in this sample, not the causal effect of adding nutrients.
+
+5. **The non-maize channel is a proxy, not the intervention.** QPM adds nutrients through maize, and the simulation treats that increment as if it arrived through non-maize sources. The assumption is that a milligram of a nutrient acts the same whatever food carried it, which is reasonable for the quantity but ignores any matrix effect specific to biofortified grain.
+
+6. **Residual confounding remains.** Non-maize intake is itself a marker of dietary diversity and therefore of household resources, so the estimated association carries part of that gradient.
+
+## Terminology
+
+The dataset columns `hfa` and `zlen` carry the anthropometric outcome as it is
+named in the SIVESNU source. In the published outputs the continuous
+height-for-age z-score is reported as **HAZ** and the binary variable
+(HAZ < -2) as **stunting**.

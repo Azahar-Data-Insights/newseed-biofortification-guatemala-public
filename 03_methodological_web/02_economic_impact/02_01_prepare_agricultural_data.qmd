@@ -1,0 +1,584 @@
+---
+title: "Agricultural Data Preparation"
+subtitle: "Module 2: Economic Impact"
+---
+
+## Overview
+
+Economic impact assessment requires detailed information about maize farmers: their
+land holdings, production volumes, input costs, and market participation. This
+information enables calculation of potential economic gains from biofortified
+maize adoption and identification of farmers most likely to benefit.
+
+ENCOVI 2023 provides a comprehensive agricultural module, but the data require
+substantial preparation before analysis. Raw survey responses contain heterogeneous
+measurement units, missing values, and logical inconsistencies that must be
+systematically addressed.
+
+This document describes the preparation of agricultural data through three stages:
+
+1. **Unit corrections** — Standardize land area to manzanas and production to
+   quintales, resolving mixed units in survey responses
+2. **Data integration** — Combine information from multiple survey modules into
+   a unified household-level dataset
+3. **Quality treatment** — Apply systematic cleaning including allocation
+   normalization, structural NA handling, outlier detection, and imputation
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by framework 02_01).
+
+tbl_a4_land_corrections <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_a4_land_corrections.rds"),
+  trust = TRUE
+)
+
+tbl_a4_yield_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_a4_yield_summary.rds"),
+  trust = TRUE
+)
+
+tbl_b6_integration_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_b6_integration_summary.rds"),
+  trust = TRUE
+)
+
+tbl_c1_allocation_diagnostic <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_c1_allocation_diagnostic.rds"),
+  trust = TRUE
+)
+
+tbl_c2_structural_nas <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_c2_structural_nas.rds"),
+  trust = TRUE
+)
+
+tbl_c3_impossible_values <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_c3_impossible_values.rds"),
+  trust = TRUE
+)
+
+tbl_c4_imputation_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_c4_imputation_summary.rds"),
+  trust = TRUE
+)
+
+tbl_c6_quality_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_01_tbl_c6_quality_summary.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Counts for the narrative summary
+
+# Number of base variables imputed
+n_vars_imputed <- nrow(tbl_c4_imputation_summary)
+
+# Total imputed values (sum across imputed base variables)
+n_values_imputed <- tbl_c4_imputation_summary |>
+  dplyr::summarise(total = sum(imputed, na.rm = TRUE)) |>
+  dplyr::pull(total)
+
+# Flagged impossible values (sum across criteria)
+n_values_flagged <- tbl_c3_impossible_values |>
+  dplyr::summarise(total = sum(n_cases, na.rm = TRUE)) |>
+  dplyr::pull(total)
+```
+
+
+## Data Sources
+
+ENCOVI 2023 includes a comprehensive agricultural module that captures farm-level
+information across multiple survey sections. We integrate data from:
+
+- **Agricultural unit registry** — Farm identification and poverty status
+- **Crop production module** — Cultivation practices, harvest quantities, input costs, and sales
+- **Household demographics** — Composition, location, and socioeconomic characteristics
+
+The production data is filtered to white maize only (cod_cultivo = 142), the staple
+crop targeted by biofortification efforts in Guatemala.
+
+
+## Unit Corrections
+
+ENCOVI respondents report land area and production quantities in heterogeneous
+units, and the recorded unit field is not always consistent with the magnitude
+of the reported value. Corrections are therefore applied on a plausibility
+basis rather than uniformly: each value is first assessed as if it were already
+expressed in the standard unit (manzanas for land, quintales for production),
+and a conversion is applied only when the reported magnitude is implausible
+under that assumption. Values that are already plausible are kept unchanged.
+
+This conditional logic is reflected in the correction outcomes below: the large
+majority of land records (around 90%) require no correction, while the remaining
+records are reassigned to their most likely original unit based on the magnitude
+of the reported value. The "likely unit" terminology denotes this inference:
+the most plausible unit given the value, not a unit recorded as such in the
+source data.
+
+### Land Area Standardization
+
+Values are standardized to **manzanas** (approximately 0.7 hectares)
+using range-based detection:
+
+- **< 0.05** — Likely caballerías (×45)
+- **40–60** — Likely acres (×0.7)
+- **60–100** — Likely cuerdas (×0.25)
+- **100–350** — Likely cuadras (×0.025)
+- **≥ 350** — Likely square meters (÷7,000)
+- **Zero/NA** — Assigned minimum viable plot (0.05 mz)
+
+```{r}
+#| label: tbl-a4-land-corrections
+#| tbl-cap: "Land area unit corrections applied to white maize records"
+
+tbl_a4_land_corrections |>
+  gt() |>
+  tab_header(
+    title = "Land Area Unit Corrections",
+    subtitle = "White maize records (cod_cultivo = 142)"
+  ) |>
+  cols_label(
+    correction_type = "Correction Applied",
+    n_records = "Records",
+    pct = "Percentage"
+  ) |>
+  cols_align(align = "left", columns = correction_type) |>
+  fmt_number(columns = n_records, use_seps = TRUE, decimals = 0) |>
+  fmt_percent(columns = pct, decimals = 1) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = correction_type == "No correction (manzanas)")
+  ) |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023, agricultural production module"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+### Yield Validation
+
+After unit corrections, yield distribution is validated against expected ranges
+for Guatemalan white maize production.
+
+```{r}
+#| label: tbl-a4-yield-summary
+#| tbl-cap: "White maize yield distribution after unit corrections"
+
+tbl_a4_yield_summary |>
+  gt() |>
+  tab_header(
+    title = "White Maize Yield Distribution",
+    subtitle = "After unit corrections (qq/mz)"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = metric %in% c("Total records", "Records with valid yield",
+                         "Records with yield < 3 qq/mz",
+                         "Records with yield > 150 qq/mz"),
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = value,
+    rows = !metric %in% c("Total records", "Records with valid yield",
+                          "Records with yield < 3 qq/mz",
+                          "Records with yield > 150 qq/mz"),
+    decimals = 1
+  ) |>
+  tab_row_group(label = md("*Distribution*"), rows = 3:9) |>
+  tab_row_group(label = md("*Sample Size*"), rows = 1:2) |>
+  tab_row_group(label = md("*Extreme Values*"), rows = 10:11) |>
+  row_group_order(groups = c("*Sample Size*", "*Distribution*", "*Extreme Values*")) |>
+  tab_source_note(
+    source_note = "Expected range for Guatemala: 20-40 qq/mz for non-hybrid varieties (locally known as criollo or OPV), up to 80-100 qq/mz for commercial hybrids"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.size = px(13)
+  )
+```
+
+::: {.callout-note}
+## Yield Validation
+The median yield of approximately 25 qq/mz sits in the range reported for
+traditional Guatemalan non-hybrid maize varieties, which is the reference point
+against which the unit conversion is read.
+:::
+
+
+## Data Integration
+
+Variables are derived from multiple ENCOVI modules and integrated at the
+household level. The integration includes land metrics, input expenditures,
+revenue and self-consumption, land characteristics, and farmer demographics.
+
+```{r}
+#| label: tbl-b6-integration-summary
+#| tbl-cap: "Data integration summary"
+
+tbl_b6_integration_summary |>
+  gt() |>
+  fmt_markdown(columns = Source) |>
+  cols_align(align = "right", columns = Variables) |>
+  cols_align(align = "left", columns = c(Source, Description)) |>
+  tab_header(
+    title = "Data Integration Summary",
+    subtitle = md("*White maize farmers from ENCOVI 2023*")
+  ) |>
+  tab_source_note(
+    source_note = "All dataframes joined by no_hogar (household ID)"
+  ) |>
+  tab_style(
+    style = list(cell_text(weight = "bold")),
+    locations = cells_body(rows = 7)
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Data Quality Treatment
+
+This stage addresses data quality issues through systematic processes: allocation
+normalization, structural NA handling, impossible value detection, and imputation.
+
+### Production Allocation Consistency
+
+Survey respondents often report destinations (sales, household consumption,
+animal feed/seed) that do not sum to total production. All destination
+quantities are scaled proportionally to match `total_production`.
+
+The scaling preserves the relative distribution reported by each farmer. Every
+destination quantity (sales, household consumption, animal feed and seed) is
+multiplied by the ratio between total reported production and the sum of the
+reported destinations, so the adjusted destinations sum to total production
+while the share of each destination stays at its reported value.
+
+$$
+\text{qty\_adj}_i = \frac{\text{qty\_raw}_i}{\sum \text{qty\_raw}} \times \text{total\_production}
+$$
+
+```{r}
+#| label: tbl-c1-allocation-diagnostic
+#| tbl-cap: "Production allocation consistency diagnostic"
+
+tbl_c1_allocation_diagnostic |>
+  gt() |>
+  tab_header(
+    title = "Production Allocation Consistency Diagnostic",
+    subtitle = "Distribution of farmers by allocation status"
+  ) |>
+  cols_label(
+    allocation_status = "Status",
+    n_records = "Records",
+    pct_records = "% Records"
+  ) |>
+  fmt_number(columns = n_records, decimals = 0, sep_mark = ",") |>
+  fmt_number(columns = pct_records, decimals = 1, pattern = "{x}%") |>
+  tab_style(
+    style = cell_fill(color = "#ffebee"),
+    locations = cells_body(rows = str_detect(allocation_status, "Excess"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fff3e0"),
+    locations = cells_body(rows = str_detect(allocation_status, "Deficit"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(rows = str_detect(allocation_status, "Balanced"))
+  ) |>
+  tab_source_note(
+    source_note = md("**Excess:** Reported destinations exceed production. **Deficit:** Destinations below production. Status compares the sum of destinations (sales, household consumption, animal feed and seed) against total production.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    table.width = pct(100)
+  )
+```
+
+### Structural NA Handling
+
+Variables with NA representing "no activity" are converted to explicit zeros.
+Price variables remain NA for non-sellers since price is undefined without a
+transaction.
+
+```{r}
+#| label: tbl-c2-structural-nas
+#| tbl-cap: "Structural NAs converted to zero"
+
+tbl_c2_structural_nas |>
+  gt() |>
+  cols_label(
+    variable = "Variable",
+    na_before = "NAs Before",
+    na_after = "NAs After",
+    converted = "Converted",
+    action = "Action"
+  ) |>
+  cols_align(align = "left", columns = variable) |>
+  cols_align(align = "right", columns = c(na_before, na_after, converted)) |>
+  cols_align(align = "center", columns = action) |>
+  tab_header(
+    title = "Structural NAs Converted to Zero",
+    subtitle = md("*NAs representing 'no activity' replaced with explicit zeros*")
+  ) |>
+  tab_spanner(
+    label = "NA Count",
+    columns = c(na_before, na_after)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(rows = action == "Converted to 0", columns = action)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fff3e0"),
+    locations = cells_body(rows = action == "Remains NA (price/rate)", columns = action)
+  ) |>
+  tab_source_note(
+    source_note = "Annual rates convert to 0 when no land; price variables remain NA when undefined"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    table.width = pct(100)
+  )
+```
+
+### Impossible Value Detection
+
+Domain-based rules identify logically impossible values, converting them to NA
+for subsequent imputation:
+
+- **Harvest frequency > 3/year** — Exceeds Guatemala's agricultural calendar
+- **Price outside 50–500 Q/qq** — Outside typical Guatemalan range (150–250 Q/qq)
+- **Seed expenditure > 5,000 Q/mz** — Exceeds premium hybrid costs (~1,500 Q/mz max)
+- **Household consumption > 15 qq/person/year** — Physiologically implausible (>680 kg)
+- **Animal/seed reserves > 500 qq** — Exceeds plausible storage (>22 tons)
+- **Yield > 160 qq/mz** — Exceeds biological limits for white maize (>7.3 tons/mz)
+
+Additionally, `farmer_score` — a composite indicator of likelihood of using
+non-hybrid varieties, computed from seed expenditure and yield patterns
+(see [farmer segmentation](02_03_farmer_segmentation.qmd) for the full
+scoring methodology) — has existing NAs from the scoring process that will
+also be imputed.
+
+```{r}
+#| label: tbl-c3-impossible-values
+#| tbl-cap: "Impossible values flagged for imputation"
+
+tbl_c3_impossible_values |>
+  gt() |>
+  cols_label(
+    criterion = "Detection Criterion",
+    base_variable = "Variable Set to NA",
+    n_cases = "Cases"
+  ) |>
+  tab_header(
+    title = "Impossible Values Flagged for Imputation",
+    subtitle = "Domain-based outlier detection"
+  ) |>
+  fmt_number(columns = n_cases, decimals = 0) |>
+  tab_source_note(
+    source_note = "These base variables will be imputed using Random Forest in the next step"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    table.width = pct(100)
+  )
+```
+
+### Random Forest Imputation
+
+Missing values in base variables are imputed using a Random Forest-based
+multivariate imputation procedure. The method is non-parametric, handles 
+mixed continuous and categorical data, and captures complex non-linear 
+relationships between variables. Implementation uses the
+`impute_rf_parallel()` utility function, which runs a multi-threaded `ranger`
+engine and reports out-of-bag (OOB) error estimates separately for continuous
+variables (OOBE) and categorical variables (PFC).
+
+Variables imputed: `n_harvests_total`, `qty_sold_qq`, `exp_seeds`,
+`qty_household_qq`, `qty_animal_seed_qq`, `total_production`, and `farmer_score`.
+
+After imputation, structural values are restored for non-sellers
+(`is_seller = 0`): `qty_sold_qq` is set to zero (non-sellers have no sales by
+definition), and price and gain variables remain NA (undefined without a
+transaction).
+
+```{r}
+#| label: tbl-c4-imputation-summary
+#| tbl-cap: "Random Forest imputation results"
+
+tbl_c4_imputation_summary |>
+  gt() |>
+  cols_label(
+    variable = "Variable",
+    na_before = "NAs Before",
+    na_after = "NAs After",
+    imputed = "Values Imputed",
+    status = "Status"
+  ) |>
+  cols_align(align = "left", columns = variable) |>
+  cols_align(align = "right", columns = c(na_before, na_after, imputed)) |>
+  cols_align(align = "center", columns = status) |>
+  tab_header(
+    title = "Random Forest Imputation Results",
+    subtitle = md("*Multivariate imputation via `impute_rf_parallel()` (ranger engine)*")
+  ) |>
+  grand_summary_rows(
+    columns = c(na_before, imputed),
+    fns = list(Total = ~sum(.)),
+    fmt = ~fmt_number(., decimals = 0)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e8f5e9"),
+    locations = cells_body(rows = status == "Complete", columns = status)
+  ) |>
+  tab_source_note(
+    source_note = "Imputation parameters: maxiter = 10, ntree = 100, seed = 789"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-tip}
+## Imputation Quality
+Out-of-bag (OOB) error metrics — OOBE for continuous variables and PFC for
+categorical variables — provide internal quality estimates calculated from
+observations randomly excluded during tree construction within the Random Forest
+algorithm. This avoids the need for a separate test set. OOBE values below 0.50
+are considered acceptable; PFC values below 0.20 indicate acceptable categorical
+accuracy.
+:::
+
+### Quality Treatment Summary
+
+```{r}
+#| label: tbl-c6-quality-summary
+#| tbl-cap: "Complete data quality treatment pipeline"
+
+tbl_c6_quality_summary |>
+  gt() |>
+  cols_label(
+    step = "Step",
+    action = "Action",
+    description = "Description",
+    records_affected = "Records Affected"
+  ) |>
+  cols_align(align = "center", columns = step) |>
+  cols_align(align = "left", columns = c(action, description, records_affected)) |>
+  tab_header(
+    title = "Data Quality Treatment Summary",
+    subtitle = md("*Systematic cleaning of agricultural dataset*")
+  ) |>
+  tab_row_group(label = "Recalculation & Correction", rows = 7:9) |>
+  tab_row_group(label = "Imputation", rows = 5:6) |>
+  tab_row_group(label = "Error Detection", rows = 4) |>
+  tab_row_group(label = "Structural Values", rows = 2:3) |>
+  tab_row_group(label = "Allocation Normalization", rows = 1) |>
+  row_group_order(groups = c("Allocation Normalization", "Structural Values",
+                             "Error Detection", "Imputation",
+                             "Recalculation & Correction")) |>
+  tab_source_note(
+    source_note = "Final dataset: white maize farmers ready for MAGA weight calibration and downstream segmentation"
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    table.width = pct(100),
+    row_group.font.weight = "bold"
+  )
+```
+
+
+## Summary
+
+### Key Findings
+
+1. **Unit heterogeneity**: A proportion of land area and production records
+   required unit conversion, highlighting the importance of systematic
+   standardization
+
+2. **Yield distribution**: Median yield aligns with expected values for
+   traditional Guatemalan maize varieties, validating the conversion approach
+
+3. **Quality treatment**: The cleaning pipeline detected approximately
+   `r n_values_flagged` impossible values across `r n_vars_imputed` base variables
+   and imputed `r format(n_values_imputed, big.mark = ",")` values via Random
+   Forest, while preserving structural NAs for undefined metrics
+   (price and gain for non-sellers)
+
+### Application
+
+This cleaned dataset provides the foundation for subsequent analyses in this
+module:
+
+- **MAGA weight calibration** — Calibrate survey weights to official
+  agricultural statistics
+- **Farmer segmentation** — Identify farmer typologies based on land
+  holdings, input use, and market orientation
+- **Economic impact calculation** — Estimate potential gains from
+  biofortified maize adoption
+- **Adoption modeling** — Predict which farmers are most likely to
+  adopt biofortified varieties

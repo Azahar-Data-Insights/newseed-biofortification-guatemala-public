@@ -1,0 +1,3506 @@
+---
+title: "Determination of the Likely Adopters Scoring and Saturation Model"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Setup: Load packages, configure environment, define constants
+# =============================================================================
+
+# Clean environment
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  gt,             # Professional table formatting
+  patchwork,      # Plot composition
+  mirai,          # Persistent daemon pool for parallel sweeps
+  RhpcBLASctl,    # BLAS/OpenMP thread control inside daemons
+  tidyverse       # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select    <- dplyr::select
+filter    <- dplyr::filter
+summarise <- dplyr::summarise
+
+# Set display options
+options(
+  scipen = 999,
+  digits = 4
+)
+
+# Load utility functions from centralized file
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# --- Reference configuration ------------------------------------------------
+#
+# Model determination is performed once on the s22 + sub00 economic impact
+# dataset, which serves as the baseline configuration of the framework: the
+# 2022 seed variant is the currently deployed generation, and sub00 is the
+# active commercial subsidy regime as of April 2026.
+#
+# The structural parameters identified through the determination process
+# (component weights, segment scheme, scoring heuristics, risk-aversion
+# coefficients, and continuous-adoption curve parameters) are modelled as a
+# function of the joint distribution of farmer characteristics. The single calibration run on s22 + sub00
+# therefore produces the model configuration applicable across the nine
+# seed-by-subsidy combinations handled by the scoring engine in script
+# 02_06.
+
+seed_suffix    <- "s22"
+subsidy_suffix <- "sub00"
+file_prefix    <- "02_05"
+
+# --- Visual constants -------------------------------------------------------
+ADI_PRIMARY  <- "#2E5266"
+ADI_GREEN    <- "#2E7D32"
+ADI_ACCENT   <- "#7B8B99"
+ADI_AMBER    <- "#E89923"
+ADI_RED      <- "#C0392B"
+SEGMENT_COLORS <- c(
+  "OPV/Criollo" = "#81C784",
+  "Low"         = "#2E7D32",
+  "Mid"         = "#FDD835",
+  "High"        = "#C62828"
+)
+
+# --- Coverage grid ----------------------------------------------------------
+# Anchors at 5%, 10%, 20%, 30% from NewSeed market composition matrix, plus
+# the structural 100% population anchor. The grid resolution of 0.05 places
+# every anchor point on a grid point.
+p_grid <- seq(0, 1, by = 0.05)
+
+# --- Hectare-to-manzana conversion -----------------------------------------
+# Standard Central American conversion: 1 hectare = 1.4308 manzanas.
+HA_TO_MZ <- 1.4308
+
+# --- Entry-size profile parameters -----------------------------------------
+# The scoring engine evaluates each farmer on the fraction of white-maize
+# land committed to biofortified maize at the moment of entry into the
+# ranking, governed by a per-profile entry coefficient.
+ENTRY_CUT_S_M  <- 1.5   # land_wtcorn cutoff (mz) between profiles S and M
+ENTRY_CUT_M_L  <- 7.0   # land_wtcorn cutoff (mz) between profiles M and L
+ENTRY_COEF_S   <- 0.95  # entry-size coefficient for profile S (small)
+ENTRY_COEF_M   <- 0.50  # entry-size coefficient for profile M (medium)
+ENTRY_COEF_L   <- 0.20  # entry-size coefficient for profile L (large)
+
+# --- Structural risk driver coefficient -------------------------------------
+# The projected-loss driver is fixed by design at alpha_loss = 1.0,
+# reflecting its structural role as a deterministic disincentive.
+ALPHA_LOSS <- 1.0
+
+# models/
+ensure_output_dir(here("01_data", "02_processed", "models"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Overview
+
+This script determines the structural parameters of the Likely Adopters scoring and saturation model from the empirical anchors provided by NewSeed. The determination proceeds in two stages.
+
+The first stage performs variable selection through three complementary filters: a correlation screen to remove redundant predictors, a near-zero variance screen to discard uninformative variables, and Boruta feature selection to identify variables significantly associated with adoption priority. The screening operates on the joined economic impact and segmentation datasets for the **`r seed_suffix` + `r subsidy_suffix`** baseline configuration.
+
+The second stage calibrates the scoring and saturation engine against five anchor points: four empirical anchors from the NewSeed market composition matrix at production coverage levels 5%, 10%, 20%, 30%, and one structural anchor at full coverage recovered from the population. The calibration is decomposed into independent sensitivity sweeps over four architectural components: scoring heuristics, segment-priority schemes, component weights, risk-aversion parameters, and continuous-adoption curve parameters. Each sweep produces a ranked table of mean absolute deviations (MAD) against the anchor set, from which the configuration minimising the global MAD is carried forward to the next stage.
+
+The final consolidated configuration is exported as a single `.rds` artefact consumed by script 02_06 (Likely Adopters scoring engine).
+
+## Main Operations
+
+1. **Variable selection (Phase A-C)**: load and join economic impact (02_04) and segmentation (02_03) datasets; apply correlation filter, near-zero variance filter, and Boruta selection on the adoption priority proxy.
+2. **Anchor preparation (Phase D)**: derive per-farmer entry-size magnitude, recover the structural population anchor at p = 1.0, and assemble the five-anchor calibration set.
+3. **Scoring sweeps (Phase E)**: per-component heuristic sweeps, segment-priority scheme sweep, component-weight sweep, with sequential inheritance of the best configuration across axes.
+4. **Risk-aversion sweep (Phase F)**: joint sweep over driver coefficients, logistic slope, risk weight, and z-score vs absolute-value driver variants.
+5. **Continuous-adoption sweeps (Phase G)**: sequential sweeps over profile floors, steepness coefficients, and profile cutoffs.
+6. **Consolidation (Phase H)**: integrate the best configurations into a single model configuration object, evaluate the integrated calibration against the anchor set, and export the configuration as `.rds`.
+
+# Phase A: Data Loading and Integration
+
+This phase loads the economic impact dataset from script 02_04 (s22 variant under the active subsidy regime) and supplements it with additional farmer characteristics from script 02_03. The join preserves all variables while avoiding column duplication.
+
+## A1. Load Economic Impact and Segmentation Data
+
+Load the primary dataset containing economic impact calculations, benefit decomposition, and segment assignments. Load supplementary data containing farmer sociodemographics, input expenditure details, z-scores, and scoring components.
+
+```{r}
+#| label: a1-load-data
+
+# =============================================================================
+# A1. Load Economic Impact Data (02_04) and Segmentation Data (02_03)
+# =============================================================================
+
+df_economic <- read_parquet(
+  here("01_data", "02_processed", "transfer",
+       paste0("02_04_", seed_suffix, "_", subsidy_suffix,
+              "_farmers_economic_impact.parquet"))
+)
+
+df_segmentation <- read_parquet(
+  here("01_data", "02_processed", "transfer",
+       "02_03_farmers_segmentated.parquet")
+)
+```
+
+## A2. Join Datasets
+
+Perform left join using economic impact data as the base, adding only unique variables from the segmentation dataset to avoid column duplication.
+
+```{r}
+#| label: a2-join-datasets
+
+# =============================================================================
+# A2. Join Economic Impact and Segmentation Datasets
+# =============================================================================
+
+# Define join keys
+join_keys <- c("no_hogar", "farmer_id", "copy_id")
+
+# Identify unique variables in segmentation dataset
+vars_unique_segmentation <- setdiff(names(df_segmentation), names(df_economic))
+
+# Prepare segmentation data: keep only join keys + unique variables
+df_segmentation_unique <- df_segmentation |>
+  select(all_of(c(join_keys, vars_unique_segmentation)))
+
+# Perform left join
+df_farmers <- df_economic |>
+  left_join(df_segmentation_unique, by = join_keys)
+
+# Derive structural profile assignment and entry-size magnitude. The
+# entry-size variable replaces total land area as the scale magnitude
+# consumed by the scoring engine's scale-potential component and by the
+# land driver of the risk-aversion penalty.
+df_farmers <- df_farmers |>
+  mutate(
+    profile_entry = case_when(
+      land_wtcorn <  ENTRY_CUT_S_M ~ "S",
+      land_wtcorn <  ENTRY_CUT_M_L ~ "M",
+      TRUE                          ~ "L"
+    ),
+    entry_coef = case_when(
+      profile_entry == "S" ~ ENTRY_COEF_S,
+      profile_entry == "M" ~ ENTRY_COEF_M,
+      profile_entry == "L" ~ ENTRY_COEF_L
+    ),
+    land_entry_size = land_wtcorn * entry_coef
+  )
+
+# Clean up intermediate objects
+rm(df_segmentation_unique, vars_unique_segmentation, join_keys,
+   df_economic, df_segmentation)
+```
+
+---
+
+# Phase B: Variable Assessment
+
+This phase evaluates candidate predictor variables for the adoption scoring model through correlation analysis and near-zero variance detection. The goal is to identify redundant or uninformative variables before constructing the scoring system.
+
+## B1. Define Candidate Variables
+
+Select variables that could potentially influence adoption priority, excluding identifiers, survey design variables, projected outcomes, model parameters, and segment indicators.
+
+```{r}
+#| label: b1-define-candidates
+
+# =============================================================================
+# B1. Define Candidate Predictor Variables
+# =============================================================================
+
+# Variables to EXCLUDE from candidate set
+vars_exclude <- c(
+  # Identifiers
+  "no_hogar", "farmer_id", "copy_id",
+  # Survey design (used for weighting, not prediction)
+  "weight_calibrated", "upm", "factor", "n_copies", "needs_expansion",
+  "weight_expanded", "weight_per_copy", "weight_ratio",
+  # Projected values (outcomes of adoption, not predictors)
+  "income_net_projected", "income_sales_projected",
+  "value_self_consumption_projected", "value_gross_projected",
+  "cost_seeds_projected", "cost_non_seed_projected", "cost_total_projected",
+  "has_positive_income_projected", "qty_sold_projected",
+  "qty_household_projected", "qty_animal_projected", "qty_other_projected",
+  "qty_retained_projected", "production_biofortified",
+  # Impact metrics (these ARE what we want to predict/score)
+  "income_increment", "income_increment_pct", "production_increment",
+  "production_increment_pct", "sales_qty_increment", "sales_value_increment",
+  "cost_seeds_increment", "cost_total_increment", "impact_category",
+  # Benefit decomposition (components of impact)
+  "benefit_from_sales", "benefit_from_self_consumption",
+  "benefit_from_seed_savings",
+  # Model parameters (constants, not farmer characteristics)
+  "yield_change_factor", "seed_cost_conventional", "seed_cost_biofortified",
+  "price_sale", "price_purchase",
+  # Subsidy metadata and derived monetary variables
+  "subsidy_scenario", "subsidy_suffix", "subsidy_reduction_pct",
+  "cost_seeds_bio_no_subsidy", "subsidy_amount_absolute",
+  "cost_seeds_bio_current_regime", "subsidy_reduction_cost",
+  "newseed_subsidy", "producer_absorption", "newseed_savings_vs_current",
+  "subsidy_decomposition_check", "newseed_delta_check",
+  # Segment indicators (handled separately as primary driver)
+  "segment_final", "is_opv_direct",
+  # Scoring components from 02_03 (new scores constructed downstream)
+  "score_total", "score_yield", "score_seed", "score_poverty",
+  "score_ownership",
+  # Redundant geographic (keep departamento only)
+  "depto", "region",
+  # Variables with structural NAs or zero variance in seller subset
+  "gain_per_qq_with_cost", "price_per_qq", "gain_per_qq_no_cost", "is_seller",
+  # Entry-size scaffolding (derived in A2; not a base predictor)
+  "profile_entry", "entry_coef", "land_entry_size"
+)
+
+# Define candidate variables
+vars_candidates <- setdiff(names(df_farmers), vars_exclude)
+
+# Separate numeric and categorical candidates
+vars_numeric <- vars_candidates[
+  map_lgl(vars_candidates, ~ is.numeric(df_farmers[[.x]]))
+]
+vars_categorical <- vars_candidates[
+  map_lgl(vars_candidates, ~ !is.numeric(df_farmers[[.x]]))
+]
+```
+
+## B2. Correlation Filter
+
+Identify and remove highly correlated variables (r > 0.80) using the `caret::findCorrelation()` algorithm, which selects variables for removal based on mean absolute correlation.
+
+```{r}
+#| label: tbl-b2-correlation-filter
+#| tbl-cap: "Variables Removed Due to High Correlation (r > 0.80)"
+
+# =============================================================================
+# B2. Correlation Filter (r > 0.80)
+# =============================================================================
+
+# Prepare numeric data for correlation
+df_numeric_candidates <- df_farmers |>
+  select(all_of(vars_numeric)) |>
+  mutate(across(everything(), as.numeric))
+
+# Calculate correlation matrix
+cor_matrix <- cor(df_numeric_candidates, use = "pairwise.complete.obs")
+
+# Identify variables to remove (findCorrelation returns indices)
+vars_high_cor_idx <- caret::findCorrelation(cor_matrix, cutoff = 0.80,
+                                            names = FALSE)
+vars_high_cor <- colnames(cor_matrix)[vars_high_cor_idx]
+
+# Create summary table
+tbl_b2_correlation_filter <- tibble(
+  variable_removed = vars_high_cor,
+  reason = "Correlation > 0.80 with retained variable"
+)
+
+export(
+  tbl_b2_correlation_filter,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_b2_correlation_filter.rds"))
+)
+
+tbl_b2_correlation_filter |>
+  gt() |>
+  tab_header(
+    title    = "Variables Removed: High Correlation Filter",
+    subtitle = paste0(length(vars_high_cor), " of ", length(vars_numeric),
+                      " numeric variables removed (cutoff r = 0.80)")
+  ) |>
+  cols_label(
+    variable_removed = "Variable Removed",
+    reason           = "Reason"
+  ) |>
+  tab_source_note(
+    source_note = "Selection via caret::findCorrelation (removes variable with highest mean absolute correlation)"
+  ) |>
+  tab_options(
+    table.font.size          = px(12),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Update candidate set
+vars_post_cor <- setdiff(vars_numeric, vars_high_cor)
+
+# Clean up
+rm(df_numeric_candidates, cor_matrix, vars_high_cor_idx, vars_high_cor,
+   tbl_b2_correlation_filter)
+```
+
+## B3. Near-Zero Variance Analysis
+
+Identify variables with minimal variation that provide limited predictive value. Variables with frequency ratio > 19 and percent unique < 10% are flagged via `caret::nearZeroVar()`.
+
+```{r}
+#| label: tbl-b3-nzv-analysis
+#| tbl-cap: "Near-Zero Variance Analysis for Post-Correlation Variables"
+
+# =============================================================================
+# B3. Near-Zero Variance Analysis
+# =============================================================================
+
+tbl_b3_nzv_analysis <- df_farmers |>
+  select(all_of(vars_post_cor)) |>
+  analyze_variance()
+
+export(
+  tbl_b3_nzv_analysis,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_b3_nzv_analysis.rds"))
+)
+
+tbl_b3_nzv_analysis
+
+# Cleanup auxiliary objects
+rm(tbl_b3_nzv_analysis)
+```
+
+## B4. Variable Selection Summary
+
+Consolidate results from correlation and NZV analysis to define the final candidate set for Boruta feature selection.
+
+```{r}
+#| label: tbl-b4-selection-summary
+#| tbl-cap: "Variable Selection Pipeline Summary"
+
+# =============================================================================
+# B4. Final Candidate Variable Selection
+# =============================================================================
+
+# Identify NZV variables automatically
+nzv_result <- caret::nearZeroVar(
+  df_farmers |> select(all_of(vars_post_cor)),
+  saveMetrics = FALSE
+)
+vars_nzv_remove <- vars_post_cor[nzv_result]
+
+# Final candidate set
+vars_final_candidates <- setdiff(vars_post_cor, vars_nzv_remove)
+
+# Create summary table
+tbl_b4_selection_summary <- tibble(
+  stage = c("Initial numeric candidates",
+            "After correlation filter (r > 0.80)",
+            "After NZV filter",
+            "Final candidates for Boruta"),
+  n_variables = c(
+    length(vars_numeric),
+    length(vars_post_cor),
+    length(vars_final_candidates),
+    length(vars_final_candidates)
+  ),
+  removed = c(
+    NA,
+    length(vars_numeric) - length(vars_post_cor),
+    length(vars_nzv_remove),
+    NA
+  )
+)
+
+export(
+  tbl_b4_selection_summary,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_b4_selection_summary.rds"))
+)
+
+tbl_b4_selection_summary |>
+  gt() |>
+  tab_header(
+    title    = "Variable Selection Pipeline",
+    subtitle = "From initial candidates to Boruta input"
+  ) |>
+  cols_label(
+    stage       = "Stage",
+    n_variables = "Variables",
+    removed     = "Removed"
+  ) |>
+  sub_missing(missing_text = "\u2014") |>
+  cols_align(align = "center", columns = c(n_variables, removed)) |>
+  tab_style(
+    style    = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = stage == "Final candidates for Boruta")
+  ) |>
+  tab_options(
+    table.font.size          = px(12),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up intermediate vectors (keep vars_final_candidates for Phase C)
+rm(vars_nzv_remove, vars_post_cor, nzv_result, tbl_b4_selection_summary)
+```
+
+---
+
+# Phase C: Adoption Priority Proxy and Feature Selection
+
+This phase constructs an economically-grounded proxy outcome for adoption priority and applies Boruta feature selection to identify the most important predictors. The resulting variable importance informs the scoring model design carried forward to the calibration stage.
+
+## C1. Construct Adoption Priority Proxy
+
+The proxy reflects NewSeed's strategic targeting priorities based on segment positioning and economic benefit potential. The proxy is a domain-informed ranking that captures the logic of which farmers should be prioritised for outreach.
+
+**Priority logic:**
+
+- **Level 5**: Low segment with positive income increment — high improvement potential among commercially established farmers.
+- **Level 4**: OPV/Criollo with positive income increment — largest yield gains, requires technology transition.
+- **Level 3**: Mid segment with positive income increment — marginal gains within an established commercial system.
+- **Level 2**: Any segment with non-positive income increment — limited economic incentive.
+- **Level 1**: High segment — negative yield impact under the biofortified seed configuration.
+
+```{r}
+#| label: c1-construct-proxy
+
+# =============================================================================
+# C1. Construct Adoption Priority Proxy
+# =============================================================================
+
+df_farmers <- df_farmers |>
+  mutate(
+    adoption_priority = case_when(
+      segment_final == "Low"         & income_increment > 0 ~ 5L,
+      segment_final == "OPV/Criollo" & income_increment > 0 ~ 4L,
+      segment_final == "Mid"         & income_increment > 0 ~ 3L,
+      income_increment <= 0                                 ~ 2L,
+      segment_final == "High"                               ~ 1L,
+      TRUE                                                   ~ 2L
+    )
+  )
+```
+
+## C2. Boruta Feature Selection
+
+Apply the Boruta algorithm to identify variables significantly associated with adoption priority. Boruta uses Random Forest importance and compares each variable against shadow (permuted) versions to determine statistical significance. The ranger engine is used as the importance source, enabling multi-threaded tree construction within each Boruta iteration.
+
+```{r}
+#| label: c2-boruta-selection
+
+# =============================================================================
+# C2. Boruta Feature Selection (ranger engine, multi-threaded)
+# =============================================================================
+
+# Prepare data for Boruta (numeric candidates + proxy outcome)
+df_boruta <- df_farmers |>
+  select(all_of(vars_final_candidates), adoption_priority) |>
+  drop_na()
+
+# Run Boruta with ranger as importance source
+set.seed(789)
+
+boruta_result <- Boruta::Boruta(
+  adoption_priority ~ .,
+  data        = df_boruta,
+  doTrace     = 0,
+  maxRuns     = 150,
+  getImp      = Boruta::getImpRfZ,
+  num.threads = parallel::detectCores() - 2
+)
+
+# Extract decision statistics
+boruta_stats <- Boruta::attStats(boruta_result) |>
+  rownames_to_column("variable") |>
+  as_tibble() |>
+  arrange(desc(medianImp))
+
+# Clean up
+rm(df_boruta)
+```
+
+## C3. Variable Importance Visualization
+
+Display Boruta importance scores for all candidate variables, showing the algorithm's decision (Confirmed, Tentative, Rejected) and the shadow maximum threshold used for significance determination.
+
+```{r}
+#| label: fig-c3-boruta-importance
+#| fig-cap: "Boruta variable importance for adoption priority prediction"
+#| fig-height: 14
+#| fig-width: 10
+
+# =============================================================================
+# C3. Boruta Importance Plot - All Variables
+# =============================================================================
+
+# Prepare importance data
+df_boruta_importance <- boruta_result$ImpHistory |>
+  as.data.frame() |>
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "variable",
+    values_to = "importance"
+  ) |>
+  filter(is.finite(importance)) |>
+  filter(!str_detect(variable, "^shadow")) |>
+  left_join(
+    boruta_stats |> select(variable, decision, medianImp),
+    by = "variable"
+  ) |>
+  mutate(
+    decision = factor(decision, levels = c("Confirmed", "Tentative", "Rejected")),
+    variable = fct_reorder(variable, medianImp)
+  )
+
+# Get shadow max threshold for reference line
+shadow_max_median <- boruta_result$ImpHistory |>
+  as.data.frame() |>
+  pull(shadowMax) |>
+  median(na.rm = TRUE)
+
+export(
+  df_boruta_importance,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_fig_c3_boruta_importance.rds"))
+)
+
+ggplot(df_boruta_importance, aes(x = importance, y = variable, fill = decision)) +
+  geom_boxplot(alpha = 0.4, outlier.size = 0.5) +
+  geom_vline(xintercept = shadow_max_median, linetype = "dashed",
+             color = "grey40") +
+  scale_fill_manual(
+    values = c(
+      "Confirmed" = "#2E7D32",
+      "Tentative" = "#F9A825",
+      "Rejected"  = "#C62828"
+    )
+  ) +
+  labs(
+    title    = "Boruta Variable Importance for Adoption Priority",
+    subtitle = "All candidate variables. Dashed line = shadow maximum threshold",
+    x        = "Importance",
+    y        = NULL,
+    fill     = "Decision"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position    = "bottom",
+    axis.text.y        = element_text(size = 8),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+# Clean up
+rm(df_boruta_importance, shadow_max_median)
+```
+
+## C4. Boruta Selection Summary
+
+Summary table of Boruta decisions showing which variables are confirmed as important predictors of adoption priority.
+
+```{r}
+#| label: tbl-c4-boruta-summary
+#| tbl-cap: "Boruta Feature Selection Results"
+
+# =============================================================================
+# C4. Boruta Selection Summary Table
+# =============================================================================
+
+tbl_c4_boruta_summary <- boruta_stats |>
+  select(variable, decision, medianImp, meanImp, maxImp) |>
+  mutate(
+    decision = factor(decision, levels = c("Confirmed", "Tentative", "Rejected"))
+  ) |>
+  arrange(decision, desc(medianImp))
+
+export(
+  tbl_c4_boruta_summary,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_c4_boruta_summary.rds"))
+)
+
+tbl_c4_boruta_summary |>
+  gt() |>
+  tab_header(
+    title    = "Boruta Feature Selection Results",
+    subtitle = paste0("Proxy outcome: adoption_priority (5-level ordinal). ",
+                      sum(boruta_stats$decision == "Confirmed"), " confirmed, ",
+                      sum(boruta_stats$decision == "Tentative"), " tentative, ",
+                      sum(boruta_stats$decision == "Rejected"), " rejected")
+  ) |>
+  cols_label(
+    variable  = "Variable",
+    decision  = "Decision",
+    medianImp = "Median Imp.",
+    meanImp   = "Mean Imp.",
+    maxImp    = "Max Imp."
+  ) |>
+  fmt_number(
+    columns  = c(medianImp, meanImp, maxImp),
+    decimals = 2
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = decision == "Confirmed")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFF8E1"),
+    locations = cells_body(rows = decision == "Tentative")
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(rows = decision == "Rejected")
+  ) |>
+  tab_source_note(
+    source_note = "Boruta algorithm with maxRuns = 150, ranger importance source. Importance compared against shadow (permuted) variables."
+  ) |>
+  tab_options(
+    table.font.size          = px(12),
+    heading.title.font.size  = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_c4_boruta_summary)
+```
+
+## C5. Correlation Direction Analysis
+
+Examine how the top Boruta variables correlate with adoption priority to determine directionality. This informs whether higher values indicate higher or lower adoption likelihood in the scoring model.
+
+```{r}
+#| label: tbl-c5-correlation-direction
+#| tbl-cap: "Correlation of Top Variables with Adoption Priority"
+
+# =============================================================================
+# C5. Correlation Direction Analysis (Spearman)
+# =============================================================================
+
+# Select variables with importance >= 10 (exclude near-irrelevant)
+vars_relevant <- boruta_stats |>
+  filter(medianImp >= 10) |>
+  pull(variable)
+
+# Calculate Spearman correlations with adoption_priority
+cor_with_priority <- df_farmers |>
+  select(all_of(vars_relevant), adoption_priority) |>
+  summarise(
+    across(
+      all_of(vars_relevant),
+      ~ cor(.x, adoption_priority, method = "spearman", use = "complete.obs")
+    )
+  ) |>
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "variable",
+    values_to = "cor_spearman"
+  ) |>
+  left_join(
+    boruta_stats |> select(variable, medianImp),
+    by = "variable"
+  ) |>
+  mutate(
+    direction = case_when(
+      cor_spearman >  0.1 ~ "Positive (\u2191 = higher priority)",
+      cor_spearman < -0.1 ~ "Negative (\u2191 = lower priority)",
+      TRUE                ~ "Weak/None"
+    )
+  ) |>
+  arrange(desc(medianImp))
+
+export(
+  cor_with_priority,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_c5_correlation_direction.rds"))
+)
+
+cor_with_priority |>
+  gt() |>
+  tab_header(
+    title    = "Variable Correlation with Adoption Priority",
+    subtitle = "Spearman correlation (variables with Boruta importance \u2265 10)"
+  ) |>
+  cols_label(
+    variable     = "Variable",
+    cor_spearman = "\u03c1 (Spearman)",
+    medianImp    = "Boruta Imp.",
+    direction    = "Direction"
+  ) |>
+  fmt_number(
+    columns  = c(cor_spearman, medianImp),
+    decimals = 2
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = cor_spearman > 0.1)
+  ) |>
+  tab_style(
+    style    = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(rows = cor_spearman < -0.1)
+  ) |>
+  tab_source_note(
+    source_note = "Positive: higher values \u2192 higher adoption priority. Negative: higher values \u2192 lower priority."
+  ) |>
+  tab_options(
+    table.font.size          = px(12),
+    heading.title.font.size  = px(14)
+  )
+
+# Cleanup auxiliary objects
+rm(vars_relevant, cor_with_priority, boruta_result, boruta_stats,
+   vars_final_candidates, vars_candidates, vars_numeric, vars_categorical,
+   vars_exclude)
+```
+
+---
+
+# Phase D: Calibration Anchors and Helper Functions
+
+This phase prepares the empirical and structural anchors that define the calibration target, and defines the helper functions used across all sweeps in Phases E-G.
+
+## D1. NewSeed Market Composition Matrix (Empirical Anchors)
+
+The NewSeed market composition matrix reports the per-segment share of purchasing farmers at four candidate production coverage levels (5%, 10%, 20%, 30%). The shares are interpreted as the expected segmental composition of the adopting cohort at each coverage level, conditional on the universe of all white-maize producers in Guatemala (the same ENCOVI 2023 universe used throughout the framework).
+
+The values at p = 5% and p = 10% correspond to the directly observed coverage range of the 2022-2025 commercial period. The values at p = 20% and p = 30% are extrapolated from the same observational base using Gompertz sigmoid fits per segment. The matrix satisfies two structural requirements: per-segment cohort size is monotonically non-decreasing across coverage levels, and no per-segment cohort size at any intermediate level exceeds the corresponding population total at full coverage.
+
+```{r}
+#| label: d1-newseed-matrix
+
+# =============================================================================
+# D1. NewSeed Market Composition Matrix (Empirical Anchors)
+# =============================================================================
+
+# Per-segment shares (%) of the purchasing-farmer cohort at four coverage
+# levels. Source: NewSeed ex-ante segment composition estimate (April 2026).
+newseed_composition <- tibble(
+  p_anchor = c(0.05, 0.10, 0.20, 0.30),
+  pct_OPV  = c(17.8, 22.6, 41.6, 56.4),
+  pct_Low  = c(59.6, 32.0, 17.0, 12.0),
+  pct_Mid  = c(12.6, 20.0, 15.7, 12.5),
+  pct_High = c(10.0, 25.4, 25.7, 19.1)
+)
+```
+
+## D2. Land-Size Trajectory (Empirical Anchors)
+
+The land-size trajectory reports the average land planted in biofortified maize among purchasing farmers at the four candidate coverage levels (overall, not segmented). Source values are reported in hectares and converted to manzanas using `1 ha = 1.4308 mz`.
+
+The trajectory is interpreted as a trimmed-mean property of the adopting cohort under the same P5-P95 weighted trimming convention used in script 02_03, preserving consistency across the framework.
+
+```{r}
+#| label: d2-newseed-land
+
+# =============================================================================
+# D2. NewSeed Land-Size Trajectory (Empirical Anchors)
+# =============================================================================
+
+newseed_land <- tibble(
+  p_anchor        = c(0.05, 0.10, 0.20, 0.30),
+  land_overall_ha = c(0.44, 0.35, 0.53, 0.92)
+) |>
+  mutate(land_overall_mz = land_overall_ha * HA_TO_MZ)
+```
+
+## D3. Recover Population Anchor at p = 1.0
+
+The composition at full coverage equals the population composition by definition: at p = 1.0 every farmer in the segmented dataset has fully converted to biofortified maize. This anchor is recovered directly from the calibrated dataset using survey-calibrated weights.
+
+```{r}
+#| label: d3-population-anchor
+
+# =============================================================================
+# D3. Population Composition and Land at Full Coverage (p = 1.0)
+# =============================================================================
+
+# Universe-level population total
+N_universe <- sum(df_farmers$weight_calibrated, na.rm = TRUE)
+
+# Per-segment population shares
+pop_composition <- df_farmers |>
+  summarise(
+    pct = sum(weight_calibrated, na.rm = TRUE) / N_universe * 100,
+    .by = segment_final
+  ) |>
+  pivot_wider(names_from  = segment_final,
+              values_from = pct,
+              names_prefix = "pct_") |>
+  rename(
+    pct_OPV  = `pct_OPV/Criollo`,
+    pct_Low  = pct_Low,
+    pct_Mid  = pct_Mid,
+    pct_High = pct_High
+  )
+
+# Land overall at p = 1.0: weighted trimmed mean (P5-P95) of land_wtcorn
+# across the entire universe, computed under the same trimming convention
+# applied to the per-cohort land metric.
+land_overall_p100_mz <- trimmed_mean_p5p95(
+  df_farmers$land_wtcorn,
+  df_farmers$weight_calibrated
+)
+```
+
+## D4. Assemble Anchor Set and A-priori Weights
+
+The five anchors are assembled into two tibbles (per-segment counts and overall land). The four NewSeed anchors carry the empirical signal about adoption dynamics under the biofortification programme and are weighted with `w_emp = 1.0`. The population anchor at p = 1.0 represents the asymptotic composition of the universe; it is weighted at half the empirical anchors with `w_str = 0.5`, reflecting its auxiliary role.
+
+The MAD evaluation operates on relative deviations: each cell at each anchor contributes the absolute model-anchor error divided by the anchor value plus a small offset, so that all anchor cells contribute proportionally regardless of their absolute magnitude.
+
+```{r}
+#| label: d4-assemble-anchors
+
+# =============================================================================
+# D4. Assemble Calibration Anchors and Weights
+# =============================================================================
+
+# Per-segment absolute counts (empirical anchors): share-of-cohort * N_universe
+anchors_farmers <- bind_rows(
+  newseed_composition |>
+    mutate(
+      N_OPV  = pct_OPV  / 100 * p_anchor * N_universe,
+      N_Low  = pct_Low  / 100 * p_anchor * N_universe,
+      N_Mid  = pct_Mid  / 100 * p_anchor * N_universe,
+      N_High = pct_High / 100 * p_anchor * N_universe,
+      role   = "Empirical (NewSeed)"
+    ),
+  tibble(
+    p_anchor = 1.0,
+    pct_OPV  = pop_composition$pct_OPV,
+    pct_Low  = pop_composition$pct_Low,
+    pct_Mid  = pop_composition$pct_Mid,
+    pct_High = pop_composition$pct_High,
+    N_OPV    = pop_composition$pct_OPV  / 100 * N_universe,
+    N_Low    = pop_composition$pct_Low  / 100 * N_universe,
+    N_Mid    = pop_composition$pct_Mid  / 100 * N_universe,
+    N_High   = pop_composition$pct_High / 100 * N_universe,
+    role     = "Structural (population)"
+  )
+) |>
+  arrange(p_anchor)
+
+# Overall land anchors
+anchors_land <- bind_rows(
+  newseed_land |>
+    select(p_anchor, land_overall_mz) |>
+    mutate(role = "Empirical (NewSeed)"),
+  tibble(
+    p_anchor        = 1.00,
+    land_overall_mz = land_overall_p100_mz,
+    role            = "Structural (population)"
+  )
+) |>
+  arrange(p_anchor)
+
+# A-priori anchor weights
+anchor_weights <- tibble(
+  p_anchor = c(0.05, 0.10, 0.20, 0.30, 1.00),
+  w_p      = c(1.0,  1.0,  1.0,  1.0,  0.5)
+)
+```
+
+## D5. Display Calibration Anchors
+
+```{r}
+#| label: tbl-d5-anchors-farmers
+#| tbl-cap: "Calibration Anchors — Per-Segment Absolute Farmer Counts"
+
+anchors_farmers |>
+  left_join(anchor_weights, by = "p_anchor") |>
+  select(role, p_anchor, w_p,
+         pct_OPV, pct_Low, pct_Mid, pct_High,
+         N_OPV, N_Low, N_Mid, N_High) |>
+  gt() |>
+  tab_header(
+    title    = "Calibration anchors \u2014 per-segment absolute farmer counts",
+    subtitle = "Five anchors: four empirical (NewSeed market composition) plus one structural (population)"
+  ) |>
+  cols_label(
+    role     = "Role",
+    p_anchor = "p",
+    w_p      = "Weight",
+    pct_OPV  = "% OPV", pct_Low = "% Low",
+    pct_Mid  = "% Mid", pct_High = "% High",
+    N_OPV    = "N OPV", N_Low   = "N Low",
+    N_Mid    = "N Mid", N_High  = "N High"
+  ) |>
+  fmt_percent(columns = p_anchor, decimals = 0, scale_values = TRUE) |>
+  fmt_number(columns = c(pct_OPV, pct_Low, pct_Mid, pct_High), decimals = 2) |>
+  fmt_number(columns = c(N_OPV, N_Low, N_Mid, N_High),
+             decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = w_p, decimals = 1) |>
+  tab_spanner(label = "Composition shares (%)",
+              columns = c(pct_OPV, pct_Low, pct_Mid, pct_High)) |>
+  tab_spanner(label = "Absolute farmer counts",
+              columns = c(N_OPV, N_Low, N_Mid, N_High)) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+```{r}
+#| label: tbl-d5-anchors-land
+#| tbl-cap: "Calibration Anchors — Overall Land per Cohort (Manzanas)"
+
+anchors_land |>
+  left_join(anchor_weights, by = "p_anchor") |>
+  select(role, p_anchor, w_p, land_overall_mz) |>
+  gt() |>
+  tab_header(
+    title    = "Calibration anchors \u2014 overall land per cohort (manzanas)",
+    subtitle = "Trimmed mean P5-P95 weighted convention. Source values converted from hectares using 1 ha = 1.4308 mz."
+  ) |>
+  cols_label(
+    role            = "Role",
+    p_anchor        = "p",
+    w_p             = "Weight",
+    land_overall_mz = "Land overall (mz)"
+  ) |>
+  fmt_percent(columns = p_anchor, decimals = 0, scale_values = TRUE) |>
+  fmt_number(columns = land_overall_mz, decimals = 4) |>
+  fmt_number(columns = w_p, decimals = 1) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+## D6. Scoring Helper Functions
+
+The scoring functions are parameterised so that the same code structure supports all sweep variants in Phase E. Each component score returns an integer in `[0, 100]`. The composite score is a weighted linear combination of the five component scores.
+
+```{r}
+#| label: d6-helpers-scoring
+
+# =============================================================================
+# D6. Scoring Helper Functions
+# =============================================================================
+
+# Null-coalescing helper for parameterised sweep helpers
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# --- Segment-priority score ------------------------------------------------
+# Pure categorical scoring on the segment label, parameterised by a named
+# point vector (Low, OPV, Mid, High).
+score_segment_fn <- function(segment, points) {
+  case_when(
+    segment == "Low"         ~ as.integer(points[["Low"]]),
+    segment == "OPV/Criollo" ~ as.integer(points[["OPV"]]),
+    segment == "Mid"         ~ as.integer(points[["Mid"]]),
+    segment == "High"        ~ as.integer(points[["High"]]),
+    TRUE                     ~ 0L
+  )
+}
+
+# --- Economic-benefit score (parameterised by percentile breakpoints) ------
+score_economic_fn <- function(x, bp_probs = c(0.25, 0.50, 0.75)) {
+  q <- quantile(x, probs = bp_probs, na.rm = TRUE)
+  case_when(
+    x >= q[[3]] ~ 100L,
+    x >= q[[2]] ~  75L,
+    x >= q[[1]] ~  50L,
+    x >= 0      ~  25L,
+    TRUE        ~   0L
+  )
+}
+
+# --- Improvement-potential score (inverse, four breakpoints) ---------------
+score_improvement_fn <- function(x, bp_probs = c(0.25, 0.50, 0.75, 0.90)) {
+  q <- quantile(x, probs = bp_probs, na.rm = TRUE)
+  case_when(
+    x <= q[[1]] ~ 100L,
+    x <= q[[2]] ~  75L,
+    x <= q[[3]] ~  50L,
+    x <= q[[4]] ~  25L,
+    TRUE        ~   0L
+  )
+}
+
+# --- Scale-potential score (three breakpoints) -----------------------------
+score_scale_fn <- function(x, bp_probs = c(0.25, 0.50, 0.75)) {
+  q <- quantile(x, probs = bp_probs, na.rm = TRUE)
+  case_when(
+    x >= q[[3]] ~ 100L,
+    x >= q[[2]] ~  75L,
+    x >= q[[1]] ~  50L,
+    TRUE        ~  25L
+  )
+}
+
+# --- Age score (three-axis factory) ----------------------------------------
+# peak_center: centre of the score-100 band
+# peak_width:  half-width of the score-100 band
+# profile:    distribution of secondary scores across flanking bands
+#             ("decreasing", "young_priority", "elder_priority",
+#              "neutral_edges")
+make_score_age <- function(peak_center, peak_width, profile) {
+  function(farmer_age) {
+    peak_lo    <- peak_center - peak_width
+    peak_hi    <- peak_center + peak_width
+    near_lo_lo <- peak_lo - 10
+    far_lo_lo  <- peak_lo - 20
+    near_hi_hi <- peak_hi + 10
+    far_hi_hi  <- peak_hi + 20
+
+    pts <- switch(profile,
+      "decreasing"     = c(near_below = 80L, far_below = 60L,
+                           near_above = 80L, far_above = 60L,
+                           extreme = 50L),
+      "young_priority" = c(near_below = 85L, far_below = 70L,
+                           near_above = 60L, far_above = 40L,
+                           extreme = 50L),
+      "elder_priority" = c(near_below = 60L, far_below = 40L,
+                           near_above = 85L, far_above = 70L,
+                           extreme = 50L),
+      "neutral_edges"  = c(near_below = 70L, far_below = 55L,
+                           near_above = 70L, far_above = 55L,
+                           extreme = 50L)
+    )
+
+    case_when(
+      farmer_age >= peak_lo    & farmer_age <  peak_hi    ~ 100L,
+      farmer_age >= near_lo_lo & farmer_age <  peak_lo    ~ pts[["near_below"]],
+      farmer_age >= far_lo_lo  & farmer_age <  near_lo_lo ~ pts[["far_below"]],
+      farmer_age >= peak_hi    & farmer_age <  near_hi_hi ~ pts[["near_above"]],
+      farmer_age >= near_hi_hi & farmer_age <  far_hi_hi  ~ pts[["far_above"]],
+      TRUE                                                ~ pts[["extreme"]]
+    )
+  }
+}
+
+# Reference age-score function: peak 55, decreasing scores in flanking bands.
+score_age_default <- make_score_age(peak_center = 55, peak_width = 5,
+                                    profile = "decreasing")
+
+# --- Composite score -------------------------------------------------------
+# Compute composite adoption score with arbitrary segment points, component
+# weights, and component-score functions. The scale-potential score consumes
+# land_entry_size (the per-farmer entry commitment); the segment score uses
+# segment_final; the other components use income_increment (economic),
+# exp_total_per_mz_annual (improvement), and age (age).
+compute_composite_score <- function(df,
+                                    segment_points,
+                                    weights_vec,
+                                    score_econ  = score_economic_fn,
+                                    score_impr  = score_improvement_fn,
+                                    score_scale = score_scale_fn,
+                                    score_age   = score_age_default) {
+  df |>
+    mutate(
+      .s_seg = score_segment_fn(segment_final, segment_points),
+      .s_eco = score_econ(income_increment),
+      .s_imp = score_impr(exp_total_per_mz_annual),
+      .s_sca = score_scale(land_entry_size),
+      .s_age = score_age(farmer_age),
+      adoption_score =
+        .s_seg * weights_vec[["segment"]]     +
+        .s_eco * weights_vec[["economic"]]    +
+        .s_imp * weights_vec[["improvement"]] +
+        .s_sca * weights_vec[["scale"]]       +
+        .s_age * weights_vec[["age"]]
+    )
+}
+```
+
+## D7. Cohort and Trajectory Helpers
+
+The binary cohort definition admits the prefix of ranked farmers whose cumulative basal production reaches the coverage threshold, with full conversion ($r = 1$) for every admitted farmer. The continuous cohort definition uses per-farmer conversion ratios governed by the profile-stratified sigmoid curves, modulating the effective contribution of each admitted farmer.
+
+```{r}
+#| label: d7-helpers-cohort
+
+# =============================================================================
+# D7. Cohort and Trajectory Helpers
+# =============================================================================
+
+# Binary cohort composition at coverage p_target. Reports per-segment
+# absolute farmer counts and the overall trimmed-mean land within the cohort.
+cohort_composition_at_p <- function(df_ranked, p_target) {
+  total_basal <- sum(df_ranked$basal_weighted, na.rm = TRUE)
+  cum_basal   <- cumsum(df_ranked$basal_weighted)
+  threshold   <- p_target * total_basal
+  admitted    <- df_ranked[cum_basal <= threshold, , drop = FALSE]
+
+  if (nrow(admitted) == 0) {
+    return(tibble(
+      p     = p_target,
+      N_OPV = 0, N_Low = 0, N_Mid = 0, N_High = 0,
+      land_overall_mz = NA_real_
+    ))
+  }
+
+  w   <- admitted$weight_calibrated
+  seg <- admitted$segment_final
+  # Under the binary model, every admitted farmer has full conversion
+  # (r = 1), so biofortified area equals total maize area.
+  land_biofortified <- admitted$land_wtcorn
+
+  N_per_seg <- function(s) sum(w[seg == s])
+
+  tibble(
+    p     = p_target,
+    N_OPV = N_per_seg("OPV/Criollo"),
+    N_Low = N_per_seg("Low"),
+    N_Mid = N_per_seg("Mid"),
+    N_High = N_per_seg("High"),
+    land_overall_mz = trimmed_mean_p5p95(land_biofortified, w)
+  )
+}
+
+# Binary trajectory over the full coverage grid
+trajectory_binary <- function(df_ranked, grid = p_grid) {
+  map_dfr(grid, ~ cohort_composition_at_p(df_ranked, .x))
+}
+
+# Continuous trajectory using per-profile conversion curves
+trajectory_continuous <- function(df_scored, p_grid_use,
+                                  k_S_use, k_M_use, k_L_use,
+                                  floor_S_use, floor_M_use, floor_L_use) {
+  map_dfr(p_grid_use, function(pv) {
+    r_i <- apply_adoption_curve(
+      pv, df_scored$p_entry, df_scored$profile,
+      floor_S = floor_S_use,
+      floor_M = floor_M_use,
+      floor_L = floor_L_use,
+      k_S = k_S_use, k_M = k_M_use, k_L = k_L_use
+    )
+    admitted_idx <- which(r_i > 0)
+    if (length(admitted_idx) == 0) {
+      return(tibble(
+        p     = pv,
+        N_OPV = 0, N_Low = 0, N_Mid = 0, N_High = 0,
+        land_overall_mz = NA_real_
+      ))
+    }
+    w_eff <- df_scored$weight_calibrated[admitted_idx] * r_i[admitted_idx]
+    seg   <- df_scored$segment_final[admitted_idx]
+    land  <- df_scored$land_wtcorn[admitted_idx]
+    land_biofortified <- land * r_i[admitted_idx]
+    w_pop <- df_scored$weight_calibrated[admitted_idx]
+
+    N_per_seg <- function(s) sum(w_eff[seg == s])
+
+    tibble(
+      p     = pv,
+      N_OPV = N_per_seg("OPV/Criollo"),
+      N_Low = N_per_seg("Low"),
+      N_Mid = N_per_seg("Mid"),
+      N_High = N_per_seg("High"),
+      land_overall_mz = trimmed_mean_p5p95(land_biofortified, w_pop)
+    )
+  })
+}
+```
+
+## D8. MAD Calibration Distance
+
+The calibration distance between a modelled trajectory and the anchor set is computed as a relative mean absolute deviation aggregated across two components: farmer counts per segment and overall biofortified land. The implementation aligns the trajectory grid and the anchor grid through an explicit integer key (coverage multiplied by 1000 and rounded), removing dependence on floating-point equality between the two grids.
+
+$$
+\text{MAD}_{\text{global}} = \frac{1}{|\mathcal{S}|} \sum_{p \in \mathcal{P}} w_p \sum_{s \in \mathcal{S}} \frac{\left| N^{model}_{s,p} - N^{anchor}_{s,p} \right|}{N^{anchor}_{s,p} + 1} + \sum_{p \in \mathcal{P}} w_p \frac{\left| \bar{L}^{bio,model}(p) - \bar{L}^{bio,anchor}(p) \right|}{\bar{L}^{bio,anchor}(p) + 0.01}
+$$
+
+where `|S| = 4` is the number of segments.
+
+```{r}
+#| label: d8-mad-function
+
+# =============================================================================
+# D8. MAD Calibration Distance Function
+# =============================================================================
+
+mad_vs_anchors <- function(traj,
+                           anchors_f  = anchors_farmers,
+                           anchors_l  = anchors_land,
+                           weights_a  = anchor_weights,
+                           eps_count  = 1,
+                           eps_land   = 0.01,
+                           n_segments = 4) {
+
+  key <- function(x) round(x * 1000)
+
+  traj_keyed <- traj |>
+    mutate(p_key = key(p)) |>
+    select(p_key, N_OPV, N_Low, N_Mid, N_High, land_overall_mz)
+
+  anch_f_keyed <- anchors_f |>
+    mutate(p_key = key(p_anchor)) |>
+    select(p_key, N_OPV, N_Low, N_Mid, N_High) |>
+    rename_with(~ paste0(.x, "_anc"), -p_key)
+
+  anch_l_keyed <- anchors_l |>
+    mutate(p_key = key(p_anchor)) |>
+    select(p_key, land_overall_mz) |>
+    rename(land_overall_mz_anc = land_overall_mz)
+
+  w_keyed <- weights_a |>
+    mutate(p_key = key(p_anchor)) |>
+    select(p_key, w_p)
+
+  joined <- anch_f_keyed |>
+    inner_join(anch_l_keyed, by = "p_key") |>
+    inner_join(w_keyed,      by = "p_key") |>
+    inner_join(traj_keyed,   by = "p_key") |>
+    arrange(p_key)
+
+  dev_seg <- abs(joined$N_OPV  - joined$N_OPV_anc)  / (joined$N_OPV_anc  + eps_count) +
+             abs(joined$N_Low  - joined$N_Low_anc)  / (joined$N_Low_anc  + eps_count) +
+             abs(joined$N_Mid  - joined$N_Mid_anc)  / (joined$N_Mid_anc  + eps_count) +
+             abs(joined$N_High - joined$N_High_anc) / (joined$N_High_anc + eps_count)
+  mad_farmers <- sum(joined$w_p * dev_seg, na.rm = TRUE)
+
+  dev_land <- abs(joined$land_overall_mz - joined$land_overall_mz_anc) /
+              (joined$land_overall_mz_anc + eps_land)
+  mad_land <- sum(joined$w_p * dev_land, na.rm = TRUE)
+
+  mad_global <- mad_farmers / n_segments + mad_land
+
+  list(
+    mad_farmers = mad_farmers,
+    mad_land    = mad_land,
+    mad_global  = mad_global
+  )
+}
+```
+
+---
+
+# Phase E: Scoring Sensitivity Sweeps
+
+This phase determines the scoring configuration through three sequential axes. Each subsequent axis inherits the best configuration from the previous one, so the recommended configuration emerges from a chain of univariate optima on the binary saturation model.
+
+## E1. Sweep Setup
+
+The univariate scoring sweeps share a common evaluation frame: each variant alters one component while the others are held at their reference defaults. The segment scheme and component weights are held at the production baseline during the heuristic sweep.
+
+```{r}
+#| label: e1-sweep-frame
+
+# =============================================================================
+# E1. Common Frame for Univariate Heuristic Sweeps
+# =============================================================================
+
+# Reference segment points and component weights for E2 sweeps
+seg_points_ref <- c(Low = 100, OPV = 80, Mid = 40, High = 10)
+weights_ref    <- c(
+  segment     = 0.40,
+  economic    = 0.31,
+  improvement = 0.14,
+  scale       = 0.08,
+  age         = 0.07
+)
+
+sweep_one_component <- function(variant_specs, component_name) {
+  map_dfr(names(variant_specs), function(vn) {
+    spec      <- variant_specs[[vn]]
+    overrides <- spec$score_fn_overrides
+
+    df_scored_v <- df_farmers |>
+      compute_composite_score(
+        seg_points_ref,
+        weights_ref,
+        score_econ  = overrides$score_econ_fn  %||% score_economic_fn,
+        score_impr  = overrides$score_impr_fn  %||% score_improvement_fn,
+        score_scale = overrides$score_scale_fn %||% score_scale_fn,
+        score_age   = overrides$score_age_fn   %||% score_age_default
+      ) |>
+      mutate(basal_weighted = total_production * weight_calibrated) |>
+      arrange(desc(adoption_score))
+
+    traj <- trajectory_binary(df_scored_v)
+    res  <- mad_vs_anchors(traj)
+
+    tibble(
+      component   = component_name,
+      variant     = vn,
+      label       = spec$label,
+      mad_farmers = res$mad_farmers,
+      mad_land    = res$mad_land,
+      mad_global  = res$mad_global
+    )
+  })
+}
+```
+
+## E2. Sensitivity to Scoring Heuristics
+
+Each of the four non-segment scoring components is varied independently while the others are held at their reference defaults. The univariate best variant of each component is selected on minimum global MAD.
+
+### E2.1 score_economic
+
+The economic-benefit score uses three percentile breakpoints over `income_increment` to assign farmers to four bands (with an additional fifth band for non-positive increments). Three variants of the breakpoint vector are evaluated.
+
+```{r}
+#| label: e2-1-econ-sweep
+
+# =============================================================================
+# E2.1 score_economic Sensitivity
+# =============================================================================
+
+variants_econ <- list(
+  econ_default = list(
+    label = "Default (P25/P50/P75)",
+    score_fn_overrides = list(
+      score_econ_fn = function(x) score_economic_fn(x, c(0.25, 0.50, 0.75))
+    )
+  ),
+  econ_soft = list(
+    label = "Soft (P20/P40/P60)",
+    score_fn_overrides = list(
+      score_econ_fn = function(x) score_economic_fn(x, c(0.20, 0.40, 0.60))
+    )
+  ),
+  econ_demanding = list(
+    label = "Demanding (P50/P70/P90)",
+    score_fn_overrides = list(
+      score_econ_fn = function(x) score_economic_fn(x, c(0.50, 0.70, 0.90))
+    )
+  )
+)
+
+sweep_e2_econ <- sweep_one_component(variants_econ, "score_economic") |>
+  arrange(mad_global)
+```
+
+```{r}
+#| label: tbl-e2-1-econ
+#| tbl-cap: "Sensitivity to score_economic Breakpoints"
+
+export(
+  sweep_e2_econ,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e2_1_econ_sweep.rds"))
+)
+
+sweep_e2_econ |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_economic breakpoints",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+### E2.2 score_improvement
+
+The improvement-potential score uses four percentile breakpoints over `exp_total_per_mz_annual` (inverse direction: lower expenditure indicates higher improvement potential). Three variants of the breakpoint vector are evaluated.
+
+```{r}
+#| label: e2-2-impr-sweep
+
+# =============================================================================
+# E2.2 score_improvement Sensitivity
+# =============================================================================
+
+variants_impr <- list(
+  impr_default = list(
+    label = "Default (P25/P50/P75/P90)",
+    score_fn_overrides = list(
+      score_impr_fn = function(x)
+        score_improvement_fn(x, c(0.25, 0.50, 0.75, 0.90))
+    )
+  ),
+  impr_soft = list(
+    label = "Soft (P30/P60/P80/P95)",
+    score_fn_overrides = list(
+      score_impr_fn = function(x)
+        score_improvement_fn(x, c(0.30, 0.60, 0.80, 0.95))
+    )
+  ),
+  impr_demanding = list(
+    label = "Demanding (P10/P25/P50/P75)",
+    score_fn_overrides = list(
+      score_impr_fn = function(x)
+        score_improvement_fn(x, c(0.10, 0.25, 0.50, 0.75))
+    )
+  )
+)
+
+sweep_e2_impr <- sweep_one_component(variants_impr, "score_improvement") |>
+  arrange(mad_global)
+```
+
+```{r}
+#| label: tbl-e2-2-impr
+#| tbl-cap: "Sensitivity to score_improvement Breakpoints"
+
+export(
+  sweep_e2_impr,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e2_2_impr_sweep.rds"))
+)
+
+sweep_e2_impr |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_improvement breakpoints",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+### E2.3 score_scale
+
+The scale-potential score uses three percentile breakpoints over `land_entry_size`. Three variants of the breakpoint vector are evaluated.
+
+```{r}
+#| label: e2-3-scale-sweep
+
+# =============================================================================
+# E2.3 score_scale Sensitivity
+# =============================================================================
+
+variants_scale <- list(
+  scale_default = list(
+    label = "Default (P25/P50/P75)",
+    score_fn_overrides = list(
+      score_scale_fn = function(x) score_scale_fn(x, c(0.25, 0.50, 0.75))
+    )
+  ),
+  scale_soft = list(
+    label = "Soft (P33/P66/P90)",
+    score_fn_overrides = list(
+      score_scale_fn = function(x) score_scale_fn(x, c(0.33, 0.66, 0.90))
+    )
+  ),
+  scale_demanding = list(
+    label = "Demanding (P50/P75/P90)",
+    score_fn_overrides = list(
+      score_scale_fn = function(x) score_scale_fn(x, c(0.50, 0.75, 0.90))
+    )
+  )
+)
+
+sweep_e2_scale <- sweep_one_component(variants_scale, "score_scale") |>
+  arrange(mad_global)
+```
+
+```{r}
+#| label: tbl-e2-3-scale
+#| tbl-cap: "Sensitivity to score_scale Breakpoints"
+
+export(
+  sweep_e2_scale,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e2_3_scale_sweep.rds"))
+)
+
+sweep_e2_scale |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_scale breakpoints",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+### E2.4 score_age
+
+The age-score is parameterised on three axes: `peak_center` (centre of the score-100 band: 45, 50, 55), `peak_width` (half-width: 5 or 10), and `profile` (distribution of secondary scores: `decreasing`, `young_priority`, `elder_priority`, `neutral_edges`). Twelve representative variants are evaluated.
+
+```{r}
+#| label: e2-4-age-sweep
+
+# =============================================================================
+# E2.4 score_age Sensitivity (Three-Axis Parameterisation)
+# =============================================================================
+
+age_variants_grid <- bind_rows(
+  tibble(peak_center = 45, peak_width = 5,  profile = "decreasing"),
+  tibble(peak_center = 45, peak_width = 10, profile = "decreasing"),
+  tibble(peak_center = 45, peak_width = 5,  profile = "young_priority"),
+  tibble(peak_center = 50, peak_width = 5,  profile = "decreasing"),
+  tibble(peak_center = 50, peak_width = 10, profile = "decreasing"),
+  tibble(peak_center = 50, peak_width = 5,  profile = "elder_priority"),
+  tibble(peak_center = 50, peak_width = 5,  profile = "neutral_edges"),
+  tibble(peak_center = 55, peak_width = 5,  profile = "decreasing"),
+  tibble(peak_center = 55, peak_width = 10, profile = "decreasing"),
+  tibble(peak_center = 55, peak_width = 5,  profile = "elder_priority"),
+  tibble(peak_center = 55, peak_width = 5,  profile = "young_priority"),
+  tibble(peak_center = 55, peak_width = 10, profile = "neutral_edges")
+) |>
+  mutate(
+    variant_name = paste0("age_", peak_center, "_w", peak_width,
+                          "_", profile),
+    label = paste0("Peak ", peak_center,
+                   " \u00b1", peak_width,
+                   " | ", profile)
+  )
+
+variants_age <- map(seq_len(nrow(age_variants_grid)), function(i) {
+  spec <- age_variants_grid[i, ]
+  list(
+    label = spec$label,
+    score_fn_overrides = list(
+      score_age_fn = make_score_age(
+        peak_center = spec$peak_center,
+        peak_width  = spec$peak_width,
+        profile     = spec$profile
+      )
+    )
+  )
+}) |>
+  set_names(age_variants_grid$variant_name)
+
+sweep_e2_age <- sweep_one_component(variants_age, "score_age") |>
+  arrange(mad_global)
+```
+
+```{r}
+#| label: tbl-e2-4-age
+#| tbl-cap: "Sensitivity to score_age (Three-Axis Parameterisation)"
+
+export(
+  sweep_e2_age,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e2_4_age_sweep.rds"))
+)
+
+sweep_e2_age |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to score_age (three-axis parameterisation)",
+    subtitle = "Other components held at reference defaults; ordered by global MAD"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+### E2.5 Selected Heuristic Configuration
+
+The univariate best variant of each component is selected by minimum global MAD within each sweep. The four selected variants are consolidated into the heuristic configuration carried forward to E3 (segment schemes) and E4 (component weights).
+
+```{r}
+#| label: e2-5-best-heuristics
+
+# =============================================================================
+# E2.5 Select Best Heuristic per Component
+# =============================================================================
+
+best_heuristics <- bind_rows(
+  sweep_e2_econ  |> slice(1) |> mutate(component = "score_economic"),
+  sweep_e2_impr  |> slice(1) |> mutate(component = "score_improvement"),
+  sweep_e2_scale |> slice(1) |> mutate(component = "score_scale"),
+  sweep_e2_age   |> slice(1) |> mutate(component = "score_age")
+)
+
+# Recover the concrete override functions for downstream use
+best_econ_fn  <- variants_econ[[best_heuristics$variant[
+  best_heuristics$component == "score_economic"
+]]]$score_fn_overrides$score_econ_fn
+
+best_impr_fn  <- variants_impr[[best_heuristics$variant[
+  best_heuristics$component == "score_improvement"
+]]]$score_fn_overrides$score_impr_fn
+
+best_scale_fn <- variants_scale[[best_heuristics$variant[
+  best_heuristics$component == "score_scale"
+]]]$score_fn_overrides$score_scale_fn
+
+best_age_fn   <- variants_age[[best_heuristics$variant[
+  best_heuristics$component == "score_age"
+]]]$score_fn_overrides$score_age_fn
+```
+
+```{r}
+#| label: tbl-e2-5-best-heuristics
+#| tbl-cap: "Selected Heuristic Configuration (Univariate Best per Component)"
+
+export(
+  best_heuristics,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e2_5_best_heuristics.rds"))
+)
+
+best_heuristics |>
+  select(component, variant, label, mad_farmers, mad_land, mad_global) |>
+  gt() |>
+  tab_header(
+    title    = "Selected heuristic configuration (univariate best per component)",
+    subtitle = "Variants minimising global MAD within each component sweep"
+  ) |>
+  cols_label(
+    component   = "Component",
+    variant     = "Variant",
+    label       = "Label",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+## E3. Sensitivity to Segment-Priority Schemes
+
+The segment-priority sweep explores two families of cardinal configurations. A *steep* family (gap of 20 or more points between consecutive segments) tests whether the segment component, treated as the dominant input to the composite score, reproduces the empirical anchor pattern on its own. A *compressed* family (gap of 5 to 15 points between consecutive segments) tests an alternative architecture in which the segment component provides a weak categorical prior and the discrimination among farmers is carried by the economic, improvement, scale, age, and risk-aversion components.
+
+The heuristic configuration from E2 is held fixed during this sweep.
+
+```{r}
+#| label: e3-segment-schemes
+
+# =============================================================================
+# E3. Segment-Priority Schemes Sweep
+# =============================================================================
+
+segment_schemes <- list(
+  # --- Family A: steep schemes ---
+  lmh_steep    = c(Low = 100, Mid = 75, High = 50, OPV = 20),
+  lmh_shallow  = c(Low = 100, Mid = 85, High = 70, OPV = 40),
+  lhm_steep    = c(Low = 100, High = 65, Mid = 60, OPV = 50),
+  lhm_shallow  = c(Low = 100, High = 85, Mid = 70, OPV = 45),
+  lom_default  = c(Low = 100, OPV = 80, Mid = 40, High = 10),
+  lmo_balanced = c(Low = 100, Mid = 75, OPV = 50, High = 20),
+
+  # --- Family B: compressed schemes ---
+  flat_low_opv   = c(Low = 70, OPV = 60, Mid = 50, High = 45),
+  low_opv_paired = c(Low = 75, OPV = 70, Mid = 50, High = 30),
+  flat_lo_demote = c(Low = 80, OPV = 70, Mid = 55, High = 40),
+  fully_flat     = c(Low = 60, OPV = 55, Mid = 50, High = 45),
+  flat_lhm       = c(Low = 65, High = 60, Mid = 55, OPV = 50)
+)
+
+sweep_e3 <- map_dfr(names(segment_schemes), function(scheme_name) {
+  pts <- segment_schemes[[scheme_name]]
+
+  df_scored_v <- df_farmers |>
+    compute_composite_score(
+      pts, weights_ref,
+      score_econ  = best_econ_fn,
+      score_impr  = best_impr_fn,
+      score_scale = best_scale_fn,
+      score_age   = best_age_fn
+    ) |>
+    mutate(basal_weighted = total_production * weight_calibrated) |>
+    arrange(desc(adoption_score))
+
+  traj <- trajectory_binary(df_scored_v)
+  res  <- mad_vs_anchors(traj)
+
+  tibble(
+    scheme      = scheme_name,
+    Low         = pts[["Low"]],
+    OPV         = pts[["OPV"]],
+    Mid         = pts[["Mid"]],
+    High        = pts[["High"]],
+    mad_farmers = res$mad_farmers,
+    mad_land    = res$mad_land,
+    mad_global  = res$mad_global
+  )
+}) |>
+  arrange(mad_global)
+```
+
+```{r}
+#| label: tbl-e3-segment-schemes
+#| tbl-cap: "Sensitivity to Segment-Priority Schemes"
+
+export(
+  sweep_e3,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e3_segment_schemes.rds"))
+)
+
+sweep_e3 |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to segment-priority schemes",
+    subtitle = "Best heuristics from E2 fixed; component weights at reference; ordered by global MAD"
+  ) |>
+  cols_label(
+    scheme      = "Scheme",
+    Low         = "Low",
+    OPV         = "OPV",
+    Mid         = "Mid",
+    High        = "High",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(Low, OPV, Mid, High), decimals = 0) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+
+# Capture the best segment scheme for downstream sweeps
+best_scheme_name <- sweep_e3$scheme[1]
+best_pts <- segment_schemes[[best_scheme_name]]
+```
+
+## E4. Sensitivity to Component Weights
+
+The component weights are the relative contributions of the five scoring components to the composite score. Holding the heuristic configuration from E2 and the segment scheme from E3 fixed, the weight vector is varied across plausible neighbourhoods of the reference baseline.
+
+The grid is constructed by varying the segment weight on a coarse range. The age and scale weights are held at their reference values (0.07 and 0.08), so the perturbation operates primarily on the segment / economic / improvement balance. The segment weight is bounded at 0.60 from above: a segment weight above this threshold produces a ranking in which the categorical segment classification dominates the composite ranking to the point where intra-segment variation in the other components becomes irrelevant.
+
+```{r}
+#| label: e4-weight-grid
+
+# =============================================================================
+# E4. Component Weight Grid
+# =============================================================================
+
+weight_grid <- expand_grid(
+  w_segment              = c(0.40, 0.50, 0.60),
+  econ_share_of_residual = c(0.50, 0.65, 0.80)
+) |>
+  mutate(
+    residual      = 1 - w_segment - 0.08 - 0.07,
+    w_economic    = round(econ_share_of_residual * residual, 3),
+    w_improvement = round(residual - w_economic, 3),
+    w_scale       = 0.08,
+    w_age         = 0.07
+  ) |>
+  filter(residual > 0) |>
+  select(-residual, -econ_share_of_residual)
+
+sweep_e4 <- pmap_dfr(weight_grid, function(w_segment, w_economic,
+                                           w_improvement, w_scale, w_age) {
+  weights_v <- c(
+    segment     = w_segment,
+    economic    = w_economic,
+    improvement = w_improvement,
+    scale       = w_scale,
+    age         = w_age
+  )
+
+  df_scored_v <- df_farmers |>
+    compute_composite_score(
+      best_pts, weights_v,
+      score_econ  = best_econ_fn,
+      score_impr  = best_impr_fn,
+      score_scale = best_scale_fn,
+      score_age   = best_age_fn
+    ) |>
+    mutate(basal_weighted = total_production * weight_calibrated) |>
+    arrange(desc(adoption_score))
+
+  traj <- trajectory_binary(df_scored_v)
+  res  <- mad_vs_anchors(traj)
+
+  tibble(
+    w_segment     = w_segment,
+    w_economic    = w_economic,
+    w_improvement = w_improvement,
+    w_scale       = w_scale,
+    w_age         = w_age,
+    mad_farmers   = res$mad_farmers,
+    mad_land      = res$mad_land,
+    mad_global    = res$mad_global
+  )
+}) |>
+  arrange(mad_global)
+```
+
+```{r}
+#| label: tbl-e4-weight-sweep
+#| tbl-cap: "Sensitivity to Component Weights"
+
+export(
+  sweep_e4,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_e4_weight_sweep.rds"))
+)
+
+sweep_e4 |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to component weights",
+    subtitle = "Best heuristics from E2 and best segment scheme from E3 fixed; ordered by global MAD"
+  ) |>
+  cols_label(
+    w_segment     = "w_seg",
+    w_economic    = "w_econ",
+    w_improvement = "w_impr",
+    w_scale       = "w_scale",
+    w_age         = "w_age",
+    mad_farmers   = "MAD farmers",
+    mad_land      = "MAD land (mz)",
+    mad_global    = "MAD global"
+  ) |>
+  fmt_number(columns = c(w_segment, w_economic, w_improvement,
+                         w_scale, w_age),
+             decimals = 3) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+
+# Capture the best weight vector
+best_weights <- c(
+  segment     = sweep_e4$w_segment[1],
+  economic    = sweep_e4$w_economic[1],
+  improvement = sweep_e4$w_improvement[1],
+  scale       = sweep_e4$w_scale[1],
+  age         = sweep_e4$w_age[1]
+)
+```
+
+## E5. Recommended Scoring Configuration
+
+The recommended scoring configuration combines the best heuristics from E2, the best segment scheme from E3, and the best component-weight vector from E4. This configuration is carried forward to Phase F as the base scoring on which the risk-aversion penalty is applied.
+
+```{r}
+#| label: e5-recommended-scoring
+
+# =============================================================================
+# E5. Recommended Scoring Configuration
+# =============================================================================
+
+df_scoring_best <- df_farmers |>
+  compute_composite_score(
+    best_pts, best_weights,
+    score_econ  = best_econ_fn,
+    score_impr  = best_impr_fn,
+    score_scale = best_scale_fn,
+    score_age   = best_age_fn
+  ) |>
+  mutate(basal_weighted = total_production * weight_calibrated) |>
+  arrange(desc(adoption_score))
+
+traj_e5 <- trajectory_binary(df_scoring_best)
+mad_e5  <- mad_vs_anchors(traj_e5)
+```
+
+---
+
+# Phase F: Risk-Aversion Sweep
+
+The risk-aversion term is constructed as an additive penalty on the adoption score from Phase E. The penalty depends on four drivers: baseline yield, income-increment ratio, land entry size, and projected loss. The first three drivers compete for a unit weight budget through the sweep coefficients `alpha_y`, `alpha_r`, `alpha_L`. The projected-loss coefficient `alpha_loss` is held fixed at 1.0, reflecting the structural rather than calibrated nature of this driver. The penalty is bounded in `[0, 100]` through a logistic transformation; the steepness `beta` and the risk weight `w_R` are explored across a focused grid. Two variants of the driver representation are evaluated in parallel: departmental z-scores (Z) and absolute values normalised via P1-P99 (A).
+
+## F1. Compute Risk Drivers
+
+```{r}
+#| label: f1-risk-drivers
+
+# =============================================================================
+# F1. Compute Risk Drivers (Both Variants)
+# =============================================================================
+
+df_risk <- df_scoring_best |>
+  mutate(
+    income_baseline_proxy  = pmax(value_total_economic, 1e-3),
+    income_increment_ratio = income_increment / income_baseline_proxy,
+    land_entry_log         = log1p(land_entry_size),
+    loss_score             = case_when(
+      income_increment <  -500 ~ 100L,
+      income_increment <  -200 ~  75L,
+      income_increment <     0 ~  50L,
+      TRUE                     ~   0L
+    )
+  )
+
+# --- Variant Z: departmental z-scores --------------------------------------
+df_risk <- df_risk |>
+  add_dept_zscore("yield_wtcorn_qq",        "yield_zscore_risk") |>
+  add_dept_zscore("income_increment_ratio", "income_ratio_zscore_risk") |>
+  add_dept_zscore("land_entry_log",         "land_zscore_risk") |>
+  add_dept_zscore("loss_score",             "loss_zscore_risk")
+
+# --- Variant A: absolute values normalised via P1-P99 ----------------------
+weighted_quantiles <- function(x, w, probs) {
+  o   <- order(x)
+  xs  <- x[o]
+  ws  <- w[o]
+  cw  <- cumsum(ws) / sum(ws)
+  map_dbl(probs, ~ xs[which.min(abs(cw - .x))])
+}
+
+scale_p1_p99 <- function(x, w) {
+  qs <- weighted_quantiles(x, w, c(0.01, 0.50, 0.99))
+  half_range <- (qs[3] - qs[1]) / 2
+  if (half_range <= 0) return(rep(0, length(x)))
+  (x - qs[2]) / half_range
+}
+
+df_risk <- df_risk |>
+  mutate(
+    yield_abs_risk        = scale_p1_p99(yield_wtcorn_qq,
+                                         weight_calibrated),
+    income_ratio_abs_risk = scale_p1_p99(income_increment_ratio,
+                                         weight_calibrated),
+    land_abs_risk         = scale_p1_p99(land_entry_log,
+                                         weight_calibrated),
+    loss_abs_risk         = scale_p1_p99(loss_score,
+                                         weight_calibrated)
+  )
+```
+
+## F2. Penalty Function and Sweep Grid
+
+The penalty is a weighted linear combination of the four drivers, passed through a logistic transformation to map to `[0, 100]`. The first three drivers share a unit weight budget; the projected-loss driver is added with the fixed coefficient `alpha_loss = 1.0`.
+
+```{r}
+#| label: f2-penalty-setup
+
+# =============================================================================
+# F2. Penalty Function and Sweep Grid
+# =============================================================================
+
+compute_risk_penalty <- function(df, alpha_y, alpha_r, alpha_L,
+                                 beta = 1.0, variant = "z",
+                                 alpha_loss = ALPHA_LOSS) {
+  if (variant == "z") {
+    z_combo <- alpha_y    * df$yield_zscore_risk        +
+               alpha_r    * df$income_ratio_zscore_risk +
+               alpha_L    * df$land_zscore_risk         +
+               alpha_loss * df$loss_zscore_risk
+  } else {
+    z_combo <- alpha_y    * df$yield_abs_risk        +
+               alpha_r    * df$income_ratio_abs_risk +
+               alpha_L    * df$land_abs_risk         +
+               alpha_loss * df$loss_abs_risk
+  }
+  100 * (1 / (1 + exp(-beta * z_combo)))
+}
+
+# Sensitivity grid: alpha_y + alpha_r + alpha_L = 1 (unit budget),
+# crossed with beta and w_R, expanded across both variants.
+risk_alpha_grid <- expand_grid(
+  alpha_y = c(0.0, 0.1, 0.2, 0.3),
+  alpha_r = c(0.0, 0.1, 0.2, 0.3)
+) |>
+  mutate(alpha_L = 1.0 - alpha_y - alpha_r) |>
+  filter(alpha_L >= -1e-9, alpha_L <= 1.0 + 1e-9) |>
+  mutate(alpha_L = round(pmax(0, pmin(1, alpha_L)), 1)) |>
+  distinct(alpha_y, alpha_r, alpha_L) |>
+  crossing(
+    beta = c(1.0, 1.5, 2.0, 2.5),
+    w_R  = c(0.30, 0.40)
+  )
+
+risk_sweep_grid <- risk_alpha_grid |>
+  crossing(variant = c("z", "a"))
+```
+
+## F3. Risk-Aversion Sweep (Parallel via mirai)
+
+The sweep is executed in parallel through a `mirai` daemon pool. Each task is fully self-contained: helper functions are defined inside the task closure, and a slim copy of the risk-driver dataset plus the calibration anchors travel through `.args` (serialised once at pool creation).
+
+```{r}
+#| label: f3-risk-sweep
+
+# =============================================================================
+# F3. Risk-Aversion Sweep
+# =============================================================================
+
+set.seed(789)
+
+sweep_f3 <- local({
+
+  df_risk_slim <- df_risk |>
+    select(
+      yield_zscore_risk, income_ratio_zscore_risk,
+      land_zscore_risk, loss_zscore_risk,
+      yield_abs_risk, income_ratio_abs_risk,
+      land_abs_risk, loss_abs_risk,
+      adoption_score,
+      basal_weighted, weight_calibrated, segment_final, land_wtcorn
+    )
+
+  physical_cores <- parallel::detectCores(logical = FALSE)
+  n_daemons      <- min(nrow(risk_sweep_grid),
+                        max(1, physical_cores - 3))
+  mirai_profile  <- "sweep_f3_risk"
+
+  mirai::daemons(n_daemons, .compute = mirai_profile)
+  on.exit(mirai::daemons(0, .compute = mirai_profile), add = TRUE)
+
+  mirai::everywhere(
+    {
+      suppressPackageStartupMessages({
+        library(dplyr)
+        library(purrr)
+        library(Hmisc)
+      })
+      if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+        RhpcBLASctl::blas_set_num_threads(1)
+        RhpcBLASctl::omp_set_num_threads(1)
+      }
+    },
+    .compute = mirai_profile
+  )
+
+  cells <- pmap(risk_sweep_grid, function(alpha_y, alpha_r, alpha_L,
+                                          beta, w_R, variant) {
+    list(alpha_y = alpha_y, alpha_r = alpha_r, alpha_L = alpha_L,
+         beta = beta, w_R = w_R, variant = variant)
+  })
+
+  m <- mirai::mirai_map(
+    .x = cells,
+    .f = function(cell, df_risk, p_grid,
+                  anchors_farmers, anchors_land, anchor_weights) {
+
+      trimmed_mean_p5p95 <- function(values, weights) {
+        ok <- !is.na(values) & !is.na(weights) & weights > 0
+        if (sum(ok) < 2) return(NA_real_)
+        v <- values[ok]; w <- weights[ok]
+        q <- Hmisc::wtd.quantile(v, weights = w, probs = c(0.05, 0.95))
+        keep <- v >= q[[1]] & v <= q[[2]]
+        if (!any(keep)) return(NA_real_)
+        sum(v[keep] * w[keep]) / sum(w[keep])
+      }
+
+      cohort_composition_at_p <- function(df_ranked, p_target) {
+        total_basal <- sum(df_ranked$basal_weighted, na.rm = TRUE)
+        cum_basal   <- cumsum(df_ranked$basal_weighted)
+        threshold   <- p_target * total_basal
+        admitted    <- df_ranked[cum_basal <= threshold, , drop = FALSE]
+        if (nrow(admitted) == 0) {
+          return(tibble(p = p_target,
+                        N_OPV = 0, N_Low = 0, N_Mid = 0, N_High = 0,
+                        land_overall_mz = NA_real_))
+        }
+        w <- admitted$weight_calibrated
+        seg <- admitted$segment_final
+        land_biofortified <- admitted$land_wtcorn
+        N_per_seg <- function(s) sum(w[seg == s])
+        tibble(
+          p     = p_target,
+          N_OPV = N_per_seg("OPV/Criollo"),
+          N_Low = N_per_seg("Low"),
+          N_Mid = N_per_seg("Mid"),
+          N_High = N_per_seg("High"),
+          land_overall_mz = trimmed_mean_p5p95(land_biofortified, w)
+        )
+      }
+
+      trajectory_binary <- function(df_ranked) {
+        map_dfr(p_grid, ~ cohort_composition_at_p(df_ranked, .x))
+      }
+
+      mad_vs_anchors_local <- function(traj) {
+        key <- function(x) round(x * 1000)
+        traj_keyed <- traj |>
+          mutate(p_key = key(p)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High, land_overall_mz)
+        anch_f_keyed <- anchors_farmers |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High) |>
+          rename_with(~ paste0(.x, "_anc"), -p_key)
+        anch_l_keyed <- anchors_land |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, land_overall_mz) |>
+          rename(land_overall_mz_anc = land_overall_mz)
+        w_keyed <- anchor_weights |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, w_p)
+        joined <- anch_f_keyed |>
+          inner_join(anch_l_keyed, by = "p_key") |>
+          inner_join(w_keyed,      by = "p_key") |>
+          inner_join(traj_keyed,   by = "p_key") |>
+          arrange(p_key)
+        dev_seg <- abs(joined$N_OPV  - joined$N_OPV_anc)  / (joined$N_OPV_anc  + 1) +
+                   abs(joined$N_Low  - joined$N_Low_anc)  / (joined$N_Low_anc  + 1) +
+                   abs(joined$N_Mid  - joined$N_Mid_anc)  / (joined$N_Mid_anc  + 1) +
+                   abs(joined$N_High - joined$N_High_anc) / (joined$N_High_anc + 1)
+        mad_farmers <- sum(joined$w_p * dev_seg, na.rm = TRUE)
+        dev_land <- abs(joined$land_overall_mz - joined$land_overall_mz_anc) /
+                    (joined$land_overall_mz_anc + 0.01)
+        mad_land <- sum(joined$w_p * dev_land, na.rm = TRUE)
+        list(mad_farmers = mad_farmers, mad_land = mad_land,
+             mad_global = mad_farmers / 4 + mad_land)
+      }
+
+      compute_risk_penalty <- function(df, alpha_y, alpha_r, alpha_L,
+                                       beta, variant) {
+        if (variant == "z") {
+          z_combo <- alpha_y * df$yield_zscore_risk +
+                     alpha_r * df$income_ratio_zscore_risk +
+                     alpha_L * df$land_zscore_risk +
+                     1.0     * df$loss_zscore_risk
+        } else {
+          z_combo <- alpha_y * df$yield_abs_risk +
+                     alpha_r * df$income_ratio_abs_risk +
+                     alpha_L * df$land_abs_risk +
+                     1.0     * df$loss_abs_risk
+        }
+        100 * (1 / (1 + exp(-beta * z_combo)))
+      }
+
+      pen <- compute_risk_penalty(
+        df_risk,
+        cell$alpha_y, cell$alpha_r, cell$alpha_L,
+        cell$beta, variant = cell$variant
+      )
+      df_alt <- df_risk |>
+        mutate(adoption_score_with_risk = adoption_score -
+                                          cell$w_R * pen) |>
+        arrange(desc(adoption_score_with_risk))
+      traj <- trajectory_binary(df_alt)
+      res  <- mad_vs_anchors_local(traj)
+      tibble(
+        variant     = cell$variant,
+        alpha_y     = cell$alpha_y,
+        alpha_r     = cell$alpha_r,
+        alpha_L     = cell$alpha_L,
+        beta        = cell$beta,
+        w_R         = cell$w_R,
+        mad_farmers = res$mad_farmers,
+        mad_land    = res$mad_land,
+        mad_global  = res$mad_global
+      )
+    },
+    .args = list(
+      df_risk         = df_risk_slim,
+      p_grid          = p_grid,
+      anchors_farmers = anchors_farmers,
+      anchors_land    = anchors_land,
+      anchor_weights  = anchor_weights
+    ),
+    .compute = mirai_profile
+  )
+
+  results <- m[]
+  errors  <- which(vapply(results, inherits, logical(1), "errorValue"))
+  if (length(errors) > 0) {
+    stop(sprintf("F3: %d/%d tasks failed. First error (task %d): %s",
+                 length(errors), length(results), errors[1],
+                 as.character(results[[errors[1]]])))
+  }
+
+  results |>
+    bind_rows() |>
+    arrange(mad_global)
+})
+```
+
+## F4. Top Risk Configurations per Variant
+
+```{r}
+#| label: tbl-f4-risk-top
+#| tbl-cap: "Top 5 Risk-Aversion Configurations per Driver Variant"
+
+export(
+  sweep_f3,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_f3_risk_sweep.rds"))
+)
+
+sweep_f3 |>
+  group_by(variant) |>
+  slice_head(n = 5) |>
+  ungroup() |>
+  arrange(variant, mad_global) |>
+  gt(groupname_col = "variant") |>
+  tab_header(
+    title    = "Top 5 risk-aversion configurations per variant",
+    subtitle = "Z = departmental z-scores; A = absolute values normalised via P1-P99"
+  ) |>
+  cols_label(
+    alpha_y     = "\u03b1_yield",
+    alpha_r     = "\u03b1_ratio",
+    alpha_L     = "\u03b1_land",
+    beta        = "\u03b2",
+    w_R         = "w_R",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(alpha_y, alpha_r, alpha_L, beta, w_R),
+             decimals = 2) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+## F5. Best Combined Configuration (Scoring + Risk)
+
+```{r}
+#| label: f5-best-combined
+
+# =============================================================================
+# F5. Extract Best Combined Configuration
+# =============================================================================
+
+best_risk_row     <- sweep_f3[1, ]
+best_risk_variant <- best_risk_row$variant
+
+best_pen <- compute_risk_penalty(
+  df_risk,
+  best_risk_row$alpha_y, best_risk_row$alpha_r, best_risk_row$alpha_L,
+  best_risk_row$beta, variant = best_risk_variant
+)
+
+df_combined_best <- df_risk |>
+  mutate(
+    risk_penalty            = best_pen,
+    adoption_score_combined = adoption_score -
+                              best_risk_row$w_R * risk_penalty,
+    basal_weighted          = total_production * weight_calibrated
+  ) |>
+  arrange(desc(adoption_score_combined))
+
+traj_f5 <- trajectory_binary(df_combined_best)
+mad_f5  <- mad_vs_anchors(traj_f5)
+```
+
+---
+
+# Phase G: Continuous Adoption Sweeps
+
+The continuous adoption model assigns each farmer to one of three behavioural profiles based on white-maize land area: small (S, near-binary adoption), medium (M, sigmoid adoption), and large (L, gradual adoption). The per-farmer conversion ratio `r_i(p)` depends on the farmer's profile and on the farmer's entry point `p_entry` in the global ranking. Three design axes are explored sequentially, with each axis inheriting the best configuration from the previous one: floor values (F), steepness coefficients (G), and profile cutoffs (H).
+
+Phase G inherits the combined scoring + risk configuration from Phase F.
+
+## G1. Setup p_entry and Initial Profile Assignment
+
+The per-farmer entry point is computed from the cumulative basal production under the combined ranking. The initial profile assignment uses a reference cutoff scheme based on empirical land percentiles; the cutoff sweep in G4 explores a refined grid that subsumes this reference.
+
+```{r}
+#| label: g1-p-entry-setup
+
+# =============================================================================
+# G1. Compute p_entry and Initial Profile Assignment
+# =============================================================================
+
+total_basal_combined <- sum(df_combined_best$basal_weighted, na.rm = TRUE)
+
+df_with_entry <- df_combined_best |>
+  mutate(
+    cum_basal = cumsum(basal_weighted),
+    p_entry   = pmax(0, (cum_basal - basal_weighted) / total_basal_combined)
+  )
+
+# Reference cutoffs from empirical land percentiles (used during G2 floor sweep)
+land_pcts_weighted <- function(df, qs) {
+  o <- order(df$land_wtcorn)
+  L <- df$land_wtcorn[o]
+  W <- df$weight_calibrated[o]
+  cw <- cumsum(W) / sum(W)
+  map_dbl(qs, ~ L[which.min(abs(cw - .x))])
+}
+
+land_p_ref <- land_pcts_weighted(df_with_entry, c(0.50, 0.85))
+cuts_ref   <- c(S_M = land_p_ref[1], M_L = land_p_ref[2])
+
+df_with_entry <- df_with_entry |>
+  mutate(
+    profile = case_when(
+      land_wtcorn <  cuts_ref[["S_M"]] ~ "S",
+      land_wtcorn <  cuts_ref[["M_L"]] ~ "M",
+      TRUE                              ~ "L"
+    )
+  )
+```
+
+## G2. Sweep — Floor Values per Profile
+
+The floor values determine the conversion ratio at the moment a farmer enters the ranking. They are explored first because the floor values exert the strongest influence on the cohort land-trimmed metric. The reference steepness configuration (`k_S = 12, k_M = 8, k_L = 4`) and the reference cutoff scheme are held during this sweep.
+
+```{r}
+#| label: g2-sweep-floors
+
+# =============================================================================
+# G2. Sweep - Floor Values per Profile
+# =============================================================================
+
+floor_grid <- expand_grid(
+  floor_S = c(0.85, 0.95),
+  floor_M = c(0.40, 0.50),
+  floor_L = c(0.02, 0.05, 0.10, 0.20)
+)
+
+set.seed(789)
+
+sweep_g2 <- local({
+
+  df_entry_slim <- df_with_entry |>
+    select(p_entry, profile, weight_calibrated, segment_final, land_wtcorn)
+
+  physical_cores <- parallel::detectCores(logical = FALSE)
+  n_daemons      <- min(nrow(floor_grid), max(1, physical_cores - 3))
+  mirai_profile  <- "sweep_g2_floors"
+
+  mirai::daemons(n_daemons, .compute = mirai_profile)
+  on.exit(mirai::daemons(0, .compute = mirai_profile), add = TRUE)
+
+  mirai::everywhere(
+    {
+      suppressPackageStartupMessages({
+        library(dplyr)
+        library(purrr)
+        library(Hmisc)
+      })
+      if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+        RhpcBLASctl::blas_set_num_threads(1)
+        RhpcBLASctl::omp_set_num_threads(1)
+      }
+    },
+    .compute = mirai_profile
+  )
+
+  cells <- pmap(floor_grid, function(floor_S, floor_M, floor_L) {
+    list(floor_S = floor_S, floor_M = floor_M, floor_L = floor_L)
+  })
+
+  m <- mirai::mirai_map(
+    .x = cells,
+    .f = function(cell, df_scored, p_grid,
+                  anchors_farmers, anchors_land, anchor_weights) {
+
+      trimmed_mean_p5p95 <- function(values, weights) {
+        ok <- !is.na(values) & !is.na(weights) & weights > 0
+        if (sum(ok) < 2) return(NA_real_)
+        v <- values[ok]; w <- weights[ok]
+        q <- Hmisc::wtd.quantile(v, weights = w, probs = c(0.05, 0.95))
+        keep <- v >= q[[1]] & v <= q[[2]]
+        if (!any(keep)) return(NA_real_)
+        sum(v[keep] * w[keep]) / sum(w[keep])
+      }
+
+      sigmoid_curve <- function(p, p_entry, floor_val, k) {
+        u <- (p - p_entry) / pmax(1 - p_entry, 1e-6)
+        raw  <- 1 / (1 + exp(-k * (u - 0.5)))
+        raw0 <- 1 / (1 + exp(-k * (0 - 0.5)))
+        raw1 <- 1 / (1 + exp(-k * (1 - 0.5)))
+        scaled <- floor_val + (1 - floor_val) * (raw - raw0) / (raw1 - raw0)
+        if_else(p < p_entry, 0, pmin(1, pmax(floor_val, scaled)))
+      }
+
+      apply_curve <- function(p, p_entry, profile,
+                              floor_S_v, floor_M_v, floor_L_v,
+                              k_S_v, k_M_v, k_L_v) {
+        case_when(
+          profile == "S" ~ sigmoid_curve(p, p_entry, floor_S_v, k_S_v),
+          profile == "M" ~ sigmoid_curve(p, p_entry, floor_M_v, k_M_v),
+          profile == "L" ~ sigmoid_curve(p, p_entry, floor_L_v, k_L_v)
+        )
+      }
+
+      trajectory_continuous <- function(df_sc, p_grid_use,
+                                        k_S_use, k_M_use, k_L_use,
+                                        floor_S_use, floor_M_use, floor_L_use) {
+        map_dfr(p_grid_use, function(pv) {
+          r_i <- apply_curve(pv, df_sc$p_entry, df_sc$profile,
+                             floor_S_v = floor_S_use,
+                             floor_M_v = floor_M_use,
+                             floor_L_v = floor_L_use,
+                             k_S_v = k_S_use, k_M_v = k_M_use, k_L_v = k_L_use)
+          admitted_idx <- which(r_i > 0)
+          if (length(admitted_idx) == 0) {
+            return(tibble(p = pv,
+                          N_OPV = 0, N_Low = 0, N_Mid = 0, N_High = 0,
+                          land_overall_mz = NA_real_))
+          }
+          w_eff <- df_sc$weight_calibrated[admitted_idx] *
+                   r_i[admitted_idx]
+          seg   <- df_sc$segment_final[admitted_idx]
+          land  <- df_sc$land_wtcorn[admitted_idx]
+          land_biofortified <- land * r_i[admitted_idx]
+          w_pop <- df_sc$weight_calibrated[admitted_idx]
+          N_per_seg <- function(s) sum(w_eff[seg == s])
+          tibble(p = pv,
+                 N_OPV = N_per_seg("OPV/Criollo"),
+                 N_Low = N_per_seg("Low"),
+                 N_Mid = N_per_seg("Mid"),
+                 N_High = N_per_seg("High"),
+                 land_overall_mz = trimmed_mean_p5p95(land_biofortified,
+                                                     w_pop))
+        })
+      }
+
+      mad_vs_anchors_local <- function(traj) {
+        key <- function(x) round(x * 1000)
+        traj_keyed <- traj |>
+          mutate(p_key = key(p)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High, land_overall_mz)
+        anch_f_keyed <- anchors_farmers |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High) |>
+          rename_with(~ paste0(.x, "_anc"), -p_key)
+        anch_l_keyed <- anchors_land |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, land_overall_mz) |>
+          rename(land_overall_mz_anc = land_overall_mz)
+        w_keyed <- anchor_weights |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, w_p)
+        joined <- anch_f_keyed |>
+          inner_join(anch_l_keyed, by = "p_key") |>
+          inner_join(w_keyed,      by = "p_key") |>
+          inner_join(traj_keyed,   by = "p_key") |>
+          arrange(p_key)
+        dev_seg <- abs(joined$N_OPV  - joined$N_OPV_anc)  / (joined$N_OPV_anc  + 1) +
+                   abs(joined$N_Low  - joined$N_Low_anc)  / (joined$N_Low_anc  + 1) +
+                   abs(joined$N_Mid  - joined$N_Mid_anc)  / (joined$N_Mid_anc  + 1) +
+                   abs(joined$N_High - joined$N_High_anc) / (joined$N_High_anc + 1)
+        mad_farmers <- sum(joined$w_p * dev_seg, na.rm = TRUE)
+        dev_land <- abs(joined$land_overall_mz - joined$land_overall_mz_anc) /
+                    (joined$land_overall_mz_anc + 0.01)
+        mad_land <- sum(joined$w_p * dev_land, na.rm = TRUE)
+        list(mad_farmers = mad_farmers, mad_land = mad_land,
+             mad_global = mad_farmers / 4 + mad_land)
+      }
+
+      traj <- trajectory_continuous(
+        df_scored, p_grid,
+        k_S_use = 12, k_M_use = 8, k_L_use = 4,
+        floor_S_use = cell$floor_S,
+        floor_M_use = cell$floor_M,
+        floor_L_use = cell$floor_L
+      )
+      res <- mad_vs_anchors_local(traj)
+      tibble(
+        floor_S     = cell$floor_S,
+        floor_M     = cell$floor_M,
+        floor_L     = cell$floor_L,
+        mad_farmers = res$mad_farmers,
+        mad_land    = res$mad_land,
+        mad_global  = res$mad_global
+      )
+    },
+    .args = list(
+      df_scored       = df_entry_slim,
+      p_grid          = p_grid,
+      anchors_farmers = anchors_farmers,
+      anchors_land    = anchors_land,
+      anchor_weights  = anchor_weights
+    ),
+    .compute = mirai_profile
+  )
+
+  results <- m[]
+  errors  <- which(vapply(results, inherits, logical(1), "errorValue"))
+  if (length(errors) > 0) {
+    stop(sprintf("G2: %d/%d tasks failed. First error (task %d): %s",
+                 length(errors), length(results), errors[1],
+                 as.character(results[[errors[1]]])))
+  }
+
+  results |>
+    bind_rows() |>
+    arrange(mad_global)
+})
+```
+
+```{r}
+#| label: tbl-g2-floors
+#| tbl-cap: "Sensitivity to Floor Values per Profile"
+
+export(
+  sweep_g2,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_g2_floor_sweep.rds"))
+)
+
+sweep_g2 |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to floor values per profile",
+    subtitle = "Steepness coefficients and cutoffs held at reference; ordered by global MAD"
+  ) |>
+  cols_label(
+    floor_S     = "floor_S",
+    floor_M     = "floor_M",
+    floor_L     = "floor_L",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(floor_S, floor_M, floor_L), decimals = 2) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+
+# Capture the best floors
+best_floors <- sweep_g2[1, ]
+```
+
+## G3. Sweep — Steepness Coefficients per Profile
+
+Holding the best floor values from G2 and the reference cutoff scheme, the steepness coefficients are explored. The grid for `k_L` extends toward lower values so the optimum can be located in the interior of the grid.
+
+```{r}
+#| label: g3-sweep-steepness
+
+# =============================================================================
+# G3. Sweep - Steepness Coefficients
+# =============================================================================
+
+steepness_grid <- expand_grid(
+  k_S = c(8, 12, 16),
+  k_M = c(4, 8),
+  k_L = c(0.5, 1, 1.5, 2)
+)
+
+set.seed(789)
+
+sweep_g3 <- local({
+
+  df_entry_slim <- df_with_entry |>
+    select(p_entry, profile, weight_calibrated, segment_final, land_wtcorn)
+
+  physical_cores <- parallel::detectCores(logical = FALSE)
+  n_daemons      <- min(nrow(steepness_grid), max(1, physical_cores - 3))
+  mirai_profile  <- "sweep_g3_steepness"
+
+  mirai::daemons(n_daemons, .compute = mirai_profile)
+  on.exit(mirai::daemons(0, .compute = mirai_profile), add = TRUE)
+
+  mirai::everywhere(
+    {
+      suppressPackageStartupMessages({
+        library(dplyr)
+        library(purrr)
+        library(Hmisc)
+      })
+      if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+        RhpcBLASctl::blas_set_num_threads(1)
+        RhpcBLASctl::omp_set_num_threads(1)
+      }
+    },
+    .compute = mirai_profile
+  )
+
+  cells <- pmap(steepness_grid, function(k_S, k_M, k_L) {
+    list(k_S = k_S, k_M = k_M, k_L = k_L)
+  })
+
+  m <- mirai::mirai_map(
+    .x = cells,
+    .f = function(cell, df_scored, p_grid, floor_S, floor_M, floor_L,
+                  anchors_farmers, anchors_land, anchor_weights) {
+
+      trimmed_mean_p5p95 <- function(values, weights) {
+        ok <- !is.na(values) & !is.na(weights) & weights > 0
+        if (sum(ok) < 2) return(NA_real_)
+        v <- values[ok]; w <- weights[ok]
+        q <- Hmisc::wtd.quantile(v, weights = w, probs = c(0.05, 0.95))
+        keep <- v >= q[[1]] & v <= q[[2]]
+        if (!any(keep)) return(NA_real_)
+        sum(v[keep] * w[keep]) / sum(w[keep])
+      }
+
+      sigmoid_curve <- function(p, p_entry, floor_val, k) {
+        u <- (p - p_entry) / pmax(1 - p_entry, 1e-6)
+        raw  <- 1 / (1 + exp(-k * (u - 0.5)))
+        raw0 <- 1 / (1 + exp(-k * (0 - 0.5)))
+        raw1 <- 1 / (1 + exp(-k * (1 - 0.5)))
+        scaled <- floor_val + (1 - floor_val) * (raw - raw0) / (raw1 - raw0)
+        if_else(p < p_entry, 0, pmin(1, pmax(floor_val, scaled)))
+      }
+
+      apply_curve <- function(p, p_entry, profile,
+                              floor_S_v, floor_M_v, floor_L_v,
+                              k_S_v, k_M_v, k_L_v) {
+        case_when(
+          profile == "S" ~ sigmoid_curve(p, p_entry, floor_S_v, k_S_v),
+          profile == "M" ~ sigmoid_curve(p, p_entry, floor_M_v, k_M_v),
+          profile == "L" ~ sigmoid_curve(p, p_entry, floor_L_v, k_L_v)
+        )
+      }
+
+      trajectory_continuous <- function(df_sc, p_grid_use,
+                                        k_S_use, k_M_use, k_L_use,
+                                        floor_S_use, floor_M_use, floor_L_use) {
+        map_dfr(p_grid_use, function(pv) {
+          r_i <- apply_curve(pv, df_sc$p_entry, df_sc$profile,
+                             floor_S_v = floor_S_use,
+                             floor_M_v = floor_M_use,
+                             floor_L_v = floor_L_use,
+                             k_S_v = k_S_use, k_M_v = k_M_use, k_L_v = k_L_use)
+          admitted_idx <- which(r_i > 0)
+          if (length(admitted_idx) == 0) {
+            return(tibble(p = pv,
+                          N_OPV = 0, N_Low = 0, N_Mid = 0, N_High = 0,
+                          land_overall_mz = NA_real_))
+          }
+          w_eff <- df_sc$weight_calibrated[admitted_idx] *
+                   r_i[admitted_idx]
+          seg   <- df_sc$segment_final[admitted_idx]
+          land  <- df_sc$land_wtcorn[admitted_idx]
+          land_biofortified <- land * r_i[admitted_idx]
+          w_pop <- df_sc$weight_calibrated[admitted_idx]
+          N_per_seg <- function(s) sum(w_eff[seg == s])
+          tibble(p = pv,
+                 N_OPV = N_per_seg("OPV/Criollo"),
+                 N_Low = N_per_seg("Low"),
+                 N_Mid = N_per_seg("Mid"),
+                 N_High = N_per_seg("High"),
+                 land_overall_mz = trimmed_mean_p5p95(land_biofortified,
+                                                     w_pop))
+        })
+      }
+
+      mad_vs_anchors_local <- function(traj) {
+        key <- function(x) round(x * 1000)
+        traj_keyed <- traj |>
+          mutate(p_key = key(p)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High, land_overall_mz)
+        anch_f_keyed <- anchors_farmers |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High) |>
+          rename_with(~ paste0(.x, "_anc"), -p_key)
+        anch_l_keyed <- anchors_land |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, land_overall_mz) |>
+          rename(land_overall_mz_anc = land_overall_mz)
+        w_keyed <- anchor_weights |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, w_p)
+        joined <- anch_f_keyed |>
+          inner_join(anch_l_keyed, by = "p_key") |>
+          inner_join(w_keyed,      by = "p_key") |>
+          inner_join(traj_keyed,   by = "p_key") |>
+          arrange(p_key)
+        dev_seg <- abs(joined$N_OPV  - joined$N_OPV_anc)  / (joined$N_OPV_anc  + 1) +
+                   abs(joined$N_Low  - joined$N_Low_anc)  / (joined$N_Low_anc  + 1) +
+                   abs(joined$N_Mid  - joined$N_Mid_anc)  / (joined$N_Mid_anc  + 1) +
+                   abs(joined$N_High - joined$N_High_anc) / (joined$N_High_anc + 1)
+        mad_farmers <- sum(joined$w_p * dev_seg, na.rm = TRUE)
+        dev_land <- abs(joined$land_overall_mz - joined$land_overall_mz_anc) /
+                    (joined$land_overall_mz_anc + 0.01)
+        mad_land <- sum(joined$w_p * dev_land, na.rm = TRUE)
+        list(mad_farmers = mad_farmers, mad_land = mad_land,
+             mad_global = mad_farmers / 4 + mad_land)
+      }
+
+      traj <- trajectory_continuous(
+        df_scored, p_grid,
+        k_S_use = cell$k_S, k_M_use = cell$k_M, k_L_use = cell$k_L,
+        floor_S_use = floor_S,
+        floor_M_use = floor_M,
+        floor_L_use = floor_L
+      )
+      res <- mad_vs_anchors_local(traj)
+      tibble(
+        k_S         = cell$k_S,
+        k_M         = cell$k_M,
+        k_L         = cell$k_L,
+        mad_farmers = res$mad_farmers,
+        mad_land    = res$mad_land,
+        mad_global  = res$mad_global
+      )
+    },
+    .args = list(
+      df_scored       = df_entry_slim,
+      p_grid          = p_grid,
+      floor_S         = best_floors$floor_S,
+      floor_M         = best_floors$floor_M,
+      floor_L         = best_floors$floor_L,
+      anchors_farmers = anchors_farmers,
+      anchors_land    = anchors_land,
+      anchor_weights  = anchor_weights
+    ),
+    .compute = mirai_profile
+  )
+
+  results <- m[]
+  errors  <- which(vapply(results, inherits, logical(1), "errorValue"))
+  if (length(errors) > 0) {
+    stop(sprintf("G3: %d/%d tasks failed. First error (task %d): %s",
+                 length(errors), length(results), errors[1],
+                 as.character(results[[errors[1]]])))
+  }
+
+  results |>
+    bind_rows() |>
+    arrange(mad_global)
+})
+```
+
+```{r}
+#| label: tbl-g3-steepness
+#| tbl-cap: "Sensitivity to Steepness Coefficients per Profile"
+
+export(
+  sweep_g3,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_g3_steepness_sweep.rds"))
+)
+
+sweep_g3 |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to steepness coefficients per profile",
+    subtitle = paste0("Floors from G2 fixed (floor_S=", best_floors$floor_S,
+                      ", floor_M=", best_floors$floor_M,
+                      ", floor_L=", best_floors$floor_L,
+                      "); ordered by global MAD")
+  ) |>
+  cols_label(
+    k_S         = "k_S",
+    k_M         = "k_M",
+    k_L         = "k_L",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(k_S, k_M, k_L), decimals = 2) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+
+# Capture the best steepness
+best_steep <- sweep_g3[1, ]
+```
+
+## G4. Sweep — Profile Cutoff Sensitivity
+
+Holding the best floor values from G2 and the best steepness coefficients from G3, a refined grid of cutoffs is explored. The grid samples `cut_S/M \u2208 {1.0, 1.25, 1.5}` and `cut_M/L \u2208 {3, 4, 5, 6, 7}`.
+
+```{r}
+#| label: g4-sweep-cutoffs
+
+# =============================================================================
+# G4. Sweep - Profile Cutoff Schemes (Refined Grid)
+# =============================================================================
+
+cutoffs_grid <- expand_grid(
+  cut_S_M = c(1.0, 1.25, 1.5),
+  cut_M_L = c(3, 4, 5, 6, 7)
+) |>
+  filter(cut_S_M < cut_M_L)
+
+set.seed(789)
+
+sweep_g4 <- local({
+
+  df_entry_slim <- df_with_entry |>
+    select(p_entry, profile, weight_calibrated, segment_final, land_wtcorn)
+
+  physical_cores <- parallel::detectCores(logical = FALSE)
+  n_daemons      <- min(nrow(cutoffs_grid), max(1, physical_cores - 3))
+  mirai_profile  <- "sweep_g4_cutoffs"
+
+  mirai::daemons(n_daemons, .compute = mirai_profile)
+  on.exit(mirai::daemons(0, .compute = mirai_profile), add = TRUE)
+
+  mirai::everywhere(
+    {
+      suppressPackageStartupMessages({
+        library(dplyr)
+        library(purrr)
+        library(Hmisc)
+      })
+      if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+        RhpcBLASctl::blas_set_num_threads(1)
+        RhpcBLASctl::omp_set_num_threads(1)
+      }
+    },
+    .compute = mirai_profile
+  )
+
+  cells <- pmap(cutoffs_grid, function(cut_S_M, cut_M_L) {
+    list(cut_S_M = cut_S_M, cut_M_L = cut_M_L)
+  })
+
+  m <- mirai::mirai_map(
+    .x = cells,
+    .f = function(cell, df_scored, p_grid,
+                  k_S, k_M, k_L, floor_S, floor_M, floor_L,
+                  anchors_farmers, anchors_land, anchor_weights) {
+
+      trimmed_mean_p5p95 <- function(values, weights) {
+        ok <- !is.na(values) & !is.na(weights) & weights > 0
+        if (sum(ok) < 2) return(NA_real_)
+        v <- values[ok]; w <- weights[ok]
+        q <- Hmisc::wtd.quantile(v, weights = w, probs = c(0.05, 0.95))
+        keep <- v >= q[[1]] & v <= q[[2]]
+        if (!any(keep)) return(NA_real_)
+        sum(v[keep] * w[keep]) / sum(w[keep])
+      }
+
+      sigmoid_curve <- function(p, p_entry, floor_val, k) {
+        u <- (p - p_entry) / pmax(1 - p_entry, 1e-6)
+        raw  <- 1 / (1 + exp(-k * (u - 0.5)))
+        raw0 <- 1 / (1 + exp(-k * (0 - 0.5)))
+        raw1 <- 1 / (1 + exp(-k * (1 - 0.5)))
+        scaled <- floor_val + (1 - floor_val) * (raw - raw0) / (raw1 - raw0)
+        if_else(p < p_entry, 0, pmin(1, pmax(floor_val, scaled)))
+      }
+
+      apply_curve <- function(p, p_entry, profile,
+                              floor_S_v, floor_M_v, floor_L_v,
+                              k_S_v, k_M_v, k_L_v) {
+        case_when(
+          profile == "S" ~ sigmoid_curve(p, p_entry, floor_S_v, k_S_v),
+          profile == "M" ~ sigmoid_curve(p, p_entry, floor_M_v, k_M_v),
+          profile == "L" ~ sigmoid_curve(p, p_entry, floor_L_v, k_L_v)
+        )
+      }
+
+      trajectory_continuous <- function(df_sc, p_grid_use,
+                                        k_S_use, k_M_use, k_L_use,
+                                        floor_S_use, floor_M_use, floor_L_use) {
+        map_dfr(p_grid_use, function(pv) {
+          r_i <- apply_curve(pv, df_sc$p_entry, df_sc$profile,
+                             floor_S_v = floor_S_use,
+                             floor_M_v = floor_M_use,
+                             floor_L_v = floor_L_use,
+                             k_S_v = k_S_use, k_M_v = k_M_use, k_L_v = k_L_use)
+          admitted_idx <- which(r_i > 0)
+          if (length(admitted_idx) == 0) {
+            return(tibble(p = pv,
+                          N_OPV = 0, N_Low = 0, N_Mid = 0, N_High = 0,
+                          land_overall_mz = NA_real_))
+          }
+          w_eff <- df_sc$weight_calibrated[admitted_idx] *
+                   r_i[admitted_idx]
+          seg   <- df_sc$segment_final[admitted_idx]
+          land  <- df_sc$land_wtcorn[admitted_idx]
+          land_biofortified <- land * r_i[admitted_idx]
+          w_pop <- df_sc$weight_calibrated[admitted_idx]
+          N_per_seg <- function(s) sum(w_eff[seg == s])
+          tibble(p = pv,
+                 N_OPV = N_per_seg("OPV/Criollo"),
+                 N_Low = N_per_seg("Low"),
+                 N_Mid = N_per_seg("Mid"),
+                 N_High = N_per_seg("High"),
+                 land_overall_mz = trimmed_mean_p5p95(land_biofortified,
+                                                     w_pop))
+        })
+      }
+
+      mad_vs_anchors_local <- function(traj) {
+        key <- function(x) round(x * 1000)
+        traj_keyed <- traj |>
+          mutate(p_key = key(p)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High, land_overall_mz)
+        anch_f_keyed <- anchors_farmers |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, N_OPV, N_Low, N_Mid, N_High) |>
+          rename_with(~ paste0(.x, "_anc"), -p_key)
+        anch_l_keyed <- anchors_land |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, land_overall_mz) |>
+          rename(land_overall_mz_anc = land_overall_mz)
+        w_keyed <- anchor_weights |>
+          mutate(p_key = key(p_anchor)) |>
+          select(p_key, w_p)
+        joined <- anch_f_keyed |>
+          inner_join(anch_l_keyed, by = "p_key") |>
+          inner_join(w_keyed,      by = "p_key") |>
+          inner_join(traj_keyed,   by = "p_key") |>
+          arrange(p_key)
+        dev_seg <- abs(joined$N_OPV  - joined$N_OPV_anc)  / (joined$N_OPV_anc  + 1) +
+                   abs(joined$N_Low  - joined$N_Low_anc)  / (joined$N_Low_anc  + 1) +
+                   abs(joined$N_Mid  - joined$N_Mid_anc)  / (joined$N_Mid_anc  + 1) +
+                   abs(joined$N_High - joined$N_High_anc) / (joined$N_High_anc + 1)
+        mad_farmers <- sum(joined$w_p * dev_seg, na.rm = TRUE)
+        dev_land <- abs(joined$land_overall_mz - joined$land_overall_mz_anc) /
+                    (joined$land_overall_mz_anc + 0.01)
+        mad_land <- sum(joined$w_p * dev_land, na.rm = TRUE)
+        list(mad_farmers = mad_farmers, mad_land = mad_land,
+             mad_global = mad_farmers / 4 + mad_land)
+      }
+
+      df_local <- df_scored |>
+        mutate(
+          profile = case_when(
+            land_wtcorn <  cell$cut_S_M ~ "S",
+            land_wtcorn <  cell$cut_M_L ~ "M",
+            TRUE                         ~ "L"
+          )
+        )
+      traj <- trajectory_continuous(
+        df_local, p_grid,
+        k_S_use = k_S, k_M_use = k_M, k_L_use = k_L,
+        floor_S_use = floor_S,
+        floor_M_use = floor_M,
+        floor_L_use = floor_L
+      )
+      res <- mad_vs_anchors_local(traj)
+      tibble(
+        cut_S_M     = cell$cut_S_M,
+        cut_M_L     = cell$cut_M_L,
+        mad_farmers = res$mad_farmers,
+        mad_land    = res$mad_land,
+        mad_global  = res$mad_global
+      )
+    },
+    .args = list(
+      df_scored       = df_entry_slim,
+      p_grid          = p_grid,
+      k_S             = best_steep$k_S,
+      k_M             = best_steep$k_M,
+      k_L             = best_steep$k_L,
+      floor_S         = best_floors$floor_S,
+      floor_M         = best_floors$floor_M,
+      floor_L         = best_floors$floor_L,
+      anchors_farmers = anchors_farmers,
+      anchors_land    = anchors_land,
+      anchor_weights  = anchor_weights
+    ),
+    .compute = mirai_profile
+  )
+
+  results <- m[]
+  errors  <- which(vapply(results, inherits, logical(1), "errorValue"))
+  if (length(errors) > 0) {
+    stop(sprintf("G4: %d/%d tasks failed. First error (task %d): %s",
+                 length(errors), length(results), errors[1],
+                 as.character(results[[errors[1]]])))
+  }
+
+  results |>
+    bind_rows() |>
+    arrange(mad_global)
+})
+```
+
+```{r}
+#| label: tbl-g4-cutoffs
+#| tbl-cap: "Sensitivity to Profile Cutoff Schemes (Refined Grid)"
+
+export(
+  sweep_g4,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_g4_cutoffs_sweep.rds"))
+)
+
+sweep_g4 |>
+  gt() |>
+  tab_header(
+    title    = "Sensitivity to profile cutoff schemes (refined grid)",
+    subtitle = paste0("Floors from G2 and steepness from G3 fixed (k_S=",
+                      best_steep$k_S, ", k_M=", best_steep$k_M,
+                      ", k_L=", best_steep$k_L, "); ordered by global MAD")
+  ) |>
+  cols_label(
+    cut_S_M     = "Cut S/M (mz)",
+    cut_M_L     = "Cut M/L (mz)",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = c(cut_S_M, cut_M_L), decimals = 2) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+
+# Capture the best cutoffs
+best_cuts <- c(S_M = sweep_g4$cut_S_M[1], M_L = sweep_g4$cut_M_L[1])
+```
+
+---
+
+# Phase H: Integrated Model Evaluation and Export
+
+This phase consolidates the best configuration from all sweeps, evaluates the integrated model against the calibration anchors, displays the final fit summary and the trajectory plot, and exports the consolidated model configuration as a single `.rds` artefact consumed by script 02_06.
+
+## H1. Apply Integrated Model
+
+Apply the full integrated model — best scoring configuration from Phase E, best risk-aversion configuration from Phase F, best continuous-adoption configuration from Phase G — and evaluate the cohort trajectory against the calibration anchors.
+
+```{r}
+#| label: h1-apply-integrated
+
+# =============================================================================
+# H1. Apply Integrated Model
+# =============================================================================
+
+df_integrated <- df_with_entry |>
+  mutate(
+    profile = case_when(
+      land_wtcorn <  best_cuts[["S_M"]] ~ "S",
+      land_wtcorn <  best_cuts[["M_L"]] ~ "M",
+      TRUE                              ~ "L"
+    )
+  )
+
+traj_integrated <- trajectory_continuous(
+  df_integrated, p_grid,
+  k_S_use     = best_steep$k_S,
+  k_M_use     = best_steep$k_M,
+  k_L_use     = best_steep$k_L,
+  floor_S_use = best_floors$floor_S,
+  floor_M_use = best_floors$floor_M,
+  floor_L_use = best_floors$floor_L
+)
+
+mad_integrated <- mad_vs_anchors(traj_integrated)
+```
+
+## H2. Integrated Model Calibration Summary
+
+The integrated model's calibration distance against the anchor set is reported in a single summary row. The MAD farmers component aggregates relative per-segment count deviations across the five anchors; the MAD land component aggregates relative biofortified-area deviations; the MAD global combines both components on a common dimensionless basis.
+
+```{r}
+#| label: tbl-h2-integrated-mad
+#| tbl-cap: "Integrated Model — Calibration Distance Against Anchor Set"
+
+# =============================================================================
+# H2. Integrated Model Calibration Summary
+# =============================================================================
+
+tbl_h2_integrated_mad <- tibble(
+  model       = "Integrated (scoring + risk + continuous adoption)",
+  mad_farmers = mad_integrated$mad_farmers,
+  mad_land    = mad_integrated$mad_land,
+  mad_global  = mad_integrated$mad_global
+)
+
+export(
+  tbl_h2_integrated_mad,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_h2_integrated_mad.rds"))
+)
+
+tbl_h2_integrated_mad |>
+  gt() |>
+  tab_header(
+    title    = "Integrated model \u2014 calibration distance",
+    subtitle = "Relative mean absolute deviation against the five calibration anchors"
+  ) |>
+  cols_label(
+    model       = "Model",
+    mad_farmers = "MAD farmers",
+    mad_land    = "MAD land (mz)",
+    mad_global  = "MAD global"
+  ) |>
+  fmt_number(columns = mad_farmers, decimals = 3) |>
+  fmt_number(columns = c(mad_land, mad_global), decimals = 3) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+## H3. Trajectory Visualization Against Anchors
+
+The integrated model's trajectory is visualised against the five calibration anchors: four empirical points from the NewSeed market composition matrix (circles) and one structural point recovered from the population at full coverage (triangle). The four segment trajectories appear as solid lines on a percentage-share basis.
+
+```{r}
+#| label: fig-h3-trajectory-vs-anchors
+#| fig-cap: "Integrated model trajectory against the calibration anchors"
+#| fig-width: 11
+#| fig-height: 6
+
+# =============================================================================
+# H3. Integrated Trajectory Plot
+# =============================================================================
+
+# Convert trajectory absolute counts to share percentages
+traj_integrated_long <- traj_integrated |>
+  rowwise() |>
+  mutate(
+    N_total  = N_OPV + N_Low + N_Mid + N_High,
+    pct_OPV  = if (N_total > 0) N_OPV  / N_total * 100 else NA_real_,
+    pct_Low  = if (N_total > 0) N_Low  / N_total * 100 else NA_real_,
+    pct_Mid  = if (N_total > 0) N_Mid  / N_total * 100 else NA_real_,
+    pct_High = if (N_total > 0) N_High / N_total * 100 else NA_real_
+  ) |>
+  ungroup() |>
+  select(p, pct_OPV, pct_Low, pct_Mid, pct_High) |>
+  pivot_longer(-p, names_to = "segment", values_to = "pct") |>
+  mutate(segment = recode(segment,
+                          pct_OPV = "OPV/Criollo", pct_Low = "Low",
+                          pct_Mid = "Mid",         pct_High = "High"))
+
+anchors_long <- anchors_farmers |>
+  select(p_anchor, pct_OPV, pct_Low, pct_Mid, pct_High, role) |>
+  pivot_longer(c(pct_OPV, pct_Low, pct_Mid, pct_High),
+               names_to = "segment", values_to = "pct") |>
+  mutate(segment = recode(segment,
+                          pct_OPV = "OPV/Criollo", pct_Low = "Low",
+                          pct_Mid = "Mid",         pct_High = "High"))
+
+export(
+  list(trajectory = traj_integrated_long, anchors = anchors_long),
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_fig_h3_trajectory_vs_anchors.rds"))
+)
+
+ggplot(traj_integrated_long, aes(x = p * 100, y = pct, color = segment)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = anchors_long,
+             aes(x = p_anchor * 100, y = pct, color = segment,
+                 shape = role),
+             size = 3, fill = "white", stroke = 1.5) +
+  scale_color_manual(values = SEGMENT_COLORS) +
+  scale_shape_manual(values = c("Empirical (NewSeed)"      = 21,
+                                "Structural (population)"  = 24)) +
+  labs(
+    title    = "Integrated model: cohort composition trajectory",
+    subtitle = "Solid lines = integrated model; circles = empirical anchors; triangle = structural anchor",
+    x        = "National penetration (%)",
+    y        = "Cohort share (%)",
+    color    = NULL,
+    shape    = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12),
+    plot.subtitle   = element_text(size = 10, color = ADI_ACCENT),
+    legend.position = "bottom",
+    legend.box      = "vertical"
+  )
+```
+
+## H4. Consolidate and Export Model Configuration
+
+The consolidated model configuration is assembled into a single nested list containing all parameters required by the scoring engine in script 02_06. The list is exported as a single `.rds` artefact stored alongside the other model artefacts in `01_data/02_processed/models/`.
+
+The configuration object contains six top-level fields:
+
+- **`metadata`**: seed and subsidy suffixes, calibration date, source script identifier.
+- **`scoring`**: segment scheme, component weights, scoring heuristic specifications.
+- **`risk`**: driver variant, driver coefficients, logistic slope, risk weight, structural loss-driver coefficient.
+- **`continuous`**: profile cutoffs, floor values, steepness coefficients.
+- **`entry_size`**: entry-size profile cutoffs and coefficients.
+- **`calibration`**: MAD farmers, MAD land, MAD global from the integrated evaluation.
+
+```{r}
+#| label: h4-consolidate-config
+
+# =============================================================================
+# H4. Consolidate Model Configuration
+# =============================================================================
+
+# Recover the percentile breakpoint specifications from the best heuristics
+# by inspecting the variant labels (stable references back to E2 sweeps)
+econ_bp_label  <- best_heuristics$label[
+  best_heuristics$component == "score_economic"
+]
+impr_bp_label  <- best_heuristics$label[
+  best_heuristics$component == "score_improvement"
+]
+scale_bp_label <- best_heuristics$label[
+  best_heuristics$component == "score_scale"
+]
+age_label      <- best_heuristics$label[
+  best_heuristics$component == "score_age"
+]
+
+# Recover the age-score parameters from the best variant name
+age_best_variant <- best_heuristics$variant[
+  best_heuristics$component == "score_age"
+]
+age_best_row <- age_variants_grid |>
+  filter(variant_name == age_best_variant)
+
+# Recover percentile breakpoint vectors from the best variants
+econ_best_variant  <- best_heuristics$variant[
+  best_heuristics$component == "score_economic"
+]
+impr_best_variant  <- best_heuristics$variant[
+  best_heuristics$component == "score_improvement"
+]
+scale_best_variant <- best_heuristics$variant[
+  best_heuristics$component == "score_scale"
+]
+
+econ_bp_lookup <- list(
+  econ_default   = c(0.25, 0.50, 0.75),
+  econ_soft      = c(0.20, 0.40, 0.60),
+  econ_demanding = c(0.50, 0.70, 0.90)
+)
+
+impr_bp_lookup <- list(
+  impr_default   = c(0.25, 0.50, 0.75, 0.90),
+  impr_soft      = c(0.30, 0.60, 0.80, 0.95),
+  impr_demanding = c(0.10, 0.25, 0.50, 0.75)
+)
+
+scale_bp_lookup <- list(
+  scale_default   = c(0.25, 0.50, 0.75),
+  scale_soft      = c(0.33, 0.66, 0.90),
+  scale_demanding = c(0.50, 0.75, 0.90)
+)
+
+# Assemble the model configuration object
+model_config <- list(
+
+  metadata = list(
+    seed_suffix      = seed_suffix,
+    subsidy_suffix   = subsidy_suffix,
+    calibration_date = Sys.Date(),
+    source_script    = "02_05_determine_likely_adopters_model.qmd"
+  ),
+
+  scoring = list(
+    segment_scheme        = best_scheme_name,
+    segment_points        = best_pts,
+    component_weights     = best_weights,
+    heuristic_economic    = list(
+      variant     = econ_best_variant,
+      label       = econ_bp_label,
+      breakpoints = econ_bp_lookup[[econ_best_variant]]
+    ),
+    heuristic_improvement = list(
+      variant     = impr_best_variant,
+      label       = impr_bp_label,
+      breakpoints = impr_bp_lookup[[impr_best_variant]]
+    ),
+    heuristic_scale       = list(
+      variant     = scale_best_variant,
+      label       = scale_bp_label,
+      breakpoints = scale_bp_lookup[[scale_best_variant]]
+    ),
+    heuristic_age         = list(
+      variant     = age_best_variant,
+      label       = age_label,
+      peak_center = age_best_row$peak_center,
+      peak_width  = age_best_row$peak_width,
+      profile     = age_best_row$profile
+    )
+  ),
+
+  risk = list(
+    variant     = best_risk_variant,
+    alpha_yield = best_risk_row$alpha_y,
+    alpha_ratio = best_risk_row$alpha_r,
+    alpha_land  = best_risk_row$alpha_L,
+    alpha_loss  = ALPHA_LOSS,
+    beta        = best_risk_row$beta,
+    w_R         = best_risk_row$w_R,
+    loss_bands  = list(
+      threshold_minus_500 = 100L,
+      threshold_minus_200 =  75L,
+      threshold_negative  =  50L,
+      otherwise           =   0L
+    )
+  ),
+
+  continuous = list(
+    cut_S_M = best_cuts[["S_M"]],
+    cut_M_L = best_cuts[["M_L"]],
+    floor_S = best_floors$floor_S,
+    floor_M = best_floors$floor_M,
+    floor_L = best_floors$floor_L,
+    k_S     = best_steep$k_S,
+    k_M     = best_steep$k_M,
+    k_L     = best_steep$k_L
+  ),
+
+  entry_size = list(
+    cut_S_M = ENTRY_CUT_S_M,
+    cut_M_L = ENTRY_CUT_M_L,
+    coef_S  = ENTRY_COEF_S,
+    coef_M  = ENTRY_COEF_M,
+    coef_L  = ENTRY_COEF_L
+  ),
+
+  calibration = list(
+    mad_farmers = mad_integrated$mad_farmers,
+    mad_land    = mad_integrated$mad_land,
+    mad_global  = mad_integrated$mad_global,
+    anchor_set  = list(
+      farmers = anchors_farmers,
+      land    = anchors_land,
+      weights = anchor_weights
+    )
+  )
+)
+
+# Export the consolidated configuration alongside the other model artefacts
+export(
+  model_config,
+  here("01_data", "02_processed", "models",
+       paste0(file_prefix, "_likely_adopters_model_config.rds"))
+)
+```
+
+## H5. Final Configuration Summary
+
+The configuration summary reports the full set of parameters constituting the determined Likely Adopters model.
+
+```{r}
+#| label: tbl-h5-final-config
+#| tbl-cap: "Determined Likely Adopters Model Configuration"
+
+# =============================================================================
+# H5. Final Configuration Summary Table
+# =============================================================================
+
+tbl_h5_final_config <- tibble(
+  component = c(
+    "Segment scheme",
+    "Component weights",
+    "Heuristic \u2014 score_economic",
+    "Heuristic \u2014 score_improvement",
+    "Heuristic \u2014 score_scale",
+    "Heuristic \u2014 score_age",
+    "Risk variant",
+    "Risk drivers (\u03b1_yield, \u03b1_ratio, \u03b1_land)",
+    "Risk structural loss coefficient (\u03b1_loss)",
+    "Risk slope (\u03b2)",
+    "Risk weight (w_R)",
+    "Profile cutoffs (S/M, M/L)",
+    "Profile floors (S, M, L)",
+    "Profile steepness (k_S, k_M, k_L)",
+    "Entry-size cutoffs (S/M, M/L)",
+    "Entry-size coefficients (S, M, L)",
+    "MAD farmers (integrated)",
+    "MAD land (mz, integrated)",
+    "MAD global (integrated)"
+  ),
+  setting = c(
+    paste0(best_scheme_name, ": Low=", best_pts[["Low"]],
+           ", OPV=", best_pts[["OPV"]],
+           ", Mid=", best_pts[["Mid"]],
+           ", High=", best_pts[["High"]]),
+    paste0("seg=",   round(best_weights[["segment"]], 3),
+           ", econ=", round(best_weights[["economic"]], 3),
+           ", impr=", round(best_weights[["improvement"]], 3),
+           ", scale=", round(best_weights[["scale"]], 3),
+           ", age=",  round(best_weights[["age"]], 3)),
+    econ_bp_label,
+    impr_bp_label,
+    scale_bp_label,
+    age_label,
+    best_risk_variant,
+    paste0("yield=", best_risk_row$alpha_y,
+           ", ratio=", best_risk_row$alpha_r,
+           ", land=", best_risk_row$alpha_L),
+    sprintf("%.2f", ALPHA_LOSS),
+    sprintf("%.2f", best_risk_row$beta),
+    sprintf("%.2f", best_risk_row$w_R),
+    paste0("S/M=", round(best_cuts[["S_M"]], 2), " mz, ",
+           "M/L=", round(best_cuts[["M_L"]], 2), " mz"),
+    paste0("floor_S=", best_floors$floor_S,
+           ", floor_M=", best_floors$floor_M,
+           ", floor_L=", best_floors$floor_L),
+    paste0("k_S=", best_steep$k_S,
+           ", k_M=", best_steep$k_M,
+           ", k_L=", best_steep$k_L),
+    paste0("S/M=", ENTRY_CUT_S_M, " mz, M/L=", ENTRY_CUT_M_L, " mz"),
+    paste0("coef_S=", ENTRY_COEF_S,
+           ", coef_M=", ENTRY_COEF_M,
+           ", coef_L=", ENTRY_COEF_L),
+    sprintf("%.3f", mad_integrated$mad_farmers),
+    sprintf("%.3f", mad_integrated$mad_land),
+    sprintf("%.3f", mad_integrated$mad_global)
+  )
+)
+
+export(
+  tbl_h5_final_config,
+  here("01_data", "02_processed", "web_resources",
+       paste0(file_prefix, "_tbl_h5_final_config.rds"))
+)
+
+tbl_h5_final_config |>
+  gt() |>
+  tab_header(
+    title    = "Determined Likely Adopters model configuration",
+    subtitle = paste0("Calibrated against five anchors on the ",
+                      seed_suffix, " + ", subsidy_suffix,
+                      " baseline configuration")
+  ) |>
+  cols_label(
+    component = "Component",
+    setting   = "Setting"
+  ) |>
+  tab_options(
+    table.font.size          = px(11),
+    heading.title.font.size  = px(14)
+  )
+```
+
+# Notes
+
+## Output Artefact
+
+The determined model configuration is exported to `01_data/02_processed/models/02_05_likely_adopters_model_config.rds`. This artefact is consumed by script 02_06 (Likely Adopters scoring and saturation engine), which applies the calibrated configuration to each of the nine seed-by-subsidy combinations handled by the framework.
+
+The configuration object is a nested list with six top-level fields (`metadata`, `scoring`, `risk`, `continuous`, `entry_size`, `calibration`). The structural parameters are taken as invariant across seed variants and subsidy regimes: the relationships between farmer characteristics and adoption priority are modelled as a function of the joint distribution of farmer attributes. The single calibration run on s22 + sub00 therefore produces the model configuration applied across all nine combinations.
+
+## Reproducibility
+
+All stochastic operations in this script (Boruta feature selection in Phase C, and the parallel sweeps in Phases F and G) are seeded with `set.seed(789)` immediately before invocation, in line with the ADI reproducibility convention. The MIRAI daemon pool used for the risk-aversion and continuous-adoption sweeps disables BLAS multithreading inside each daemon via `RhpcBLASctl::blas_set_num_threads(1)`, removing thread-scheduling variability in the matrix operations performed by `Hmisc::wtd.quantile()`.
+
+## Calibration Anchors
+
+The five anchor points combine four empirical observations from the NewSeed market composition matrix at production coverage levels 5%, 10%, 20%, 30%, and one structural anchor at full coverage recovered from the segmented dataset. The four NewSeed anchors carry weight `w_p = 1.0`; the structural anchor carries auxiliary weight `w_p = 0.5`. The MAD evaluation operates on relative deviations: each cell error is normalised by the corresponding anchor value plus a small offset, so that all anchor cells contribute proportionally regardless of their absolute magnitude.
+
+## Theoretical Framework
+
+The adoption decomposition by behavioural profile (S, M, L) and by segment (OPV/Criollo, Low, Mid, High) reflects two complementary stratifications established in the agricultural-innovation literature. Aggregate adoption of agricultural innovations has been modelled canonically with sigmoidal curves since Griliches (1957); the survey by Sunding & Zilberman (2001) confirms that the logistic sigmoid is the dominant functional form for aggregate penetration of agricultural technologies. The decomposition by farmer category follows Rogers (2003), adapted to economic-agronomic rather than attitudinal criteria. For the QPM-specific case, the literature on adoption in Sub-Saharan Africa (Kostandini, La Rovere & Abdoulaye, 2013; Beyene, Kassie, Shiferaw & Marenya, 2017) supports the use of sigmoidal curves with subgroup decomposition. The risk-aversion penalty follows the smallholder-adoption literature on land allocation under uncertainty (Smale, Just & Leathers, 1994) and on risk perception in technology adoption (Liu et al., 2023).
+
+## Terminology
+
+The segment label `OPV/Criollo` identifies farmers planting open-pollinated or
+saved seed. Published outputs refer to this group as **non-hybrid**; the
+two terms denote the same segment.

@@ -1,0 +1,116 @@
+# ==============================================================================
+# Subsidy Variants Configuration
+# ==============================================================================
+#
+# Single source of truth for seed subsidy parameters used across the NewSeed
+# biofortification framework. Consumed by parametrized Quarto scripts and by
+# local and master orchestrators.
+#
+# Each variant declares:
+#   - Identification:        subsidy_year, subsidy_label, subsidy_description,
+#                            subsidy_suffix
+#   - Reduction level:       subsidy_reduction_pct (numerical, useful for facets)
+#   - Seed prices:           conventional and biofortified seed cost (Q/mz) by
+#                            farmer segment, keyed by segment name to decouple
+#                            vector order from the segment_final factor levels.
+#   - NewSeed subsidy:       newseed_subsidy_per_mz, the per-area direct
+#                            financial commitment made by NewSeed under the
+#                            active regime.
+#
+# Cost structure under each regime
+# --------------------------------
+# Three actors share the gap between the unsubsidized commercial reference
+# price (`bio_cost_no_subsidy_per_mz`, top-level constant) and the price
+# effectively paid by the farmer for biofortified seed:
+#
+#   1. NewSeed (subsidy provider): pays `newseed_subsidy_per_mz` per area
+#      planted by each farmer.
+#   2. Local seed producer (intermediary): absorbs half of the difference
+#      between the current-regime NewSeed subsidy and the active-regime
+#      NewSeed subsidy, via improved producibility.
+#   3. Farmer: pays the remaining half through a higher biofortified seed
+#      price relative to the current regime.
+#
+# Under the current regime, NewSeed covers the full gap between the
+# unsubsidized commercial price and the farmer-facing price; the producer
+# absorbs nothing and the farmer pays the baseline price.
+#
+# Invariant: in the `current` variant, `newseed_subsidy_per_mz` must equal
+# `bio_cost_no_subsidy_per_mz` minus `seed_cost_biofortified` (currently
+# 547 - 305 = 242). The .qmd uses this value as the reference for computing
+# the producer-absorption and farmer-extra shares of any subsidy reduction.
+#
+# Conventional seed prices do not vary across subsidy scenarios; they are
+# replicated under each variant to keep variants self-contained and
+# symmetrical, and to anticipate future scenarios where conventional
+# prices may also change.
+#
+# Segment keys are identical to the `segment_final` factor levels used in
+# Script 02_03 (farmer segmentation). Any change to segment nomenclature
+# must be reflected here and in the parametrized scripts simultaneously.
+#
+# Source: NewSeed refined seed prices and ex-ante subsidy values
+# (April 2026).
+# ==============================================================================
+
+# Reference unsubsidized biofortified price (Q/mz). Equals the current
+# subsidized farmer price (305) plus the full per-area NewSeed subsidy
+# under the current regime (242). Used to compute the absolute monetary
+# value of the subsidy received by the farmer (subsidy_amount_absolute).
+bio_cost_no_subsidy_per_mz: 547
+
+variants:
+
+  current:
+    subsidy_year: "2026"
+    subsidy_label: "Current subsidy"
+    subsidy_description: "current subsidy regime as of April 2026"
+    subsidy_suffix: "sub00"
+    subsidy_reduction_pct: 0
+    newseed_subsidy_per_mz: 242
+    seed_cost_conventional:
+      OPV_Criollo:  61
+      Low:         305
+      Mid:         488
+      High:        976
+    seed_cost_biofortified:
+      OPV_Criollo: 305
+      Low:         305
+      Mid:         305
+      High:        305
+
+  reduced_50:
+    subsidy_year: "2026"
+    subsidy_label: "50% subsidy reduction"
+    subsidy_description: "subsidy reduced by 50% relative to the current regime"
+    subsidy_suffix: "sub50"
+    subsidy_reduction_pct: 50
+    newseed_subsidy_per_mz: 121
+    seed_cost_conventional:
+      OPV_Criollo:  61
+      Low:         305
+      Mid:         488
+      High:        976
+    seed_cost_biofortified:
+      OPV_Criollo: 366
+      Low:         366
+      Mid:         366
+      High:        366
+
+  reduced_75:
+    subsidy_year: "2026"
+    subsidy_label: "75% subsidy reduction"
+    subsidy_description: "subsidy reduced by 75% relative to the current regime"
+    subsidy_suffix: "sub75"
+    subsidy_reduction_pct: 75
+    newseed_subsidy_per_mz: 61
+    seed_cost_conventional:
+      OPV_Criollo:  61
+      Low:         305
+      Mid:         488
+      High:        976
+    seed_cost_biofortified:
+      OPV_Criollo: 396
+      Low:         396
+      Mid:         396
+      High:        396

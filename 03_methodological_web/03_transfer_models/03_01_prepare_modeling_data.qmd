@@ -1,0 +1,567 @@
+---
+title: "Prepare Nutrient Transfer Modeling Data"
+subtitle: "Module 3: Transfer Models"
+---
+
+
+## Why Transfer Models?
+
+Children in the SIVESNU 2018 data (the nutrition surveillance system) have anthropometric 
+measurements (height, weight) but **no dietary intake data**. Meanwhile, ENCOVI 2023 
+households have detailed food consumption records but **no child growth measurements**.
+
+Transfer models bridge this gap: we use demographic and socioeconomic characteristics 
+common to both datasets to predict nutrient intake for SIVESNU children based on 
+patterns observed in ENCOVI.
+
+## Overview
+
+This document describes the data preparation steps required before building 
+prediction models. High-quality models require:
+
+1. **Complete data** — Missing values must be handled appropriately
+2. **Independent predictors** — Highly correlated variables create instability
+3. **Informative variables** — Variables with no variation provide no predictive value
+4. **Normalized distributions** — Extreme skewness can bias predictions
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  car,                # Box-Cox/Yeo-Johnson profile plots
+  gt,                 # Table formatting and presentation
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to minimize memory footprint)
+# ggcorrplot — ggcorrplot() for correlation matrix visualization
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file (single source of truth)
+source(here("..", "02_code", "00_functions", "00_functions.R"))
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Web resources for visualizations (exported by framework 03_01)
+tbl_b1_diagnose_missing <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_tbl_b1_diagnose_missing.rds"),
+  trust = TRUE
+)
+
+tbl_b2_impute_missing <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_tbl_b2_impute_missing.rds"),
+  trust = TRUE
+)
+
+tbl_b2b_completion_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_tbl_b2b_completion_summary.rds"),
+  trust = TRUE
+)
+
+fig_c1_correlation_analysis <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_fig_c1_correlation_analysis.rds"),
+  trust = TRUE
+)
+
+tbl_c2_near_zero_variance <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_tbl_c2_near_zero_variance.rds"),
+  trust = TRUE
+)
+
+fig_d1_evaluate_yj_miembros_hogar <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_fig_d1_evaluate_yj_miembros_hogar.rds"),
+  trust = TRUE
+)
+
+fig_d1_evaluate_yj_n_cuartos <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_fig_d1_evaluate_yj_n_cuartos.rds"),
+  trust = TRUE
+)
+
+fig_d2_verify_yj_miembros_hogar <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_fig_d2_verify_yj_miembros_hogar.rds"),
+  trust = TRUE
+)
+
+fig_d2_verify_yj_n_cuartos <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "03_01_fig_d2_verify_yj_n_cuartos.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Imputation quality metrics from B2 table
+oobe_row <- tbl_b2_impute_missing |>
+  dplyr::filter(metric == "OOBE (Continuous Variables)")
+
+oobe_value <- dplyr::pull(oobe_row, value)
+
+# The imputation engine returns NA for OOBE when no continuous variable
+# required imputation. Reporting the raw NA leaves an empty value in the
+# prose, so the reason recorded in the table is reported instead.
+oobe_display <- if (is.na(oobe_value)) {
+  paste0("N/A (", tolower(dplyr::pull(oobe_row, interpretation)), ")")
+} else {
+  as.character(round(oobe_value, 2))
+}
+
+pfc_value <- tbl_b2_impute_missing |>
+  dplyr::filter(metric == "PFC (Categorical Variables)") |>
+  dplyr::pull(value) |>
+  round(2)
+
+# Missing value summary statistics
+n_vars_missing <- nrow(tbl_b1_diagnose_missing)
+max_pct_missing <- tbl_b1_diagnose_missing |>
+  dplyr::pull(pct_missing) |>
+  max() |>
+  round(1)
+worst_var_missing <- tbl_b1_diagnose_missing |>
+  dplyr::arrange(dplyr::desc(pct_missing)) |>
+  dplyr::slice(1) |>
+  dplyr::pull(variable)
+```
+
+
+## Data Loading and Variable Selection
+
+### Source Data
+
+We start with the individual-level nutrient intake dataset created in Module 1, 
+containing the full sample of individuals from ENCOVI 2023 across all 22 departments 
+of Guatemala.
+
+### Predictor Variables
+
+Transfer models predict nutrient intake based on characteristics that are 
+available in **both** ENCOVI and SIVESNU. The shared variables span 
+six categories:
+
+| Category | Variables |
+|----------|-----------|
+| **Demographic** | Age, sex, household relationship |
+| **Geographic** | Department, urban/rural area |
+| **Household composition** | Number of members, education level, property ownership |
+| **Housing characteristics** | Dwelling type, construction materials, rooms, sanitation |
+| **Basic services** | Water source, garbage collection |
+| **Household assets** | Electricity, television, telephone, computer |
+
+Variables unique to one dataset (e.g., detailed food consumption in ENCOVI,
+anthropometric measurements in SIVESNU) cannot be used as predictors.
+
+### Functional Form of the Predictors
+
+The candidate set entering each nutrient model comprises 20 terms, with the
+functional form set by the type of variable:
+
+- **Continuous predictors** enter as orthogonal polynomials: age at degree 2,
+  and household members, mean household education and number of rooms at
+  degree 3. The polynomial terms let intake vary non-linearly across the range
+  of each variable, which matters for age in particular, where intake rises
+  steeply through childhood and flattens in adulthood.
+- **Nominal predictors** (household relationship, sex, department, urban/rural
+  area, property regime, dwelling type, construction materials, sanitation,
+  water source, garbage collection, and the asset indicators) enter as factors,
+  contributing one coefficient per level.
+
+
+
+## Missing Value Treatment
+
+### Why This Matters
+
+Prediction models require complete data for all observations, and the
+imputation method has to hold the joint structure of the predictors so that
+later correlation and variance filtering operate on realistic values.
+
+### Our Approach: Random Forest Imputation
+
+We use a **Random Forest-based multivariate imputation procedure**, which
+predicts missing values based on patterns in the complete data. The 
+implementation uses the `missRanger` algorithm with a multi-threaded 
+`ranger` engine for computational efficiency on large surveys. This method:
+
+- Preserves correlations between variables
+- Handles both numeric and categorical data
+- Provides out-of-bag error metrics (OOBE for continuous, PFC for categorical)
+  to verify imputation accuracy
+
+### Missing Data Summary
+
+```{r}
+#| label: tbl-b1-diagnose-missing
+#| tbl-cap: "Missing value summary for predictor variables"
+
+tbl_b1_diagnose_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Values in Predictor Variables",
+    subtitle = "Variables requiring imputation before modeling"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_missing = "N Missing",
+    pct_missing = "% Missing"
+  ) |>
+  fmt_number(
+    columns = n_missing,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = pct_missing,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+Only `r n_vars_missing` variables have missing data, with the worst case affecting
+less than `r max_pct_missing`% of observations (`r worst_var_missing`). Most variables 
+are complete.
+
+### Imputation Quality
+
+```{r}
+#| label: tbl-b2-impute-missing
+#| tbl-cap: "Random Forest imputation quality metrics"
+
+tbl_b2_impute_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Value Imputation Quality Assessment",
+    subtitle = "Out-of-bag error estimates from Random Forest imputation"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value",
+    interpretation = "Quality Assessment"
+  ) |>
+  fmt_number(
+    columns = value,
+    decimals = 4
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Acceptable"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Review required"
+    )
+  ) |>
+  tab_footnote(
+    footnote = "OOBE: aggregated out-of-bag error across the continuous variables imputed, bounded in [0, 1] and invariant to their scale. Values < 0.5 indicate acceptable imputation quality for continuous variables.",
+    locations = cells_body(columns = metric, rows = 1)
+  ) |>
+  tab_footnote(
+    footnote = "PFC: Proportion of Falsely Classified entries. Values < 0.2 indicate acceptable imputation quality for categorical variables.",
+    locations = cells_body(columns = metric, rows = 2)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-tip}
+## Quality Assessment
+OOBE (for continuous variables) and PFC (for categorical variables) are
+out-of-bag (OOB) error metrics — calculated from observations that were
+randomly excluded during tree construction within the Random Forest
+algorithm, providing an internal quality metric without requiring a separate
+test set. The ranges conventionally treated as acceptable for this imputation
+method are OOBE < 0.50 and PFC < 0.20.
+
+- **OOBE = `r oobe_display`**
+- **PFC = `r pfc_value`** (categorical variables) — within the acceptable range
+:::
+
+### Residual Missing Value Completion
+
+The Random Forest imputation engine can, in rare cases, leave residual 
+missing values for a small subset of rows when the out-of-bag prediction 
+collapses inside a terminal node with zero within-leaf variance. This
+affects a small fraction of the sample and is resolved by a final
+completion step, which leaves the predictor matrix complete.
+
+::: {.callout-note}
+## Completion Rule
+Residual missing values are completed with a variable-specific rule:
+
+- **Numeric / integer variables**: median of the observed values, which 
+  preserves the discrete support of ordinal scales (e.g., years of schooling 
+  taking values such as 1, 1.5, 2, 2.5).
+- **Factor variables**: mode of the observed values.
+:::
+
+```{r}
+#| label: tbl-b2b-completion-summary
+#| tbl-cap: "Residual missing value completion after Random Forest imputation"
+
+tbl_b2b_completion_summary |>
+  gt() |>
+  tab_header(
+    title = "Residual Missing Value Completion",
+    subtitle = "Values completed by variable-specific rule after RF imputation"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_completed = "N Completed",
+    rule = "Completion Rule"
+  ) |>
+  fmt_number(
+    columns = n_completed,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: passed"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: review required"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-tip}
+## Integrity Check
+The final row of the table reports the number of residual missing values
+**after** the completion step. A value of zero means the predictor matrix is
+complete before correlation analysis, near-zero variance filtering, and model
+training.
+:::
+
+
+## Variable Quality Assessment
+
+Before building models, we evaluate whether all candidate predictors provide 
+useful information. Two common issues can degrade model performance:
+
+### Multicollinearity
+
+When two variables measure essentially the same thing, including both creates 
+redundancy and statistical instability.
+
+```{r}
+#| label: fig-c1-correlation-analysis
+#| fig-cap: "Correlation matrix of predictor variables"
+#| fig-alt: >
+#|   Correlation heatmap of the predictor variables, shown as an upper
+#|   triangular matrix with the same variables along both axes, reordered by
+#|   hierarchical clustering. Each cell is labelled with its correlation
+#|   coefficient and colour-coded from orange for negative through white near
+#|   zero to blue for positive. Most pairs are weakly correlated, but number of
+#|   bedrooms and total rooms stand out as strongly positively correlated
+#|   (r = 0.8), flagging the redundancy that leads to dropping one of them.
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+
+fig_c1_correlation_analysis |>
+  ggcorrplot::ggcorrplot(
+    hc.order = TRUE,
+    colors = c("#E46726", "white", "#6D9EC1"),
+    type = "lower",
+    lab = TRUE
+  )
+```
+
+::: {.callout-important}
+## Decision: Remove Redundant Variable
+**Number of bedrooms** (`n_dormitorios`) correlates strongly (r > 0.8) with
+**total rooms** (`n_cuartos`). Total rooms is retained as the measure of
+overall dwelling size, and number of bedrooms is dropped from the candidate
+set.
+:::
+
+### Near-Zero Variance
+
+Variables where almost all observations fall in a single category provide 
+minimal discriminatory power for prediction.
+
+```{r}
+#| label: tbl-c2-near-zero-variance
+#| tbl-cap: "Near-zero variance analysis for predictor variables"
+#| results: asis
+
+analyze_variance(tbl_c2_near_zero_variance)
+```
+
+::: {.callout-important}
+## Decision: Remove Low-Information Variables
+Two variables flagged for near-zero variance:
+
+- **Kitchen type** (`cocina`): nearly all households have the same type
+- **Landline telephone** (`telefonia_fija`): nearly all households lack landlines
+
+These variables cannot meaningfully distinguish between nutrient profiles
+and are excluded from the model.
+:::
+
+## Variable Transformations
+
+### Why Transform?
+
+Many statistical models assume predictor variables follow approximately normal 
+distributions. Highly skewed variables (e.g., household size, where most 
+households are small but some are very large) can bias predictions.
+
+### Yeo-Johnson Transformation
+
+We apply the Yeo-Johnson transformation, which automatically determines the 
+optimal adjustment for each variable. A lambda (λ) value near 1 indicates 
+the variable is already approximately normal; values near 0 indicate 
+logarithmic transformation is needed.
+
+```{r}
+#| label: fig-d1-evaluate-yj-miembros-hogar
+#| fig-cap: "Yeo-Johnson transformation profile for household members"
+#| fig-alt: >
+#|   Profile likelihood curve for the Yeo-Johnson transformation of household
+#|   members. The transformation parameter lambda is on the x-axis and the
+#|   log-likelihood on the y-axis, with vertical dashed lines marking the 95%
+#|   confidence interval for the best lambda. The curve peaks near lambda of 0,
+#|   indicating a right-skewed variable that benefits from a near-logarithmic
+#|   transformation.
+
+boxCox(
+  lm(miembros_hogar ~ 1, data = fig_d1_evaluate_yj_miembros_hogar),
+  main = "Household Members - Transformation Profile",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-d1-evaluate-yj-n-cuartos
+#| fig-cap: "Yeo-Johnson transformation profile for number of rooms"
+#| fig-alt: >
+#|   Profile likelihood curve for the Yeo-Johnson transformation of number of
+#|   rooms. The transformation parameter lambda is on the x-axis and the
+#|   log-likelihood on the y-axis, with vertical dashed lines marking the 95%
+#|   confidence interval for the best lambda. The curve peaks near lambda of 0,
+#|   indicating a right-skewed variable that benefits from a near-logarithmic
+#|   transformation.
+
+boxCox(
+  lm(n_cuartos ~ 1, data = fig_d1_evaluate_yj_n_cuartos),
+  main = "Number of Rooms - Transformation Profile",
+  family = "yjPower"
+)
+```
+
+Both household members and number of rooms show λ ≈ 0, indicating right-skewed 
+distributions that benefit from transformation.
+
+```{r}
+#| label: fig-d2-verify-yj-miembros-hogar
+#| fig-cap: "Transformation profile for household members (post-transformation)"
+#| fig-alt: >
+#|   Profile likelihood curve for the already-transformed household members
+#|   variable. The transformation parameter lambda is on the x-axis and the
+#|   log-likelihood on the y-axis, with vertical dashed lines marking the 95%
+#|   confidence interval for the best lambda. The curve now peaks near lambda of
+#|   1, confirming that the Yeo-Johnson transformation has successfully
+#|   normalized the distribution.
+
+boxCox(
+  lm(miembros_hogar_yj ~ 1, data = fig_d2_verify_yj_miembros_hogar),
+  main = "Household Members - Post-Transformation",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-d2-verify-yj-n-cuartos
+#| fig-cap: "Transformation profile for number of rooms (post-transformation)"
+#| fig-alt: >
+#|   Profile likelihood curve for the already-transformed number of rooms
+#|   variable. The transformation parameter lambda is on the x-axis and the
+#|   log-likelihood on the y-axis, with vertical dashed lines marking the 95%
+#|   confidence interval for the best lambda. The curve now peaks near lambda of
+#|   1, confirming that the Yeo-Johnson transformation has successfully
+#|   normalized the distribution.
+
+boxCox(
+  lm(n_cuartos_yj ~ 1, data = fig_d2_verify_yj_n_cuartos),
+  main = "Number of Rooms - Post-Transformation",
+  family = "yjPower"
+)
+```
+
+::: {.callout-tip}
+## Transformation Result
+After transformation, both variables show λ ≈ 1, the value expected for an
+approximately normal distribution. The transformation parameters are saved for
+consistent application to SIVESNU data.
+:::
+
+
+## Summary of Data Preparation
+
+This preparation module brings the modeling dataset to the state the transfer
+models operate on:
+
+| Step | Action | Result |
+|------|--------|--------|
+| Missing values | Random Forest imputation (`missRanger` / `ranger`) | Imputed predictor matrix with OOB diagnostics |
+| Residual completion | Median (numeric) / mode (factor) safety net | 100% complete data |
+| Multicollinearity | Remove `n_dormitorios` | Independent predictors |
+| Near-zero variance | Remove `cocina`, `telefonia_fija` | Informative variables only |
+| Normalization | Yeo-Johnson transformation | Improved distributions |
+
+### Final ENCOVI Dataset
+
+The prepared dataset retains the full sample of individuals from ENCOVI 2023, 
+with predictor variables filtered for quality and continuous predictors 
+normalized via Yeo-Johnson transformation. The transformation parameters 
+are exported for consistent application to SIVESNU data during the modeling 
+of individual nutrients documented in subsequent sections.

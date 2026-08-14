@@ -1,0 +1,2812 @@
+---
+title: "Farmer Segmentation via Data-Driven Scoring System"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script implements a data-driven farmer segmentation system for the biofortified maize adoption model. Segment boundaries are derived empirically through triangulation of two complementary analytical frameworks.
+
+## Main Operations
+
+1. Load MAGA-calibrated agricultural data with smooth distributions 
+2. Calculate departmental z-scores for yield and seed expenditure to control for regional heterogeneity
+3. Framework 1: PAM clustering with LDA validation to discover natural farmer groupings
+4. Framework 2: Quadrant segmentation in bidimensional z-score space for interpretable classification
+5. Synthesize variable weights from convergent findings across both frameworks
+6. Apply hurdle scoring model: deterministic OPV classification + probabilistic scoring
+7. Determine optimal segment thresholds via weighted cumulative land distribution
+8. Assign final segments and validate characteristics
+9. Export segmented dataset for economic impact modeling
+
+## Methodological Rationale
+
+Segmentation combines two dimensions of farmer behaviour: seed expenditure per manzana (technology investment) and yield performance (productivity), both standardized within departments to control for local agro-climatic conditions. Seed expenditure alone leaves the two apart: a farmer with high expenditure and low yield occupies a different position from one with high expenditure and high yield.
+
+The dual-framework approach (unsupervised clustering and interpretable quadrants) grounds the final scoring weights in the observed structure of the data.
+
+## Target Segments
+
+| Segment | Description | Seed Behavior |
+|---------|-------------|---------------|
+| OPV/Criollo | Traditional farmers | Zero or near-zero seed expenditure |
+| Low | Low technology adoption | Minimal purchased seed investment |
+| Mid | Moderate adoption | Intermediate seed investment |
+| High | High technology adoption | Premium hybrid seed users |
+
+# Setup
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Environment Setup
+# =============================================================================
+
+# Clear environment
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  survey,         # Complex survey methodology
+  srvyr,          # Tidy wrapper for survey package
+  GGally,         # Correlation matrix (ggpairs)
+  ggtext,         # Markdown elements in ggplot
+  patchwork,      # Plot composition
+  gt,             # Professional table formatting
+  tidyverse       # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to keep namespace clean)
+# Hmisc    — wtd.var() for weighted variance (masking conflict: never p_load)
+# MASS     — lda() for linear discriminant analysis (masking conflict: never p_load)
+# cluster  — pam() for PAM clustering, silhouette() for cluster validation
+# scales   — label_percent() in ggplot scales
+
+# Resolve function conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Display options
+options(
+  scipen = 999,
+  digits = 4
+)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading and Z-Score Calculation
+
+This phase loads the MAGA-calibrated farmer dataset from Script 02_02, separates OPV-direct farmers (those with zero seed expenditure), and calculates departmental z-scores for yield and seed expenditure. The z-score standardization controls for regional heterogeneity in agro-climatic conditions and market access.
+
+## A1. Load Calibrated Agricultural Data
+
+Load the expanded farmer dataset produced by Script 02_02, carrying MAGA-calibrated weights and smooth distributions suitable for threshold-based segmentation.
+
+```{r}
+#| label: a1-load-data
+
+# =============================================================================
+# A1. Load Calibrated Agricultural Data
+# =============================================================================
+
+df_farmers_calibrated <- read_parquet(
+ here("01_data", "02_processed", 
+      "transfer", "02_02_agricultural_data_maga_calibrated.parquet")
+)
+```
+
+## A2. Extract Original Households and Separate OPV-Direct
+
+The MAGA-calibrated dataset contains expanded records with jitter applied. For clustering purposes, we extract the original household representatives (copy_id == 1) to avoid artificial diffusion of cluster boundaries. Segment assignments will later be transferred to all expanded records via household identifier.
+
+The scoring system follows a hurdle model structure: farmers reporting zero seed expenditure are classified as definitive OPV/Criollo users and receive a deterministic classification.
+
+```{r}
+#| label: a2-extract-original-households
+
+# =============================================================================
+# A2. Extract Original Households and Separate OPV-Direct
+# =============================================================================
+
+# Extract original household representatives (before jitter variation)
+df_households_original <- df_farmers_calibrated |>
+ filter(copy_id == 1)
+
+# Separate OPV-direct households (zero seed expenditure)
+df_opv_direct <- df_households_original |>
+ filter(exp_seeds_per_mz == 0)
+
+# Separate hybrid-potential households (positive seed expenditure)
+df_hybrid_potential <- df_households_original |>
+ filter(exp_seeds_per_mz > 0)
+```
+
+## A3. Calculate Departmental Z-Scores
+
+For hybrid-potential households, we calculate departmental z-scores for both yield and seed expenditure. This standardization controls for regional heterogeneity in agro-climatic conditions, market access, and input availability.
+
+Z-scores are calculated using survey-weighted means and variances to properly account for the complex survey design.
+
+```{r}
+#| label: a3-calculate-zscores
+
+# =============================================================================
+# A3. Calculate Departmental Z-Scores for Hybrid-Potential Households
+# =============================================================================
+
+# Calculate weighted departmental statistics for z-score standardization
+df_dept_stats <- df_hybrid_potential |>
+  summarise(
+    # Yield statistics
+    yield_mean = weighted.mean(yield_wtcorn_qq, w = weight_calibrated, na.rm = TRUE),
+    yield_sd = sqrt(Hmisc::wtd.var(yield_wtcorn_qq, weights = weight_calibrated, na.rm = TRUE)),
+    # Seed expenditure statistics
+    seed_mean = weighted.mean(exp_seeds_per_mz, w = weight_calibrated, na.rm = TRUE),
+    seed_sd = sqrt(Hmisc::wtd.var(exp_seeds_per_mz, weights = weight_calibrated, na.rm = TRUE)),
+    # Sample size
+    n_households = n(),
+    .by = departamento
+  )
+
+# Apply z-score transformation to hybrid-potential households
+df_hybrid_zscores <- df_hybrid_potential |>
+  left_join(df_dept_stats, by = "departamento") |>
+  mutate(
+    yield_zscore_dept = (yield_wtcorn_qq - yield_mean) / yield_sd,
+    seed_zscore_dept = (exp_seeds_per_mz - seed_mean) / seed_sd
+  ) |>
+  select(-yield_mean, -yield_sd, -seed_mean, -seed_sd, -n_households)
+```
+
+## A4. Departmental Statistics Summary
+
+This table documents the departmental heterogeneity behind the z-score standardization. Mean yields and seed expenditure vary widely across departments, which standardization accounts for before values are compared across regions.
+
+```{r}
+#| label: tbl-a4-departmental-stats
+#| tbl-cap: "Departmental statistics used for z-score standardization (hybrid-potential households)"
+
+# =============================================================================
+# A4. Departmental Statistics Summary Table
+# =============================================================================
+
+tbl_a4_departmental_stats <- df_dept_stats |>
+  arrange(desc(n_households)) |>
+  mutate(
+    pct_households = n_households / sum(n_households) * 100
+  )
+
+export(
+  tbl_a4_departmental_stats,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_a4_departmental_stats.rds")
+)
+
+tbl_a4_departmental_stats |>
+  gt() |>
+  tab_header(
+    title = "Departmental Reference Statistics for Z-Score Calculation",
+    subtitle = paste0("Weighted means and standard deviations (n = ",
+                      nrow(df_hybrid_potential), " hybrid-potential households)")
+  ) |>
+  cols_label(
+    departamento = "Department",
+    yield_mean = "Mean",
+    yield_sd = "SD",
+    seed_mean = "Mean",
+    seed_sd = "SD",
+    n_households = "Households",
+    pct_households = "% Total"
+  ) |>
+  tab_spanner(
+    label = "Yield (qq/mz)",
+    columns = c(yield_mean, yield_sd)
+  ) |>
+  tab_spanner(
+    label = "Seed Expenditure (Q/mz)",
+    columns = c(seed_mean, seed_sd)
+  ) |>
+  tab_spanner(
+    label = "Sample",
+    columns = c(n_households, pct_households)
+  ) |>
+  fmt_number(
+    columns = c(yield_mean, yield_sd),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(seed_mean, seed_sd),
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = n_households,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = pct_households,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 agricultural module, MAGA-calibrated weights. Statistics calculated using survey-weighted means and variances.")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_spanners()
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(12),
+    source_notes.font.size = px(10)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_a4_departmental_stats)
+```
+
+---
+
+# Phase B: Framework 1 - PAM Clustering with LDA Validation
+
+This framework applies Partitioning Around Medoids (PAM) clustering to discover natural farmer groupings in the bidimensional space of departmental z-scores (yield × seed expenditure). PAM represents each cluster by an actual farmer (the medoid) and is robust to the outliers common in survey data.
+
+Clustering is performed on the original hybrid-potential households (copy_id == 1) to avoid artificial diffusion from jitter-expanded records. Segment assignments will be transferred to all expanded records in Phase F.
+
+## B1. Prepare Clustering Data
+
+Prepare the clustering matrix using only the two z-score variables. The departmental standardization places both variables on comparable scales, so Euclidean distance applies directly for PAM clustering.
+
+```{r}
+#| label: b1-prepare-clustering-data
+
+# =============================================================================
+# B1. Prepare Clustering Data Matrix
+# =============================================================================
+
+# Extract z-scores for clustering (numeric matrix required by PAM)
+mat_clustering <- df_hybrid_zscores |>
+  select(yield_zscore_dept, seed_zscore_dept) |>
+  as.matrix()
+
+# Calculate Euclidean distance matrix
+dist_matrix <- dist(mat_clustering, method = "euclidean")
+```
+
+## B2. PAM Clustering (k=4)
+
+Apply Partitioning Around Medoids with k=4 clusters, corresponding to the expected technology adoption profiles: traditional/OPV-like behavior, low adopters, moderate adopters, and intensive/high-tech farmers. The choice of k=4 aligns with Semilla Nueva's operational segmentation.
+
+```{r}
+#| label: b2-pam-clustering
+
+# =============================================================================
+# B2. PAM Clustering with k=4
+# =============================================================================
+
+# Run PAM clustering
+set.seed(789)
+pam_result <- cluster::pam(
+  x = dist_matrix,
+  k = 4,
+  diss = TRUE,
+  cluster.only = FALSE
+)
+
+# Add cluster assignments to hybrid households dataset
+df_hybrid_clustered <- df_hybrid_zscores |>
+  mutate(
+    cluster_pam = factor(pam_result$clustering)
+  )
+```
+
+## B3. Silhouette Analysis and Cluster Quality
+
+Silhouette analysis measures how well each observation fits within its assigned cluster versus neighboring clusters. Values range from -1 (poor fit) to +1 (excellent fit). An average silhouette width above 0.25 indicates reasonable structure; above 0.50 indicates strong structure.
+
+```{r}
+#| label: b3-silhouette-analysis
+
+# =============================================================================
+# B3. Silhouette Analysis
+# =============================================================================
+
+# Calculate silhouette values for each observation
+sil_result <- cluster::silhouette(pam_result$clustering, dist_matrix)
+
+# Extract silhouette statistics by cluster
+sil_summary <- df_hybrid_clustered |>
+  mutate(
+    sil_width = sil_result[, "sil_width"]
+  ) |>
+  summarise(
+    n_households = n(),
+    avg_silhouette = mean(sil_width),
+    min_silhouette = min(sil_width),
+    max_silhouette = max(sil_width),
+    pct_negative = mean(sil_width < 0) * 100,
+    .by = cluster_pam
+  ) |>
+  arrange(cluster_pam)
+
+# Overall average silhouette
+avg_sil_overall <- mean(sil_result[, "sil_width"])
+```
+
+```{r}
+#| label: fig-b3-mds-clusters
+#| fig-cap: "PAM clustering visualization in MDS space (k=4 clusters)"
+#| fig-width: 10
+#| fig-height: 7
+
+# =============================================================================
+# B3. MDS Visualization of Clusters
+# =============================================================================
+
+# Define color palette for clusters
+cluster_colors <- c(
+  "1" = "#0b54ad",
+  "2" = "#64d0f7",
+  "3" = "#68b800",
+  "4" = "#ffb433"
+)
+
+# Compute MDS coordinates from distance matrix
+mds_coords <- cmdscale(dist_matrix, k = 2)
+
+df_mds <- data.frame(
+  dim1 = mds_coords[, 1],
+  dim2 = mds_coords[, 2],
+  cluster = factor(pam_result$clustering)
+)
+
+export(
+  df_mds,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_b3_mds_clusters.rds")
+)
+
+# Create MDS plot
+ggplot(df_mds, aes(x = dim1, y = dim2, color = cluster)) +
+  geom_point(size = 2.5, alpha = 0.6) +
+  scale_color_manual(
+    values = cluster_colors,
+    labels = paste("Cluster", 1:4)
+  ) +
+  labs(
+    title = "Farmer Segmentation via PAM Clustering",
+    subtitle = paste0("k=4 clusters | Average silhouette: ", round(avg_sil_overall, 3)),
+    x = "MDS Dimension 1",
+    y = "MDS Dimension 2",
+    color = NULL,
+    caption = "Source: ENCOVI 2023 (534 hybrid-potential households). MDS based on Euclidean distance of departmental z-scores."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50")
+  )
+
+# Cleanup
+rm(mds_coords, df_mds)
+```
+
+```{r}
+#| label: fig-b3-silhouette-distribution
+#| fig-cap: "Silhouette width distribution by cluster"
+#| fig-width: 10
+#| fig-height: 8
+
+# =============================================================================
+# B3. Silhouette Width Distribution Plot
+# =============================================================================
+
+# Prepare silhouette data for plotting
+df_silhouette <- data.frame(
+  cluster = factor(sil_result[, "cluster"]),
+  sil_width = sil_result[, "sil_width"]
+) |>
+  arrange(cluster, desc(sil_width)) |>
+  mutate(
+    order = row_number(),
+    .by = cluster
+  )
+
+# Calculate cluster labels with statistics
+cluster_labels <- df_silhouette |>
+  summarise(
+    n = n(),
+    avg_sil = mean(sil_width),
+    .by = cluster
+  ) |>
+  mutate(
+    label = paste0("Cluster ", cluster, ": n = ", n, " | avg = ", round(avg_sil, 2))
+  )
+
+df_silhouette <- df_silhouette |>
+  left_join(cluster_labels |> select(cluster, label), by = "cluster")
+
+export(
+  df_silhouette,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_b3_silhouette_distribution.rds")
+)
+
+# Silhouette plot built with geom_segment
+ggplot(df_silhouette, aes(y = order, color = cluster)) +
+  geom_segment(aes(x = 0, xend = sil_width, yend = order), 
+               linewidth = 0.7,
+               alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = avg_sil_overall, linetype = "solid", color = "#3AAF85", linewidth = 0.8) +
+  scale_color_manual(values = cluster_colors) +
+  facet_wrap(~label, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Silhouette Width Distribution by Cluster",
+    subtitle = paste0("Overall average silhouette: ", round(avg_sil_overall, 3), 
+                      " | Red line = overall average; dashed line = zero"),
+    x = "Silhouette Width",
+    y = NULL,
+    caption = "Source: ENCOVI 2023. Values near 1 indicate strong cluster membership; negative values suggest potential misclassification."
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    plot.caption = element_text(size = 9, color = "grey50"),
+    panel.spacing = unit(0.5, "lines")
+  )
+
+# Cleanup
+rm(df_silhouette, cluster_labels)
+```
+
+## B4. LDA Discriminant Analysis for Variable Importance
+
+Linear Discriminant Analysis quantifies how much each variable contributes to separating the clusters discovered by PAM. The LDA coefficients provide empirically-derived importance weights that inform the final scoring system.
+
+```{r}
+#| label: tbl-b4-lda-importance
+#| tbl-cap: "Variable importance from Linear Discriminant Analysis"
+
+# =============================================================================
+# B4. Linear Discriminant Analysis for Variable Importance
+# =============================================================================
+
+# Fit LDA model using cluster assignments as response
+lda_model <- MASS::lda(
+  cluster_pam ~ yield_zscore_dept + seed_zscore_dept,
+  data = df_hybrid_clustered
+)
+
+# Extract scaling coefficients (discriminant loadings)
+lda_scaling <- as.data.frame(lda_model$scaling)
+
+# Calculate variable importance as sum of absolute coefficients
+lda_importance <- data.frame(
+  variable = rownames(lda_scaling),
+  importance = rowSums(abs(lda_scaling))
+) |>
+  arrange(desc(importance)) |>
+  mutate(
+    importance_pct = importance / sum(importance) * 100,
+    cumulative_pct = cumsum(importance_pct),
+    variable_label = case_when(
+      variable == "yield_zscore_dept" ~ "Yield z-score (departmental)",
+      variable == "seed_zscore_dept" ~ "Seed expenditure z-score (departmental)",
+      TRUE ~ variable
+    )
+  )
+
+export(
+  lda_importance,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_b4_lda_importance.rds")
+)
+
+# Generate GT table
+lda_importance |>
+  select(variable_label, importance_pct, cumulative_pct) |>
+  gt() |>
+  tab_header(
+    title = "Variable Importance from Linear Discriminant Analysis",
+    subtitle = "Based on sum of absolute coefficients across discriminant functions"
+  ) |>
+  cols_label(
+    variable_label = "Variable",
+    importance_pct = "Importance (%)",
+    cumulative_pct = "Cumulative (%)"
+  ) |>
+  fmt_number(
+    columns = c(importance_pct, cumulative_pct),
+    decimals = 1
+  ) |>
+  cols_align(
+    align = "left",
+    columns = variable_label
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(importance_pct, cumulative_pct)
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** LDA on k=4 PAM clusters (n=534 households). Importance = sum of |coefficients| across LD1 and LD2.")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(12),
+    source_notes.font.size = px(10)
+  )
+```
+
+## B5. Cluster Characteristics Summary
+
+This table summarizes the key characteristics of each cluster identified by PAM, providing interpretable profiles for each farmer segment. The cluster means guide the interpretation of what each segment represents in terms of technology adoption behavior.
+
+```{r}
+#| label: tbl-b5-cluster-characteristics
+#| tbl-cap: "Cluster characteristics from PAM segmentation (Framework 1)"
+
+# =============================================================================
+# B5. Cluster Characteristics Summary
+# =============================================================================
+
+# Calculate cluster statistics
+tbl_cluster_chars <- df_hybrid_clustered |>
+  summarise(
+    n_households = n(),
+    weighted_n = sum(weight_calibrated),
+    # Z-score means
+    yield_zscore_mean = weighted.mean(yield_zscore_dept, w = weight_calibrated),
+    seed_zscore_mean = weighted.mean(seed_zscore_dept, w = weight_calibrated),
+    # Original scale means
+    yield_mean = weighted.mean(yield_wtcorn_qq, w = weight_calibrated),
+    seed_exp_mean = weighted.mean(exp_seeds_per_mz, w = weight_calibrated),
+    land_mean = weighted.mean(land_wtcorn, w = weight_calibrated),
+    .by = cluster_pam
+  ) |>
+  arrange(cluster_pam) |>
+  mutate(
+    pct_population = weighted_n / sum(weighted_n) * 100
+  )
+
+export(
+  tbl_cluster_chars,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_b5_cluster_characteristics.rds")
+)
+
+# Generate GT table
+tbl_cluster_chars |>
+  select(
+    cluster_pam, n_households, pct_population,
+    yield_zscore_mean, seed_zscore_mean,
+    yield_mean, seed_exp_mean, land_mean
+  ) |>
+  gt() |>
+  tab_header(
+    title = "PAM Cluster Characteristics (Framework 1)",
+    subtitle = "Survey-weighted means for 534 hybrid-potential households"
+  ) |>
+  cols_label(
+    cluster_pam = "Cluster",
+    n_households = "Households",
+    pct_population = "% Population",
+    yield_zscore_mean = "Yield (z)",
+    seed_zscore_mean = "Seed Exp (z)",
+    yield_mean = "Yield (qq/mz)",
+    seed_exp_mean = "Seed Exp (Q/mz)",
+    land_mean = "Land (mz)"
+  ) |>
+  tab_spanner(
+    label = "Sample",
+    columns = c(n_households, pct_population)
+  ) |>
+  tab_spanner(
+    label = "Z-Scores",
+    columns = c(yield_zscore_mean, seed_zscore_mean)
+  ) |>
+  tab_spanner(
+    label = "Original Scale",
+    columns = c(yield_mean, seed_exp_mean, land_mean)
+  ) |>
+  fmt_number(
+    columns = c(yield_zscore_mean, seed_zscore_mean),
+    decimals = 2,
+    force_sign = TRUE
+  ) |>
+  fmt_number(
+    columns = c(pct_population),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(yield_mean, land_mean),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = seed_exp_mean,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = n_households,
+    decimals = 0
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023. PAM clustering (k=4) on departmental z-scores.")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_spanners()
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+```
+
+```{r}
+#| label: b-cleanup
+
+# =============================================================================
+# B. Cleanup Auxiliary Objects from Phase B
+# =============================================================================
+
+rm(
+  mat_clustering,
+  dist_matrix,
+  pam_result,
+  sil_result,
+  sil_summary,
+  avg_sil_overall,
+  lda_model,
+  lda_scaling,
+  lda_importance,
+  tbl_cluster_chars, 
+  cluster_colors
+)
+```
+
+---
+
+# Phase C: Framework 2 - Quadrant Segmentation
+
+Framework 2 constructs an explicit bidimensional space where both axes represent standardized measures of agricultural performance: yield (productivity) and seed expenditure (technology investment). Segment membership follows directly from the position of a farmer in that space.
+
+By defining segments as quadrants in this z-score space, we create a transparent and reproducible classification system:
+
+- **Traditional/OPV**: Below-average yield AND below-average seed expenditure
+- **Inefficient**: Below-average yield BUT above-average seed expenditure  
+- **Efficient**: Above-average yield BUT below-average seed expenditure
+- **Intensive**: Above-average yield AND above-average seed expenditure
+
+The deterministic construction gives immediate classification of new farmers, visual interpretability, and stability under sample size changes.
+
+## C1. Assign Quadrant Segments
+
+Assign each hybrid-potential household to one of four quadrants based on their departmental z-scores. The quadrant boundaries are defined by z-score = 0 (the departmental weighted mean).
+
+```{r}
+#| label: c1-assign-quadrants
+
+# =============================================================================
+# C1. Assign Quadrant Segments Based on Z-Score Signs
+# =============================================================================
+
+df_hybrid_quadrants <- df_hybrid_clustered |>
+  mutate(
+    segment_fw2 = case_when(
+      yield_zscore_dept < 0 & seed_zscore_dept < 0 ~ "Traditional/OPV",
+      yield_zscore_dept < 0 & seed_zscore_dept >= 0 ~ "Inefficient",
+      yield_zscore_dept >= 0 & seed_zscore_dept < 0 ~ "Efficient",
+      yield_zscore_dept >= 0 & seed_zscore_dept >= 0 ~ "Intensive"
+    ),
+    segment_fw2 = factor(
+      segment_fw2,
+      levels = c("Traditional/OPV", "Inefficient", "Efficient", "Intensive"),
+      ordered = TRUE
+    )
+  )
+```
+
+## C2. Bidimensional Space Visualization
+
+Visualize the farmer distribution in the bidimensional z-score space with quadrant boundaries. This plot directly communicates the dual dimensions of technology adoption (seed investment) and productivity (yield).
+
+```{r}
+#| label: fig-c2-bidimensional-space
+#| fig-cap: "Farmer segmentation in bidimensional z-score space (Framework 2)"
+#| fig-width: 10
+#| fig-height: 8
+
+# =============================================================================
+# C2. Bidimensional Space Visualization
+# =============================================================================
+
+# Define segment colors
+segment_colors <- c(
+  "Traditional/OPV" = "#ffb433",
+  "Inefficient" = "#e00000",
+  "Efficient" = "#68b800",
+  "Intensive" = "#0b54ad"
+)
+
+export(
+  df_hybrid_quadrants,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_c2_bidimensional_space.rds")
+)
+
+ggplot(df_hybrid_quadrants,
+       aes(x = seed_zscore_dept, y = yield_zscore_dept, color = segment_fw2)) +
+  geom_point(alpha = 0.6, size = 2.5) +
+  # Quadrant boundaries
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray50", linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "gray50", linewidth = 0.8) +
+  # Quadrant labels
+  annotate("text", x = -2, y = 2.5,
+           label = "EFFICIENT\n(High yield, Low cost)", 
+           size = 3.5, color = "#68b800", fontface = "bold", hjust = 0.5) +
+  annotate("text", x = 3, y = 3.5, 
+           label = "INTENSIVE\n(High yield, High cost)", 
+           size = 3.5, color = "#0b54ad", fontface = "bold", hjust = 0.5) +
+  annotate("text", x = -2, y = -2, 
+           label = "TRADITIONAL/OPV\n(Low yield, Low cost)", 
+           size = 3.5, color = "#ffb433", fontface = "bold", hjust = 0.5) +
+  annotate("text", x = 3, y = -2, 
+           label = "INEFFICIENT\n(Low yield, High cost)", 
+           size = 3.5, color = "#e00000", fontface = "bold", hjust = 0.5) +
+  scale_color_manual(values = segment_colors) +
+  coord_cartesian(xlim = c(-3, 5), ylim = c(-3, 5)) +
+  labs(
+    title = "Farmer Segmentation: Yield vs. Seed Investment",
+    subtitle = "Departmentally-standardized z-scores define four operational quadrants",
+    x = "Seed Expenditure Z-score (departmental)",
+    y = "Yield Z-score (departmental)",
+    color = "Segment",
+    caption = "Source: ENCOVI 2023 (534 hybrid-potential households). Quadrant boundaries at z=0 (departmental means)."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50")
+  )
+```
+
+## C3. Z-Score Distributions by Segment
+
+Density plots showing the distribution of yield and seed expenditure z-scores within each quadrant segment. The vertical dashed lines at z=0 mark the quadrant boundaries.
+
+```{r}
+#| label: fig-c3-zscore-distributions
+#| fig-cap: "Z-score distributions by quadrant segment (Framework 2)"
+#| fig-width: 10
+#| fig-height: 5.5
+
+# =============================================================================
+# C3. Z-Score Distribution Plots
+# =============================================================================
+
+export(
+  df_hybrid_quadrants,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_c3_zscore_distributions.rds")
+)
+
+# Yield z-score distribution
+plot_yield_dist <- ggplot(df_hybrid_quadrants,
+                          aes(x = yield_zscore_dept, fill = segment_fw2)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  scale_fill_manual(values = segment_colors) +
+  labs(
+    title = "Yield Z-score Distribution",
+    x = "Yield Z-score (departmental)",
+    y = "Density",
+    fill = "Segment"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 12)
+  )
+
+# Seed expenditure z-score distribution
+plot_seed_dist <- ggplot(df_hybrid_quadrants, 
+                         aes(x = seed_zscore_dept, fill = segment_fw2)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  scale_fill_manual(values = segment_colors) +
+  labs(
+    title = "Seed Expenditure Z-score Distribution",
+    x = "Seed Expenditure Z-score (departmental)",
+    y = "Density",
+    fill = "Segment"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12)
+  )
+
+# Combine plots
+plot_yield_dist + plot_seed_dist +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+# Cleanup
+rm(plot_yield_dist, plot_seed_dist)
+```
+
+## C4. Quadrant Segment Characteristics
+
+Summary statistics for each quadrant segment, enabling comparison of farmer profiles across the four technology adoption categories.
+
+```{r}
+#| label: tbl-c4-quadrant-characteristics
+#| tbl-cap: "Quadrant segment characteristics (Framework 2)"
+
+# =============================================================================
+# C4. Quadrant Segment Characteristics Table
+# =============================================================================
+
+tbl_quadrant_chars <- df_hybrid_quadrants |>
+  summarise(
+    n_households = n(),
+    weighted_n = sum(weight_calibrated),
+    # Z-score means
+    yield_zscore_mean = weighted.mean(yield_zscore_dept, w = weight_calibrated),
+    seed_zscore_mean = weighted.mean(seed_zscore_dept, w = weight_calibrated),
+    # Original scale means
+    yield_mean = weighted.mean(yield_wtcorn_qq, w = weight_calibrated),
+    seed_exp_mean = weighted.mean(exp_seeds_per_mz, w = weight_calibrated),
+    land_mean = weighted.mean(land_wtcorn, w = weight_calibrated),
+    .by = segment_fw2
+  ) |>
+  arrange(segment_fw2) |>
+  mutate(
+    pct_population = weighted_n / sum(weighted_n) * 100
+  )
+
+export(
+  tbl_quadrant_chars,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_c4_quadrant_characteristics.rds")
+)
+
+# Generate GT table
+tbl_quadrant_chars |>
+  select(
+    segment_fw2, n_households, pct_population,
+    yield_zscore_mean, seed_zscore_mean,
+    yield_mean, seed_exp_mean, land_mean
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Quadrant Segment Characteristics (Framework 2)",
+    subtitle = "Survey-weighted means for 534 hybrid-potential households"
+  ) |>
+  cols_label(
+    segment_fw2 = "Segment",
+    n_households = "Households",
+    pct_population = "% Population",
+    yield_zscore_mean = "Yield (z)",
+    seed_zscore_mean = "Seed Exp (z)",
+    yield_mean = "Yield (qq/mz)",
+    seed_exp_mean = "Seed Exp (Q/mz)",
+    land_mean = "Land (mz)"
+  ) |>
+  tab_spanner(
+    label = "Sample",
+    columns = c(n_households, pct_population)
+  ) |>
+  tab_spanner(
+    label = "Z-Scores",
+    columns = c(yield_zscore_mean, seed_zscore_mean)
+  ) |>
+  tab_spanner(
+    label = "Original Scale",
+    columns = c(yield_mean, seed_exp_mean, land_mean)
+  ) |>
+  fmt_number(
+    columns = c(yield_zscore_mean, seed_zscore_mean),
+    decimals = 2,
+    force_sign = TRUE
+  ) |>
+  fmt_number(
+    columns = pct_population,
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(yield_mean, land_mean),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = seed_exp_mean,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = n_households,
+    decimals = 0
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023. Quadrant segments defined by z-score signs (boundary at z=0).")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_spanners()
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+```
+
+```{r}
+#| label: c-cleanup
+
+# =============================================================================
+# C. Cleanup Auxiliary Objects from Phase C
+# =============================================================================
+
+rm(
+  segment_colors,
+  tbl_quadrant_chars
+)
+```
+
+---
+
+# Phase D: Scoring System Synthesis
+
+This phase synthesizes findings from both analytical frameworks to construct an empirically-grounded scoring system for farmer segmentation. The scoring weights and ranges are derived from the convergent patterns observed in PAM clustering (Framework 1) and quadrant segmentation (Framework 2).
+
+The scoring system follows a hurdle model structure: farmers with zero seed expenditure receive deterministic OPV classification, while farmers with positive seed expenditure receive probabilistic scores based on their departmental z-scores and socioeconomic characteristics.
+
+## D1. Framework Convergence Analysis
+
+Cross-tabulation of PAM cluster assignments (Framework 1) against quadrant segments (Framework 2) shows the extent to which both approaches identify similar underlying structure in the farmer population.
+
+```{r}
+#| label: tbl-d1-framework-convergence
+#| tbl-cap: "Framework convergence: PAM clusters vs quadrant segments"
+
+# =============================================================================
+# D1. Framework Convergence Analysis
+# =============================================================================
+
+# Calculate agreement rate
+agreement_mapping <- df_hybrid_quadrants |>
+  mutate(
+    match = case_when(
+      cluster_pam == 3 & segment_fw2 == "Traditional/OPV" ~ TRUE,
+      cluster_pam == 2 & segment_fw2 == "Intensive" ~ TRUE,
+      cluster_pam == 4 & segment_fw2 == "Efficient" ~ TRUE,
+      cluster_pam == 1 & segment_fw2 %in% c("Efficient", "Intensive") ~ TRUE,
+      TRUE ~ FALSE
+    )
+  )
+agreement_rate <- round(mean(agreement_mapping$match) * 100, 1)
+
+# Create cross-tabulation
+tbl_convergence <- df_hybrid_quadrants |>
+  count(cluster_pam, segment_fw2) |>
+  pivot_wider(
+    names_from = segment_fw2,
+    values_from = n,
+    values_fill = 0
+  ) |>
+  mutate(
+    Total = `Traditional/OPV` + Inefficient + Efficient + Intensive
+  )
+
+export(
+  tbl_convergence,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_d1_framework_convergence.rds")
+)
+
+# Generate GT table
+tbl_convergence |>
+  gt() |>
+  tab_header(
+    title = "Framework Convergence: PAM Clusters vs Quadrant Segments",
+    subtitle = paste0("Cross-tabulation of household assignments (n = 534) | Agreement rate: ", agreement_rate, "%")
+  ) |>
+  cols_label(
+    cluster_pam = "PAM Cluster",
+    `Traditional/OPV` = "Traditional/OPV",
+    Inefficient = "Inefficient",
+    Efficient = "Efficient",
+    Intensive = "Intensive",
+    Total = "Total"
+  ) |>
+  tab_spanner(
+    label = "Quadrant Segments (Framework 2)",
+    columns = c(`Traditional/OPV`, Inefficient, Efficient, Intensive)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_spanners()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = Total)
+  ) |>
+  tab_source_note(
+    source_note = md("**Note:** Cluster 3 ↔ Traditional/OPV (92%), Cluster 2 ↔ Intensive (56%), Cluster 4 ↔ Efficient (72%). High diagonal concentration validates framework convergence.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+
+# Cleanup
+rm(agreement_mapping, tbl_convergence)
+```
+
+### Convergence Interpretation
+
+The cross-tabulation above reports the agreement rate between the two frameworks. Their convergence supports the variable weighting schema developed in the following sections.
+
+
+## D2. Empirical Justification for Variable Selection
+
+The scoring system includes four variables: yield z-score (primary), seed expenditure z-score (primary), poverty level (modulator), and land ownership (modulator). This section presents the correlation analysis that justifies these selections and the exclusion of other candidate variables (age, education).
+
+### D2a. Primary Variables: Yield and Seed Expenditure
+
+The correlation between yield and seed expenditure is positive but moderate, consistent with the two variables capturing distinct dimensions of agricultural performance.
+
+```{r}
+#| label: fig-d2a-yield-seed-correlation
+#| fig-cap: "Correlation between yield and seed expenditure z-scores"
+#| fig-width: 8
+#| fig-height: 6
+
+# =============================================================================
+# D2a. Yield vs Seed Expenditure Correlation
+# =============================================================================
+
+# Calculate correlation
+cor_yield_seed <- cor.test(
+  df_hybrid_quadrants$yield_zscore_dept,
+  df_hybrid_quadrants$seed_zscore_dept
+)
+
+export(
+  df_hybrid_quadrants,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_d2a_yield_seed_correlation.rds")
+)
+
+# Scatter plot with regression line
+ggplot(df_hybrid_quadrants, aes(x = seed_zscore_dept, y = yield_zscore_dept)) +
+  geom_point(alpha = 0.3, color = "#0b54ad", size = 2) +
+  geom_smooth(method = "lm", formula = 'y ~ x', 
+              se = TRUE, 
+              color = "#3AAF85", fill = "grey90", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title = "Relationship Between Yield and Seed Expenditure",
+    subtitle = paste0("Pearson r = ", round(cor_yield_seed$estimate, 3), 
+                      " (p ", ifelse(cor_yield_seed$p.value < 0.001, "< 0.001", 
+                                     paste0("= ", round(cor_yield_seed$p.value, 3))), ")"),
+    x = "Seed Expenditure Z-score (departmental)",
+    y = "Yield Z-score (departmental)",
+    caption = "Source: ENCOVI 2023 (534 hybrid-potential households). Moderate positive correlation indicates non-redundant dimensions."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50")
+  )
+
+# Store correlation for later reference
+cor_primary <- round(cor_yield_seed$estimate, 3)
+rm(cor_yield_seed)
+```
+
+### D2b. Stratified Analysis: Poverty Level as Modulator
+
+Stratified correlation analysis reveals that poverty status modulates the relationship between agricultural variables. The differential patterns across poverty levels—visible in both slope differences and distribution shapes—justify including poverty as a scoring modulator.
+
+```{r}
+#| label: fig-d2b-correlation-poverty
+#| fig-cap: "Correlation patterns stratified by poverty level"
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+
+# =============================================================================
+# D2b. Correlation Matrix Stratified by Poverty Level
+# =============================================================================
+
+# Define colors for poverty levels
+poverty_colors <- c(
+  "Extreme poverty" = "#e00000",
+  "Non-extreme poverty" = "#ffb433",
+  "Non-poor" = "#68b800"
+)
+
+# Custom smooth function for poverty stratification
+my_smooth_poverty <- function(data, mapping, ...) {
+  ggplot(data = data, mapping = mapping) +
+    geom_point(aes(color = poverty_factor), alpha = 0.3, size = 0.8) +
+    geom_smooth(
+      aes(color = poverty_factor, fill = poverty_factor),
+      method = "lm",
+      formula = 'y ~ x',
+      se = TRUE,
+      alpha = 0.15,
+      linewidth = 1
+    ) +
+    scale_color_manual(values = poverty_colors) +
+    scale_fill_manual(values = poverty_colors)
+}
+
+# Custom density function for diagonal
+my_density_poverty <- function(data, mapping, ...) {
+  ggplot(data = data, mapping = mapping) +
+    geom_density(aes(color = poverty_factor, fill = poverty_factor), alpha = 0.4) +
+    scale_color_manual(values = poverty_colors) +
+    scale_fill_manual(values = poverty_colors)
+}
+
+# Prepare data with poverty factor
+df_correlation_poverty <- df_households_original |>
+  mutate(
+    poverty_factor = case_when(
+      pobreza %in% c(0, 1) ~ "Extreme poverty",
+      pobreza == 2 ~ "Non-extreme poverty",
+      pobreza == 3 ~ "Non-poor",
+      TRUE ~ NA_character_
+    ),
+    poverty_factor = factor(poverty_factor,
+                            levels = c("Extreme poverty", "Non-extreme poverty", "Non-poor"))
+  ) |>
+  filter(!is.na(poverty_factor)) |>
+  select(
+    land_wtcorn,
+    yield_wtcorn_qq,
+    exp_seeds_per_mz,
+    revenue,
+    poverty_factor
+  ) |>
+  filter(
+    land_wtcorn < 15,
+    yield_wtcorn_qq < 150,
+    exp_seeds_per_mz < 200,
+    revenue < 6000
+  )
+
+export(
+  df_correlation_poverty,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_d2b_correlation_poverty.rds")
+)
+
+# Create ggpairs matrix
+plot_correlation_poverty <- ggpairs(
+  df_correlation_poverty,
+  columns = 1:4,
+  progress = FALSE,
+  columnLabels = c(
+    "Land\n(mz)",
+    "Yield\n(qq/mz)",
+    "Seed Exp.\n(Q/mz)",
+    "Revenue\n(Q/mz)"
+  ),
+  upper = list(
+    continuous = wrap("cor", size = 4, color = "#1a1a2e")
+  ),
+  lower = list(
+    continuous = my_smooth_poverty
+  ),
+  diag = list(
+    continuous = my_density_poverty
+  )
+) +
+  labs(
+    title = "Correlation Patterns Stratified by Poverty Level",
+    subtitle = "<span style='color:#e00000;'>**Extreme poverty**</span> | <span style='color:#ffb433;'>**Non-extreme poverty**</span> | <span style='color:#68b800;'>**Non-poor**</span>",
+    caption = "Source: ENCOVI 2023 (534 hybrid-potential households). Differential slopes justify poverty as scoring modulator."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_markdown(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50"),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+plot_correlation_poverty
+
+# Cleanup
+rm(df_correlation_poverty, plot_correlation_poverty, my_smooth_poverty,
+   my_density_poverty, poverty_colors)
+```
+
+### D2c. Stratified Analysis: Land Ownership as Modulator
+  
+Land ownership status modulates agricultural performance patterns. Owners and non-owners exhibit distinct investment-yield dynamics, with non-owners showing steeper negative relationships, justifying the inclusion of ownership as a secondary scoring modulator.
+
+```{r}
+#| label: fig-d2c-correlation-ownership
+#| fig-cap: "Correlation patterns stratified by land ownership status"
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+
+# =============================================================================
+# D2c. Correlation Matrix Stratified by Land Ownership
+# =============================================================================
+
+# Define colors for ownership status
+ownership_colors <- c(
+  "Non-owner" = "#e00000",
+  "Owner" = "#68b800"
+)
+
+# Custom smooth function for ownership stratification
+my_smooth_owner <- function(data, mapping, ...) {
+  ggplot(data = data, mapping = mapping) +
+    geom_point(aes(color = ownership_factor), alpha = 0.3, size = 0.8) +
+    geom_smooth(
+      aes(color = ownership_factor, fill = ownership_factor),
+      method = "lm",
+      formula = 'y ~ x',
+      se = TRUE,
+      alpha = 0.15,
+      linewidth = 1
+    ) +
+    scale_color_manual(values = ownership_colors) +
+    scale_fill_manual(values = ownership_colors)
+}
+
+# Custom density function for diagonal
+my_density_owner <- function(data, mapping, ...) {
+  ggplot(data = data, mapping = mapping) +
+    geom_density(aes(color = ownership_factor, fill = ownership_factor), alpha = 0.4) +
+    scale_color_manual(values = ownership_colors) +
+    scale_fill_manual(values = ownership_colors)
+}
+
+# Prepare data with ownership factor
+df_correlation_owner <- df_households_original |>
+  mutate(
+    ownership_factor = case_when(
+      landowner == 1 ~ "Owner",
+      landowner == 0 ~ "Non-owner",
+      TRUE ~ NA_character_
+    ),
+    ownership_factor = factor(ownership_factor, levels = c("Non-owner", "Owner"))
+  ) |>
+  filter(!is.na(ownership_factor)) |>
+  select(
+    land_wtcorn,
+    yield_wtcorn_qq,
+    exp_seeds_per_mz,
+    revenue,
+    ownership_factor
+  ) |>
+  filter(
+    land_wtcorn < 15,
+    yield_wtcorn_qq < 150,
+    exp_seeds_per_mz < 200,
+    revenue < 6000
+  )
+
+export(
+  df_correlation_owner,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_d2c_correlation_ownership.rds")
+)
+
+# Create ggpairs matrix
+plot_correlation_owner <- ggpairs(
+  df_correlation_owner,
+  columns = 1:4,
+  progress = FALSE,
+  columnLabels = c(
+    "Land\n(mz)",
+    "Yield\n(qq/mz)",
+    "Seed Exp.\n(Q/mz)",
+    "Revenue\n(Q/mz)"
+  ),
+  upper = list(
+    continuous = wrap("cor", size = 4, color = "#1a1a2e")
+  ),
+  lower = list(
+    continuous = my_smooth_owner
+  ),
+  diag = list(
+    continuous = my_density_owner
+  )
+) +
+  labs(
+    title = "Correlation Patterns Stratified by Land Ownership Status",
+    subtitle = "<span style='color:#e00000;'>**Non-owner**</span> | <span style='color:#68b800;'>**Owner**</span>",
+    caption = "Source: ENCOVI 2023 (534 hybrid-potential households). Differential patterns justify ownership as scoring modulator."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_markdown(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50"),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+plot_correlation_owner
+
+# Cleanup
+rm(df_correlation_owner, plot_correlation_owner, my_smooth_owner,
+   my_density_owner, ownership_colors)
+```
+
+### D2d. Age and Education
+
+The correlation matrix below shows no systematic relationship between farmer age or education level and the agricultural performance metrics (yield, seed expenditure). Neither variable enters the scoring system.
+
+```{r}
+#| label: fig-d2d-correlation-sociodemographic
+#| fig-cap: "Correlation matrix of sociodemographic and agricultural variables"
+#| fig-width: 10
+#| fig-height: 10
+#| warning: false
+
+# =============================================================================
+# D2d. Sociodemographic Correlation Matrix
+# =============================================================================
+
+# Custom smooth function with corporate color
+my_smooth <- function(data, mapping, ...) {
+ ggplot(data = data, mapping = mapping) +
+   geom_point(alpha = 0.5, size = 0.8, color = "#0b54ad") +
+   geom_smooth(
+     method = "lm",
+     formula = 'y ~ x',
+     se = FALSE,
+     color = "#0b54ad",
+     linewidth = 0.8
+   )
+}
+
+# Prepare data for sociodemographic correlation
+df_correlation_socio <- df_households_original |>
+ select(
+   yield_wtcorn_qq,
+   exp_seeds_per_mz,
+   farmer_age,
+   farmer_ed,
+   pobreza
+ ) |>
+ filter(
+   yield_wtcorn_qq < 150,
+   exp_seeds_per_mz < 200,
+   farmer_age < 90
+ ) |>
+ drop_na()
+
+export(
+  df_correlation_socio,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_d2d_correlation_sociodemographic.rds")
+)
+
+# Create ggpairs matrix
+plot_correlation_socio <- ggpairs(
+ df_correlation_socio,
+ progress = FALSE,
+ columnLabels = c(
+   "Yield\n(qq/mz)",
+   "Seed Exp.\n(Q/mz)",
+   "Farmer Age\n(years)",
+   "Education\nLevel",
+   "Poverty\nLevel"
+ ),
+ upper = list(
+   continuous = wrap("cor", size = 4, color = "#1a1a2e")
+ ),
+ lower = list(
+   continuous = my_smooth
+ ),
+ diag = list(
+   continuous = wrap("densityDiag", fill = "#0b54ad", alpha = 0.2, color = "#0b54ad")
+ )
+) +
+ labs(
+   title = "Correlation Matrix: Sociodemographic and Agricultural Variables",
+   subtitle = "Age and education show no significant correlation with performance metrics",
+   caption = "Source: ENCOVI 2023 (534 hybrid-potential households). Near-zero correlations justify exclusion from scoring."
+ ) +
+ theme_minimal() +
+ theme(
+   plot.title = element_text(face = "bold", size = 14),
+   plot.subtitle = element_text(size = 11),
+   plot.caption = element_text(size = 9, color = "grey50"),
+   strip.text = element_text(face = "bold", size = 10),
+   axis.text = element_text(size = 8),
+   panel.grid.minor = element_blank()
+ )
+
+plot_correlation_socio
+
+# Cleanup
+rm(df_correlation_socio, plot_correlation_socio, my_smooth)
+```
+
+## D3. Scoring Ranges Definition
+
+Based on the empirical findings from both frameworks and the correlation analysis, we define a continuous scoring system that maps z-score values to OPV-likelihood points through percentile ranking. 
+
+### Scoring Components Overview
+
+**Primary Variables (85% total weight):**
+
+| Component | Max Points | Weight | Justification |
+|-----------|------------|--------|---------------|
+| Yield performance (z-score) | 40 | 40% | LDA importance (Section B4) |
+| Seed expenditure (z-score) | 45 | 45% | LDA importance (Section B4) |
+
+**Secondary Modulators (15% total weight):**
+
+| Component | Max Points | Weight | Justification |
+|-----------|------------|--------|---------------|
+| Poverty level | 10 | 10% | Stratified analysis shows differential slopes by poverty |
+| Land ownership | 5 | 5% | Ownership modulates investment-performance dynamics |
+
+### Continuous Scoring Logic
+
+For primary variables (yield and seed expenditure z-scores), points are assigned by **percentile rank** within the hybrid-potential population:
+
+$$\text{Score}_{\text{yield}} = \left(1 - \text{percentile}(z_{\text{yield}})\right) \times 40$$
+
+$$\text{Score}_{\text{seed}} = \left(1 - \text{percentile}(z_{\text{seed}})\right) \times 45$$
+
+**Interpretation:**
+- Lower z-scores (below departmental average) → higher points → more OPV-likely
+- Higher z-scores (above departmental average) → lower points → less OPV-likely
+- Percentile ranking spreads scores across the full available range and bounds the influence of extreme z-scores
+
+### Secondary Modulators
+
+**Poverty Level (10 points maximum):**
+
+| Status | Points | Justification |
+|--------|--------|---------------|
+| Extreme poverty | 10 | Strongest constraint on agricultural investment capacity |
+| Non-extreme poverty | 5 | Intermediate constraint level |
+| Non-poor | 0 | Reference category |
+
+**Land Ownership (5 points maximum):**
+
+| Status | Points | Justification |
+|--------|--------|---------------|
+| Non-owner | 5 | Steeper negative slopes in stratified analysis |
+| Owner | 0 | Reference category |
+
+### Final Score Calculation
+
+For farmers with positive seed expenditure:
+
+$$\text{Score} = \text{Score}_{\text{yield}} + \text{Score}_{\text{seed}} + \text{Points}_{\text{poverty}} + \text{Points}_{\text{ownership}}$$
+
+The resulting 0-100 point scale enables continuous ranking of the farmer population by OPV adoption likelihood. OPV-direct farmers (zero seed expenditure) receive a deterministic score of 100.
+
+
+## D4. Apply Hurdle Scoring Model
+
+The scoring system follows a two-stage hurdle structure applied to all synthetic farmer records:
+
+**Stage 1 - Deterministic Classification:** Records with zero seed expenditure receive automatic score of 100, classifying them as OPV-direct users.
+
+**Stage 2 - Probabilistic Scoring:** Records with positive seed expenditure receive scores based on their individual z-scores (calculated using departmental reference statistics from original households) and socioeconomic characteristics.
+
+Patterns are learned from the original households and then applied to the synthetic population to capture realistic variability.
+
+```{r}
+#| label: d4-apply-scoring
+
+# =============================================================================
+# D4. Apply Hurdle Scoring Model to Full Synthetic Population
+# =============================================================================
+
+# The scoring system follows a two-stage hurdle structure:
+# Stage 1: Deterministic classification for OPV-direct farmers (exp_seeds_per_mz == 0)
+# Stage 2: Continuous probabilistic scoring for hybrid-potential farmers
+
+# -----------------------------------------------------------------------------
+# Step 1: Calculate departmental z-scores for all farmers
+# -----------------------------------------------------------------------------
+
+df_farmers_with_zscores <- df_farmers_calibrated |>
+  # Join departmental reference statistics
+  left_join(
+    df_dept_stats |> select(departamento, yield_mean, yield_sd, seed_mean, seed_sd),
+    by = "departamento"
+  ) |>
+  # Calculate z-scores using departmental references
+  mutate(
+    yield_zscore_dept = (yield_wtcorn_qq - yield_mean) / yield_sd,
+    seed_zscore_dept = (exp_seeds_per_mz - seed_mean) / seed_sd
+  ) |>
+  # Create factor variables for secondary modulators
+  mutate(
+    poverty_factor = case_when(
+      pobreza %in% c(0, 1) ~ "Extreme poverty",
+      pobreza == 2 ~ "Non-extreme poverty",
+      pobreza == 3 ~ "Non-poor",
+      TRUE ~ NA_character_
+    ),
+    ownership_factor = case_when(
+      landowner == 1 ~ "Owner",
+      landowner == 0 ~ "Non-owner",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  # Identify OPV-direct farmers
+
+  mutate(is_opv_direct = exp_seeds_per_mz == 0)
+
+# -----------------------------------------------------------------------------
+# Step 2: Calculate percentile ranks for hybrid-potential farmers only
+# Percentile-based scoring spreads farmers across the score range
+# -----------------------------------------------------------------------------
+
+df_hybrid_percentiles <- df_farmers_with_zscores |>
+  filter(!is_opv_direct) |>
+  mutate(
+    # Percentile rank within hybrid-potential population (0 = lowest, 1 = highest)
+    yield_percentile = percent_rank(yield_zscore_dept),
+    seed_percentile = percent_rank(seed_zscore_dept),
+    
+    # Convert to OPV-likelihood scores (lower z-score = higher OPV likelihood)
+    # Farmers at bottom of distribution (percentile ~ 0) get maximum points
+    # Farmers at top of distribution (percentile ~ 1) get minimum points
+    score_yield = (1 - yield_percentile) * 40,
+    score_seed = (1 - seed_percentile) * 45,
+    
+    # Secondary modulators (discrete)
+    score_poverty = case_when(
+      poverty_factor == "Extreme poverty" ~ 10,
+      poverty_factor == "Non-extreme poverty" ~ 5,
+      poverty_factor == "Non-poor" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    score_ownership = case_when(
+      ownership_factor == "Non-owner" ~ 5,
+      ownership_factor == "Owner" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # Total score for hybrid-potential farmers
+    score_total = score_yield + score_seed + score_poverty + score_ownership
+  ) |>
+  select(farmer_id, yield_percentile, seed_percentile, 
+         score_yield, score_seed, score_poverty, score_ownership, score_total)
+
+# -----------------------------------------------------------------------------
+# Step 3: Merge scores back to full population
+# -----------------------------------------------------------------------------
+
+df_farmers_scored <- df_farmers_with_zscores |>
+  left_join(df_hybrid_percentiles, by = "farmer_id") |>
+  mutate(
+    # OPV-direct farmers get score of 100
+    score_total = if_else(is_opv_direct, 100, score_total),
+    # Set component scores to NA for OPV-direct (not applicable)
+    score_yield = if_else(is_opv_direct, NA_real_, score_yield),
+    score_seed = if_else(is_opv_direct, NA_real_, score_seed),
+    score_poverty = if_else(is_opv_direct, NA_real_, score_poverty),
+    score_ownership = if_else(is_opv_direct, NA_real_, score_ownership)
+  ) |>
+  # Remove auxiliary columns
+  select(-yield_mean, -yield_sd, -seed_mean, -seed_sd,
+         -yield_percentile, -seed_percentile) |>
+  # Order by score descending
+  arrange(desc(score_total))
+
+# Cleanup
+rm(df_farmers_with_zscores, df_hybrid_percentiles)
+```
+
+## D5. Score Distribution Analysis
+
+Examination of the score distribution across the full synthetic farmer population. The distribution should show clear separation between OPV-direct farmers (score = 100) and hybrid-potential farmers (score 0-100), with hybrid farmers distributed across the scoring range according to their individual z-score profiles.
+
+```{r}
+#| label: fig-d5-score-distribution
+#| fig-cap: "Distribution of OPV-likelihood scores across synthetic farmer population"
+#| fig-width: 10
+#| fig-height: 6
+
+# =============================================================================
+# D5. Score Distribution Analysis
+# =============================================================================
+
+# Calculate summary statistics for annotation
+n_opv_direct <- sum(df_farmers_scored$is_opv_direct)
+n_hybrid <- sum(!df_farmers_scored$is_opv_direct)
+pct_opv_weighted <- round(
+  sum(df_farmers_scored$weight_calibrated[df_farmers_scored$is_opv_direct]) /
+  sum(df_farmers_scored$weight_calibrated) * 100, 1
+)
+
+export(
+  df_farmers_scored,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_d5_score_distribution.rds")
+)
+
+ggplot(df_farmers_scored, aes(x = score_total)) +
+  geom_histogram(binwidth = 5, fill = "#0b54ad", color = "white", alpha = 0.2) +
+  geom_vline(xintercept = 100, linetype = "dashed", color = "#3AAF85", linewidth = 1) +
+  annotate("text", x = 95, y = Inf, 
+           label = paste0("OPV-direct\n(n=", n_opv_direct, ", ", pct_opv_weighted, "%)"), 
+           hjust = 1, vjust = 1.5, size = 3.5, color = "#3AAF85", fontface = "bold") +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(
+    title = "Distribution of OPV-Likelihood Scores",
+    subtitle = paste0("n = ", nrow(df_farmers_scored), " synthetic farmer records | ",
+                      "OPV-direct: ", n_opv_direct, " (score=100) | ",
+                      "Hybrid-potential: ", n_hybrid, " (score 0-100)"),
+    x = "OPV-Likelihood Score",
+    y = "Number of Farmer Records",
+    caption = "Source: ENCOVI 2023 synthetic population (MAGA-calibrated). Higher scores indicate greater likelihood of OPV/traditional farming."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50")
+  )
+
+# Cleanup
+rm(n_opv_direct, n_hybrid, pct_opv_weighted)
+```
+
+```{r}
+#| label: tbl-d5-score-summary
+#| tbl-cap: "Score distribution summary by farmer type"
+
+# =============================================================================
+# D5. Score Summary Statistics Table
+# =============================================================================
+
+# Summary by farmer type
+tbl_score_summary <- df_farmers_scored |>
+  mutate(
+    farmer_type = if_else(is_opv_direct, "OPV-Direct", "Hybrid-Potential")
+  ) |>
+  summarise(
+    n_records = n(),
+    weighted_n = sum(weight_calibrated),
+    score_min = min(score_total),
+    score_max = max(score_total),
+    score_mean = mean(score_total),
+    score_median = median(score_total),
+    score_sd = sd(score_total),
+    .by = farmer_type
+  ) |>
+  arrange(desc(farmer_type)) |>
+  mutate(
+    pct_weighted = weighted_n / sum(weighted_n) * 100
+  )
+
+export(
+  tbl_score_summary,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_d5_score_summary.rds")
+)
+
+# Generate GT table
+tbl_score_summary |>
+  select(farmer_type, n_records, weighted_n, pct_weighted,
+         score_min, score_max, score_mean, score_median, score_sd) |>
+  gt() |>
+  tab_header(
+    title = "Score Distribution Summary",
+    subtitle = "OPV-likelihood scores by farmer type (synthetic population)"
+  ) |>
+  cols_label(
+    farmer_type = "Farmer Type",
+    n_records = "Records",
+    weighted_n = "Weighted N",
+    pct_weighted = "% Population",
+    score_min = "Min",
+    score_max = "Max",
+    score_mean = "Mean",
+    score_median = "Median",
+    score_sd = "SD"
+  ) |>
+  tab_spanner(
+    label = "Sample",
+    columns = c(n_records, weighted_n, pct_weighted)
+  ) |>
+  tab_spanner(
+    label = "Score Statistics",
+    columns = c(score_min, score_max, score_mean, score_median, score_sd)
+  ) |>
+  fmt_number(
+    columns = c(weighted_n),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = c(pct_weighted),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(score_mean, score_sd),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(score_min, score_max, score_median),
+    decimals = 0
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_spanners()
+  ) |>
+  tab_source_note(
+    source_note = md("**Note:** OPV-Direct farmers receive deterministic score of 100. Hybrid-Potential scores range 0-100 based on z-scores and modulators.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+
+# Cleanup
+rm(tbl_score_summary)
+```
+
+```{r}
+#| label: d-cleanup
+
+# =============================================================================
+# D. Cleanup Auxiliary Objects from Phase D
+# =============================================================================
+
+rm(agreement_rate, cor_primary)
+```
+
+---
+
+# Phase E: Threshold Determination and Segment Assignment
+
+This phase determines optimal score thresholds that achieve estimated land distribution across farmer segments (estimates of land distribution across farmer segments based on a survey of select Semilla Nueva personnel and representatives of multiple seed companies in Guatemala in October of 2025). Thresholds are calculated to match the targets set from current seed purchasing behavior.
+
+The segmentation classifies farmers by their **current technology adoption level**:
+
+- **OPV/Criollo**: Farmers currently using traditional/saved seed (zero seed expenditure)
+- **Low**: Farmers currently purchasing hybrid seed at low investment levels
+- **Mid**: Farmers currently purchasing hybrid seed at moderate investment levels
+- **High**: Farmers currently purchasing hybrid seed at high investment levels
+
+The approach uses cumulative land distribution: starting from the highest OPV-likelihood scores, we identify the score thresholds that capture the target percentage of cultivated land for each segment.
+
+## E1. Define Target Land Distribution
+
+Estimated cultivated land area currently under each seed technology adoption level. These targets are converted to cumulative percentages for threshold calculation.
+
+**Target distribution (targets set based on Semilla Nueva market data on current seed purchasing, Oct 2025):**
+
+- **OPV/Criollo**: Residual (land currently under traditional/saved seed)
+- **Low**: 40,000 hectares (57,200 manzanas) 
+- **Mid**: 53,750 hectares (76,863 manzanas) 
+- **High**: 56,250 hectares (80,438 manzanas) 
+
+```{r}
+#| label: e1-target-distribution
+
+# =============================================================================
+# E1. Define Target Land Distribution
+# =============================================================================
+
+# Total cultivated maize land from MAGA calibration
+total_land_mz <- sum(df_farmers_scored$land_wtcorn * df_farmers_scored$weight_calibrated)
+
+# Estimated distribution from Semilla Nueva (hectares converted to manzanas: 1 ha = 1.43 mz)
+target_distribution <- tibble(
+  segment = c("OPV/Criollo", "Low", "Mid", "High"),
+  hectares = c(NA_real_, 40000, 53750, 56250),
+  manzanas = hectares * 1.43
+) |>
+  mutate(
+    # Calculate OPV/Criollo as residual
+    manzanas = if_else(
+      segment == "OPV/Criollo",
+      total_land_mz - sum(manzanas, na.rm = TRUE),
+      manzanas
+    ),
+    # Calculate percentages
+    target_pct = (manzanas / total_land_mz) * 100,
+    # Calculate cumulative targets (from OPV down to High)
+    cumulative_target = cumsum(target_pct)
+  )
+```
+
+## E2. Calculate Cumulative Land Distribution by Score
+
+For each score level, calculate the cumulative percentage of cultivated land. This creates the curve against which we identify optimal thresholds.
+
+```{r}
+#| label: e2-cumulative-distribution
+
+# =============================================================================
+# E2. Calculate Cumulative Land Distribution by Score
+# =============================================================================
+
+# Calculate weighted land contribution for each farmer record
+df_cumulative_land <- df_farmers_scored |>
+  mutate(
+    weighted_land = land_wtcorn * weight_calibrated
+  ) |>
+  # Sort by score descending (highest OPV likelihood first)
+  arrange(desc(score_total)) |>
+  mutate(
+    land_cumsum = cumsum(weighted_land),
+    land_pct_cumsum = (land_cumsum / sum(weighted_land)) * 100
+  )
+```
+
+## E3. Find Optimal Score Thresholds
+
+Identify the score values that achieve each cumulative land target. The threshold for each segment is the score at which the cumulative land distribution first exceeds the target percentage.
+
+```{r}
+#| label: e3-optimal-thresholds
+
+# =============================================================================
+# E3. Find Optimal Score Thresholds
+# =============================================================================
+
+# Find optimal threshold for each segment
+optimal_thresholds <- target_distribution |>
+  rowwise() |>
+  mutate(
+    threshold_score = if_else(
+      segment == "High",
+      0,
+      df_cumulative_land |>
+        filter(land_pct_cumsum >= cumulative_target) |>
+        slice(1) |>
+        pull(score_total)
+    )
+  ) |>
+  ungroup()
+```
+
+```{r}
+#| label: tbl-e3-optimal-thresholds
+#| tbl-cap: "Optimal score thresholds for farmer segmentation"
+
+# =============================================================================
+# E3. Optimal Thresholds Summary Table
+# =============================================================================
+
+export(
+  optimal_thresholds,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_e3_optimal_thresholds.rds")
+)
+
+optimal_thresholds |>
+  select(segment, manzanas, target_pct, cumulative_target, threshold_score) |>
+  gt() |>
+  tab_header(
+    title = "Optimal Score Thresholds for Farmer Segmentation",
+    subtitle = "Based on target land distribution (estimates from Semilla Nueva market data, 2025)"
+  ) |>
+  cols_label(
+    segment = "Segment",
+    manzanas = "Target Land (mz)",
+    target_pct = "Target %",
+    cumulative_target = "Cumulative %",
+    threshold_score = "Score Threshold"
+  ) |>
+  fmt_number(
+    columns = manzanas,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = c(target_pct, cumulative_target),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = threshold_score,
+    decimals = 0
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Target distribution from Semilla Nueva market data (Oct 2025).")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+```
+
+## E4. Visualize Cumulative Land Distribution with Thresholds
+
+The cumulative land distribution curve shows how cultivated land accumulates as we move from highest to lowest OPV-likelihood scores. Optimal thresholds (vertical lines) mark the segment boundaries that achieve target land coverage (horizontal lines) for each current technology adoption level.
+
+```{r}
+#| label: fig-e4-cumulative-land
+#| fig-cap: "Cumulative land distribution by OPV-likelihood score with optimal thresholds"
+#| fig-width: 10
+#| fig-height: 6
+
+# =============================================================================
+# E4. Cumulative Land Distribution Visualization
+# =============================================================================
+
+# Prepare threshold lines for annotation
+threshold_lines <- optimal_thresholds |>
+  filter(segment != "High")
+
+export(
+  df_cumulative_land,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_e4_cumulative_land.rds")
+)
+
+# Create cumulative distribution plot
+ggplot(df_cumulative_land, aes(x = score_total, y = land_pct_cumsum)) +
+  geom_line(color = "#0b54ad", linewidth = 1.2) +
+  # Vertical threshold lines
+  geom_vline(
+    data = threshold_lines,
+    aes(xintercept = threshold_score),
+    color = "#3AAF85",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  # Horizontal target lines
+  geom_hline(
+    data = target_distribution |> filter(segment != "High"),
+    aes(yintercept = cumulative_target),
+    color = "#68b800",
+    linetype = "dotted",
+    linewidth = 1,
+    alpha = 0.7
+  ) +
+  # Segment labels
+  geom_text(
+    data = threshold_lines,
+    aes(x = threshold_score, y = 5, label = segment),
+    color = "#3AAF85",
+    angle = 90,
+    vjust = -0.5,
+    hjust = 0,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  scale_x_reverse(
+    breaks = seq(0, 100, 10),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent(scale = 1),
+    breaks = seq(0, 100, 10),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Cumulative Land Distribution by OPV-Likelihood Score",
+    subtitle = "Optimal thresholds (jade dashed) achieve target distribution (green dotted)",
+    x = "OPV-Likelihood Score (reversed scale: 100 = most likely OPV)",
+    y = "Cumulative % of Cultivated Land",
+    caption = "Source: ENCOVI 2023 (MAGA-calibrated). Score thresholds determined by target land distribution."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50", hjust = 0)
+  )
+
+# Cleanup
+rm(threshold_lines)
+```
+
+## E5. Assign Final Segments
+
+Apply the optimal thresholds to assign each farmer record to its final segment based on current seed purchasing behavior. The assignment follows a descending score logic: highest scores → OPV/Criollo (traditional seed users), lowest scores → High (intensive hybrid seed users).
+
+```{r}
+#| label: e5-segment-assignment
+
+# =============================================================================
+# E5. Final Segment Assignment Based on Optimal Thresholds
+# =============================================================================
+
+# Extract threshold values
+thresholds <- optimal_thresholds |>
+  select(segment, threshold_score) |>
+  deframe()
+
+# Assign final segments
+df_farmers_segmented <- df_farmers_scored |>
+  mutate(
+    segment_final = case_when(
+      score_total >= thresholds["OPV/Criollo"] ~ "OPV/Criollo",
+      score_total >= thresholds["Low"] ~ "Low",
+      score_total >= thresholds["Mid"] ~ "Mid",
+      score_total >= thresholds["High"] ~ "High"
+    ),
+    segment_final = factor(
+      segment_final,
+      levels = c("OPV/Criollo", "Low", "Mid", "High"),
+      ordered = TRUE
+    )
+  )
+```
+
+## E6. Segment Characteristics Summary
+
+Final summary of farmer characteristics by assigned segment, validating that the segmentation produces meaningful differentiation in current agricultural practices and seed technology adoption levels.
+
+```{r}
+#| label: tbl-e6-segment-characteristics
+#| tbl-cap: "Final segment characteristics (synthetic farmer population)"
+
+# =============================================================================
+# E6. Segment Characteristics Summary
+# =============================================================================
+
+tbl_segment_chars <- df_farmers_segmented |>
+  summarise(
+    n_records = n(),
+    weighted_farmers = sum(weight_calibrated),
+    weighted_land = sum(land_wtcorn * weight_calibrated),
+    # Score statistics
+    score_mean = weighted.mean(score_total, w = weight_calibrated),
+    score_min = min(score_total),
+    score_max = max(score_total),
+    # Agricultural characteristics
+    yield_mean = weighted.mean(yield_wtcorn_qq, w = weight_calibrated, na.rm = TRUE),
+    seed_exp_mean = weighted.mean(exp_seeds_per_mz, w = weight_calibrated, na.rm = TRUE),
+    land_mean = weighted.mean(land_wtcorn, w = weight_calibrated),
+    .by = segment_final
+  ) |>
+  arrange(segment_final) |>
+  mutate(
+    pct_farmers = weighted_farmers / sum(weighted_farmers) * 100,
+    pct_land = weighted_land / sum(weighted_land) * 100
+  )
+
+export(
+  tbl_segment_chars,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_e6_segment_characteristics.rds")
+)
+
+# Generate GT table
+tbl_segment_chars |>
+  select(segment_final, n_records, pct_farmers, pct_land,
+         score_mean, score_min, score_max,
+         yield_mean, seed_exp_mean, land_mean) |>
+  gt() |>
+  tab_header(
+    title = "Final Segment Characteristics",
+    subtitle = paste0("n = ", nrow(df_farmers_segmented), " synthetic farmer records")
+  ) |>
+  cols_label(
+    segment_final = "Segment",
+    n_records = "Records",
+    pct_farmers = "% Farmers",
+    pct_land = "% Land",
+    score_mean = "Mean",
+    score_min = "Min",
+    score_max = "Max",
+    yield_mean = "Yield (qq/mz)",
+    seed_exp_mean = "Seed Exp (Q/mz)",
+    land_mean = "Land (mz)"
+  ) |>
+  tab_spanner(
+    label = "Distribution",
+    columns = c(n_records, pct_farmers, pct_land)
+  ) |>
+  tab_spanner(
+    label = "Score Range",
+    columns = c(score_mean, score_min, score_max)
+  ) |>
+  tab_spanner(
+    label = "Agricultural Profile",
+    columns = c(yield_mean, seed_exp_mean, land_mean)
+  ) |>
+  fmt_number(
+    columns = c(pct_farmers, pct_land),
+    decimals = 1,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = c(score_mean, yield_mean, land_mean),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(score_min, score_max, seed_exp_mean),
+    decimals = 0
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_spanners()
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated synthetic population). Segments assigned by optimal score thresholds.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+
+# Cleanup
+rm(tbl_segment_chars)
+```
+
+```{r}
+#| label: e-cleanup
+
+# =============================================================================
+# E. Cleanup Auxiliary Objects from Phase E
+# =============================================================================
+
+rm(
+  df_cumulative_land,
+  target_distribution,
+  thresholds,
+  total_land_mz
+)
+```
+
+---
+
+# Phase F: Validation and Export
+
+This final phase validates the segmentation results through visual inspection of the bidimensional yield-seed expenditure space, provides comprehensive summary tables for stakeholder review, and exports the final segmented dataset.
+
+```{r}
+#| label: f-create-survey-design
+
+# =============================================================================
+# F. Create Survey Design Object for Segment Analysis
+# =============================================================================
+
+# Create survey design object with final segmented data
+svy_segmented <- df_farmers_segmented |>
+  as_survey_design(
+    ids = upm,
+    weights = weight_calibrated,
+    nest = TRUE
+  )
+```
+
+
+## F1. Segmentation Validation: Bidimensional Space
+
+Visual validation of segment assignment in the yield × seed expenditure z-score space. The scatter plot confirms that segments occupy distinct regions of the agricultural performance space, with OPV/Criollo farmers concentrated in the low-expenditure region and High-technology farmers in the high-yield, high-expenditure quadrant.
+
+```{r}
+#| label: fig-f1-segmentation-validation
+#| fig-cap: "Farmer segmentation in yield-seed expenditure space"
+#| fig-width: 10
+#| fig-height: 8
+#| warning: false
+
+# =============================================================================
+# F1. Segmentation Validation: Scatter Plot in Z-score Space
+# =============================================================================
+
+# Define segment colors
+segment_colors <- c(
+  "OPV/Criollo" = "#ffb433",
+  "Low" = "#64d0f7",
+  "Mid" = "#68b800",
+  "High" = "#e00000"
+)
+
+# Create validation scatter plot
+fig_f1_segmentation_validation <- df_farmers_segmented |>
+  filter(!is.na(yield_zscore_dept), !is.na(seed_zscore_dept)) |>
+  filter(copy_id == 1)
+
+export(
+  fig_f1_segmentation_validation,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_fig_f1_segmentation_validation.rds")
+)
+
+fig_f1_segmentation_validation |>
+  ggplot(aes(x = seed_zscore_dept, y = yield_zscore_dept, color = segment_final)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  scale_color_manual(values = segment_colors, name = "Segment") +
+  scale_x_continuous(breaks = seq(-2, 6, 1), limits = c(-2, 6)) +
+  scale_y_continuous(breaks = seq(-3, 4, 1), limits = c(-3, 4)) +
+  labs(
+    title = "Farmer Segmentation: Yield vs Seed Expenditure Performance",
+    subtitle = "Departmental z-scores. Dashed lines indicate departmental means (z = 0).",
+    x = "Seed Expenditure Z-score (departmental)",
+    y = "Yield Z-score (departmental)",
+    caption = "Source: ENCOVI 2023 (MAGA-calibrated synthetic population). Each point represents one farmer record."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9, color = "grey50", hjust = 0),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+# Cleanup
+rm(segment_colors, fig_f1_segmentation_validation)
+```
+
+## F2. Final Segment Characteristics: Survey-Weighted Medians
+
+Comprehensive summary of farmer characteristics by final segment assignment. Statistics are survey-weighted using calibrated weights. Values shown as Median [Q25, Q75] for distributional context.
+
+```{r}
+#| label: tbl-f2-segment-medians
+#| tbl-cap: "Farmer characteristics by final segment (survey-weighted medians)"
+
+# =============================================================================
+# F2. Segment Characteristics Table - Medians with IQR
+# Format: Median [Q25, Q75]
+# =============================================================================
+
+# Calculate statistics for ALL farmers by segment
+segment_stats_all <- svy_segmented |>
+  group_by(segment_final) |>
+  summarise(
+    # Totals
+    n_farmers = survey_total(vartype = "ci"),
+    total_land = survey_total(land_wtcorn, na.rm = TRUE, vartype = "ci"),
+    
+    # Land: median and quartiles
+    land_q25 = survey_quantile(land_wtcorn, 0.25, na.rm = TRUE),
+    land_q50 = survey_quantile(land_wtcorn, 0.50, na.rm = TRUE),
+    land_q75 = survey_quantile(land_wtcorn, 0.75, na.rm = TRUE),
+    
+    # Production: median and quartiles
+    prod_q25 = survey_quantile(total_production, 0.25, na.rm = TRUE),
+    prod_q50 = survey_quantile(total_production, 0.50, na.rm = TRUE),
+    prod_q75 = survey_quantile(total_production, 0.75, na.rm = TRUE),
+    
+    # Yield: median and quartiles
+    yield_q25 = survey_quantile(yield_wtcorn_qq, 0.25, na.rm = TRUE),
+    yield_q50 = survey_quantile(yield_wtcorn_qq, 0.50, na.rm = TRUE),
+    yield_q75 = survey_quantile(yield_wtcorn_qq, 0.75, na.rm = TRUE),
+    
+    # Seed expenditure: median and quartiles
+    seed_q25 = survey_quantile(exp_seeds_per_mz, 0.25, na.rm = TRUE),
+    seed_q50 = survey_quantile(exp_seeds_per_mz, 0.50, na.rm = TRUE),
+    seed_q75 = survey_quantile(exp_seeds_per_mz, 0.75, na.rm = TRUE),
+    
+    # Z-scores (median only)
+    median_yield_zscore = survey_quantile(yield_zscore_dept, 0.5, na.rm = TRUE),
+    median_seed_zscore = survey_quantile(seed_zscore_dept, 0.5, na.rm = TRUE)
+  ) |>
+  as_tibble() |>
+  mutate(
+    pct_land = total_land / sum(total_land) * 100,
+    
+    # Create display strings "median [Q25, Q75]"
+    land_display = paste0(
+      round(land_q50_q50, 2), " [", 
+      round(land_q25_q25, 2), ", ", 
+      round(land_q75_q75, 2), "]"
+    ),
+    prod_display = paste0(
+      round(prod_q50_q50, 0), " [", 
+      round(prod_q25_q25, 0), ", ", 
+      round(prod_q75_q75, 0), "]"
+    ),
+    yield_display = paste0(
+      round(yield_q50_q50, 0), " [", 
+      round(yield_q25_q25, 0), ", ", 
+      round(yield_q75_q75, 0), "]"
+    ),
+    seed_display = paste0(
+      round(seed_q50_q50, 0), " [", 
+      round(seed_q25_q25, 0), ", ", 
+      round(seed_q75_q75, 0), "]"
+    )
+  )
+
+# Calculate statistics ONLY for sellers
+segment_stats_sellers <- svy_segmented |>
+  filter(is_seller == 1) |>
+  group_by(segment_final) |>
+  summarise(
+    n_sellers = survey_total(vartype = "ci"),
+    median_revenue_sellers = survey_quantile(revenue, 0.5, na.rm = TRUE),
+    median_gain_sellers = survey_quantile(gain_per_qq_with_cost, 0.5, na.rm = TRUE)
+  ) |>
+  as_tibble()
+
+# Combine both tables
+tabla_final <- segment_stats_all |>
+  left_join(segment_stats_sellers, by = "segment_final") |>
+  mutate(
+    pct_sellers = (n_sellers / n_farmers) * 100
+  ) |>
+  transmute(
+    Segment = as.character(segment_final),
+    `Total Farmers` = format(round(n_farmers, 0), big.mark = ",", scientific = FALSE),
+    `% Land` = paste0(round(pct_land, 1), "%"),
+    `% Sellers` = paste0(round(pct_sellers, 1), "%"),
+    `Land (mz) [Q25, Q75]` = land_display,
+    `Production (qq) [Q25, Q75]` = prod_display,
+    `Yield (qq/mz) [Q25, Q75]` = yield_display,
+    `Yield z-score` = as.character(round(median_yield_zscore_q50, 1)),
+    `Seed Exp (Q/mz) [Q25, Q75]` = seed_display,
+    `Seed Exp z-score` = as.character(round(median_seed_zscore_q50, 1)),
+    `Revenue (Q) - Sellers` = format(round(median_revenue_sellers_q50, 0), big.mark = ",", scientific = FALSE),
+    `Gain (Q/qq) - Sellers` = as.character(round(median_gain_sellers_q50, 1))
+  ) |>
+  pivot_longer(cols = -Segment, names_to = "Statistic", values_to = "Value") |>
+  pivot_wider(names_from = Segment, values_from = Value) |>
+  mutate(
+    Statistic = factor(Statistic, levels = c(
+      "Total Farmers", "% Land", "% Sellers",
+      "Land (mz) [Q25, Q75]", "Production (qq) [Q25, Q75]",
+      "Yield (qq/mz) [Q25, Q75]", "Yield z-score",
+      "Seed Exp (Q/mz) [Q25, Q75]", "Seed Exp z-score",
+      "Revenue (Q) - Sellers", "Gain (Q/qq) - Sellers"
+    ))
+  ) |>
+  arrange(Statistic)
+
+export(
+  tabla_final,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_f2_segment_medians.rds")
+)
+
+# Generate GT table
+tabla_final |>
+  gt() |>
+  tab_header(
+    title = "Farmer Characteristics by Final Segment",
+    subtitle = "Survey-weighted medians and totals"
+  ) |>
+  tab_row_group(label = "Statistics (Sellers Only)", rows = 10:11) |>
+  tab_row_group(label = "Statistics (All Farmers)", rows = 4:9) |>
+  tab_row_group(label = "General", rows = 1:3) |>
+  row_group_order(groups = c("General", "Statistics (All Farmers)", "Statistics (Sellers Only)")) |>
+  cols_label(
+    Statistic = "",
+    `OPV/Criollo` = "OPV/Criollo",
+    Low = "Low",
+    Mid = "Mid",
+    High = "High"
+  ) |>
+  sub_missing(columns = everything(), missing_text = "—") |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = list(cell_text(weight = "bold"), cell_fill(color = "#f0f0f0")),
+    locations = cells_body(columns = Statistic)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Segments assigned via optimal score thresholds. Values shown as Median [Q25, Q75] where applicable.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+
+# Cleanup
+rm(segment_stats_all, segment_stats_sellers, tabla_final)
+```
+
+## F3. Final Segment Characteristics: Survey-Weighted Means
+
+Alternative summary using means with standard errors for parametric analysis and verification purposes.
+
+```{r}
+#| label: tbl-f3-segment-means
+#| tbl-cap: "Farmer characteristics by final segment (survey-weighted trimmed means)"
+
+# =============================================================================
+# F3. Segment Characteristics Table - Trimmed Means with Standard Errors
+# Format: Mean (±SE) excluding P5 and P95 to reduce outlier influence
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Step 1: Calculate P5 and P95 thresholds for trimming
+# -----------------------------------------------------------------------------
+
+trim_thresholds <- df_farmers_segmented |>
+  summarise(
+    land_p05 = quantile(land_wtcorn, 0.05, na.rm = TRUE),
+    land_p95 = quantile(land_wtcorn, 0.95, na.rm = TRUE),
+    prod_p05 = quantile(total_production, 0.05, na.rm = TRUE),
+    prod_p95 = quantile(total_production, 0.95, na.rm = TRUE),
+    yield_p05 = quantile(yield_wtcorn_qq, 0.05, na.rm = TRUE),
+    yield_p95 = quantile(yield_wtcorn_qq, 0.95, na.rm = TRUE),
+    seed_p05 = quantile(exp_seeds_per_mz, 0.05, na.rm = TRUE),
+    seed_p95 = quantile(exp_seeds_per_mz, 0.95, na.rm = TRUE),
+    yield_z_p05 = quantile(yield_zscore_dept, 0.05, na.rm = TRUE),
+    yield_z_p95 = quantile(yield_zscore_dept, 0.95, na.rm = TRUE),
+    seed_z_p05 = quantile(seed_zscore_dept, 0.05, na.rm = TRUE),
+    seed_z_p95 = quantile(seed_zscore_dept, 0.95, na.rm = TRUE)
+  )
+
+# For sellers-only variables
+trim_thresholds_sellers <- df_farmers_segmented |>
+  filter(is_seller == 1) |>
+  summarise(
+    revenue_p05 = quantile(revenue, 0.05, na.rm = TRUE),
+    revenue_p95 = quantile(revenue, 0.95, na.rm = TRUE),
+    gain_p05 = quantile(gain_per_qq_with_cost, 0.05, na.rm = TRUE),
+    gain_p95 = quantile(gain_per_qq_with_cost, 0.95, na.rm = TRUE)
+  )
+
+# -----------------------------------------------------------------------------
+# Step 2: Create survey design with trimmed values
+# -----------------------------------------------------------------------------
+
+svy_segmented_trimmed <- df_farmers_segmented |>
+  mutate(
+    # Trim values outside P5-P95 range (set to NA for exclusion)
+    land_trimmed = if_else(
+      land_wtcorn >= trim_thresholds$land_p05 & land_wtcorn <= trim_thresholds$land_p95,
+      land_wtcorn, NA_real_
+    ),
+    prod_trimmed = if_else(
+      total_production >= trim_thresholds$prod_p05 & total_production <= trim_thresholds$prod_p95,
+      total_production, NA_real_
+    ),
+    yield_trimmed = if_else(
+      yield_wtcorn_qq >= trim_thresholds$yield_p05 & yield_wtcorn_qq <= trim_thresholds$yield_p95,
+      yield_wtcorn_qq, NA_real_
+    ),
+    seed_trimmed = if_else(
+      exp_seeds_per_mz >= trim_thresholds$seed_p05 & exp_seeds_per_mz <= trim_thresholds$seed_p95,
+      exp_seeds_per_mz, NA_real_
+    ),
+    yield_z_trimmed = if_else(
+      yield_zscore_dept >= trim_thresholds$yield_z_p05 & yield_zscore_dept <= trim_thresholds$yield_z_p95,
+      yield_zscore_dept, NA_real_
+    ),
+    seed_z_trimmed = if_else(
+      seed_zscore_dept >= trim_thresholds$seed_z_p05 & seed_zscore_dept <= trim_thresholds$seed_z_p95,
+      seed_zscore_dept, NA_real_
+    ),
+    revenue_trimmed = if_else(
+      is_seller == 1 & revenue >= trim_thresholds_sellers$revenue_p05 & revenue <= trim_thresholds_sellers$revenue_p95,
+      revenue, NA_real_
+    ),
+    gain_trimmed = if_else(
+      is_seller == 1 & gain_per_qq_with_cost >= trim_thresholds_sellers$gain_p05 & gain_per_qq_with_cost <= trim_thresholds_sellers$gain_p95,
+      gain_per_qq_with_cost, NA_real_
+    )
+  ) |>
+  as_survey_design(
+    ids = farmer_id,
+    weights = weight_calibrated
+  )
+
+# -----------------------------------------------------------------------------
+# Step 3: Calculate trimmed means for ALL farmers by segment
+# -----------------------------------------------------------------------------
+
+segment_stats_all_means <- svy_segmented_trimmed |>
+  group_by(segment_final) |>
+  summarise(
+    n_farmers = survey_total(vartype = "ci"),
+    total_land = survey_total(land_wtcorn, na.rm = TRUE, vartype = "ci"),
+    
+    # Trimmed means with SE
+    land_mean = survey_mean(land_trimmed, na.rm = TRUE, vartype = "se"),
+    prod_mean = survey_mean(prod_trimmed, na.rm = TRUE, vartype = "se"),
+    yield_mean = survey_mean(yield_trimmed, na.rm = TRUE, vartype = "se"),
+    seed_mean = survey_mean(seed_trimmed, na.rm = TRUE, vartype = "se"),
+    yield_z_mean = survey_mean(yield_z_trimmed, na.rm = TRUE, vartype = "se"),
+    seed_z_mean = survey_mean(seed_z_trimmed, na.rm = TRUE, vartype = "se")
+  ) |>
+  as_tibble() |>
+  mutate(
+    pct_land = total_land / sum(total_land) * 100,
+    
+    # Create display strings "mean (±SE)"
+    land_display = paste0(sprintf("%.3f", land_mean), " (±", sprintf("%.3f", land_mean_se), ")"),
+    prod_display = paste0(sprintf("%.2f", prod_mean), " (±", sprintf("%.2f", prod_mean_se), ")"),
+    yield_display = paste0(sprintf("%.2f", yield_mean), " (±", sprintf("%.2f", yield_mean_se), ")"),
+    seed_display = paste0(sprintf("%.2f", seed_mean), " (±", sprintf("%.2f", seed_mean_se), ")"),
+    yield_z_display = paste0(sprintf("%.3f", yield_z_mean), " (±", sprintf("%.3f", yield_z_mean_se), ")"),
+    seed_z_display = paste0(sprintf("%.3f", seed_z_mean), " (±", sprintf("%.3f", seed_z_mean_se), ")")
+  )
+
+# -----------------------------------------------------------------------------
+# Step 4: Calculate trimmed means for SELLERS only
+# -----------------------------------------------------------------------------
+
+segment_stats_sellers_means <- svy_segmented_trimmed |>
+  filter(is_seller == 1) |>
+  group_by(segment_final) |>
+  summarise(
+    n_sellers = survey_total(vartype = "ci"),
+    revenue_sellers_mean = survey_mean(revenue_trimmed, na.rm = TRUE, vartype = "se"),
+    gain_sellers_mean = survey_mean(gain_trimmed, na.rm = TRUE, vartype = "se")
+  ) |>
+  as_tibble() |>
+  mutate(
+    revenue_sellers_display = paste0(sprintf("%.2f", revenue_sellers_mean), " (±", sprintf("%.2f", revenue_sellers_mean_se), ")"),
+    gain_sellers_display = paste0(sprintf("%.2f", gain_sellers_mean), " (±", sprintf("%.2f", gain_sellers_mean_se), ")")
+  )
+
+# -----------------------------------------------------------------------------
+# Step 5: Combine and format table
+# -----------------------------------------------------------------------------
+
+tabla_final_means <- segment_stats_all_means |>
+  left_join(segment_stats_sellers_means, by = "segment_final") |>
+  mutate(
+    pct_sellers = (n_sellers / n_farmers) * 100
+  ) |>
+  transmute(
+    Segment = as.character(segment_final),
+    `Total Farmers` = format(round(n_farmers, 0), big.mark = ",", scientific = FALSE),
+    `% Land` = paste0(sprintf("%.2f", pct_land), "%"),
+    `% Sellers` = paste0(sprintf("%.2f", pct_sellers), "%"),
+    `Land (mz) [Mean ± SE]` = land_display,
+    `Production (qq) [Mean ± SE]` = prod_display,
+    `Yield (qq/mz) [Mean ± SE]` = yield_display,
+    `Yield z-score [Mean ± SE]` = yield_z_display,
+    `Seed Exp (Q/mz) [Mean ± SE]` = seed_display,
+    `Seed Exp z-score [Mean ± SE]` = seed_z_display,
+    `Revenue (Q) - Sellers [Mean ± SE]` = revenue_sellers_display,
+    `Gain (Q/qq) - Sellers [Mean ± SE]` = gain_sellers_display
+  ) |>
+  pivot_longer(cols = -Segment, names_to = "Statistic", values_to = "Value") |>
+  pivot_wider(names_from = Segment, values_from = Value) |>
+  mutate(
+    Statistic = factor(Statistic, levels = c(
+      "Total Farmers", "% Land", "% Sellers",
+      "Land (mz) [Mean ± SE]", "Production (qq) [Mean ± SE]",
+      "Yield (qq/mz) [Mean ± SE]", "Yield z-score [Mean ± SE]",
+      "Seed Exp (Q/mz) [Mean ± SE]", "Seed Exp z-score [Mean ± SE]",
+      "Revenue (Q) - Sellers [Mean ± SE]", "Gain (Q/qq) - Sellers [Mean ± SE]"
+    ))
+  ) |>
+  arrange(Statistic)
+
+export(
+  tabla_final_means,
+  here("01_data", "02_processed",
+       "web_resources", "02_03_tbl_f3_segment_means.rds")
+)
+
+# Generate GT table
+tabla_final_means |>
+  gt() |>
+  tab_header(
+    title = "Farmer Characteristics by Final Segment",
+    subtitle = "Survey-weighted TRIMMED MEANS and standard errors (P5-P95)"
+  ) |>
+  tab_row_group(label = "Statistics (Sellers Only)", rows = 10:11) |>
+  tab_row_group(label = "Statistics (All Farmers)", rows = 4:9) |>
+  tab_row_group(label = "General", rows = 1:3) |>
+  row_group_order(groups = c("General", "Statistics (All Farmers)", "Statistics (Sellers Only)")) |>
+  cols_label(
+    Statistic = "",
+    `OPV/Criollo` = "OPV/Criollo",
+    Low = "Low",
+    Mid = "Mid",
+    High = "High"
+  ) |>
+  sub_missing(columns = everything(), missing_text = "—") |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = list(cell_text(weight = "bold"), cell_fill(color = "#f0f0f0")),
+    locations = cells_body(columns = Statistic)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", style = "italic"),
+    locations = cells_row_groups()
+  ) |>
+  tab_source_note(
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Trimmed means exclude P5 and P95 to reduce outlier influence.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(11),
+    source_notes.font.size = px(10)
+  )
+
+# Cleanup
+rm(trim_thresholds, trim_thresholds_sellers, svy_segmented_trimmed,
+   segment_stats_all_means, segment_stats_sellers_means, tabla_final_means)
+```
+
+
+## F4. Export Segmented Dataset
+
+Export the final dataset for use in subsequent scripts (02_04 economic impact, 02_05 adopter model determination).
+
+```{r}
+#| label: f4-export
+
+# =============================================================================
+# F4. Export Final Dataset
+# =============================================================================
+
+write_parquet(
+  df_farmers_segmented,
+  here("01_data", "02_processed", 
+       "transfer", "02_03_farmers_segmentated.parquet")
+)
+```
+
+# Notes
+
+## Methodology
+
+1. **Dual-framework validation**: PAM clustering (data-driven) and quadrant analysis (theory-driven) applied independently to the original hybrid-potential households (copy_id == 1). The agreement rate is reported in the convergence cross-tabulation (D1).
+
+2. **LDA-informed weights**: Linear Discriminant Analysis on PAM clusters gives the relative importance of each variable (Section B4). Scoring weights calibrated to reflect empirical cluster separation.
+
+3. **Continuous scoring by percentile rank**: primary scores assigned from the percentile rank of the departmental z-scores within the hybrid-potential population, spreading scores across the full [0-100] range.
+
+4. **Hurdle model structure**: Two-stage classification separating OPV-direct farmers (zero seed expenditure → deterministic score=100) from hybrid-potential farmers (continuous probabilistic scoring).
+
+5. **Target-based threshold determination**: Score thresholds derived from Semilla Nueva market data on current maize seed distribution (87% OPV/Criollo, 3.5% Low, 4.7% Mid, 4.9% High).
+
+## Scoring System
+
+| Component | Max Points | Weight | Source |
+|-----------|------------|--------|--------|
+| Seed expenditure z-score | 45 | 45% | LDA importance, scaled |
+| Yield z-score | 40 | 40% | LDA importance, scaled |
+| Poverty level | 10 | 10% | Stratified regression analysis |
+| Land ownership | 5 | 5% | Investment-performance dynamics |
+
+## Final Segments
+
+Score thresholds, record counts and land shares per segment are reported in the
+threshold table (E3) and in the final segment summaries (F2, F3).
+
+## Variables Created
+
+- **Scoring variables**: `score_yield`, `score_seed`, `score_poverty`, `score_ownership`, `score_total`
+- **Z-scores**: `yield_zscore_dept`, `seed_zscore_dept` (departmental standardization)
+- **Classification**: `is_opv_direct` (binary), `segment_final` (4-level factor)
+
+## Technical Parameters
+
+- **Score scaling**: percentile rank of the departmental z-scores within the hybrid-potential population
+- **PAM clustering**: k=4, Euclidean distance on departmental z-scores
+- **Silhouette coefficient**: reported in the silhouette analysis (B3)
+- **Synthetic population**: MAGA-calibrated farmer records, split into OPV-direct and hybrid-potential subsets as reported in A2
+
+## Terminology
+
+The segment label `OPV/Criollo` identifies farmers planting open-pollinated or
+saved seed. Published outputs refer to this group as **non-hybrid**; the
+two terms denote the same segment.

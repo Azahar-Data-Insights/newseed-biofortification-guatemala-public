@@ -1,0 +1,238 @@
+---
+title: "Build Nutrition Reference Tables"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script builds the two typed Parquet tables that the analytical
+pipeline reads, from the single editable source workbook
+`incap_finut_master.xlsx`:
+
+1. Read the `food_composition` sheet (one row per food) and write it
+   as a typed Parquet table
+2. Read the `food_equivalences` sheet (one row per food and unit) and
+   write it as a typed Parquet table
+3. Validate row counts, key uniqueness, and column types for both
+   tables
+
+The Parquet tables are byte-for-byte regenerable from the workbook.
+The workbook is the source of truth; values are edited there and this
+script is re-run to refresh the Parquet outputs. This script applies
+no normalization or imputation: it transfers the workbook values as
+they are, preserving the per-100 g basis of the composition table.
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,          # Parquet file handling
+  readxl,         # Excel sheet reading
+  here,           # Robust file path management
+  janitor,        # Data cleaning utilities
+  gt,             # Table formatting and presentation
+  tidyverse       # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# external/
+ensure_output_dir(here("01_data", "02_processed", "external"))
+```
+
+# Load Source Workbook
+
+```{r}
+#| label: load-master
+
+master_path <- here("01_data", "03_external", "incap_finut_master.xlsx")
+
+# Composition: one row per food (codine). Values per 100 g edible
+# portion, as transcribed from the source tables.
+df_composition <- read_excel(master_path, sheet = "food_composition") |>
+  clean_names()
+
+# Equivalences: one row per food and presentation unit. The numeric
+# measurement code is already provided in the workbook.
+df_equivalences <- read_excel(master_path, sheet = "food_equivalences") |>
+  clean_names()
+```
+
+# Build Tables
+
+```{r}
+#| label: build-composition
+
+# Enforce column types for the composition table
+df_food_composition <- df_composition |>
+  mutate(
+    ali = as.integer(ali),
+    codine = as.integer(codine),
+    nombre_alimento = as.character(nombre_alimento),
+    across(
+      c(energ_kcal, proteina_g, hierro_mg, zinc_mg, pct_aprov,
+        lys_g, met_g, cys_g, thr_g, trp_g,
+        pdcaas, npu, pdcaas_qpm, npu_qpm),
+      as.numeric
+    )
+  ) |>
+  arrange(codine)
+```
+
+```{r}
+#| label: build-equivalences
+
+# Enforce column types for the equivalences table; preserve row order
+df_food_equivalences <- df_equivalences |>
+  mutate(
+    codine = as.integer(codine),
+    alimento = as.character(alimento),
+    vegetal_cereal = as.character(vegetal_cereal),
+    medida_alimento = as.character(medida_alimento),
+    medida = as.integer(medida),
+    gramos = as.numeric(gramos),
+    n = as.integer(n)
+  )
+```
+
+# Validation
+
+```{r}
+#| label: tbl-validation-summary
+#| tbl-cap: "Built nutrition tables overview"
+
+tbl_validation <- tibble(
+  Table = c("food_composition", "food_equivalences"),
+  Rows = c(nrow(df_food_composition), nrow(df_food_equivalences)),
+  `Unique foods (codine)` = c(
+    n_distinct(df_food_composition$codine),
+    n_distinct(df_food_equivalences$codine)
+  ),
+  `Codine is unique` = c(
+    !any(duplicated(df_food_composition$codine)),
+    NA
+  )
+)
+
+tbl_validation |>
+  gt() |>
+  tab_header(
+    title = "Nutrition Reference Tables",
+    subtitle = "Built from incap_finut_master.xlsx"
+  ) |>
+  fmt_number(columns = c(Rows, `Unique foods (codine)`),
+             decimals = 0, use_seps = TRUE) |>
+  sub_missing(missing_text = "—") |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+```{r}
+#| label: tbl-composition-coverage
+#| tbl-cap: "Composition table column coverage (non-missing values)"
+
+tbl_coverage <- df_food_composition |>
+  summarise(across(
+    c(energ_kcal, proteina_g, hierro_mg, zinc_mg, pct_aprov,
+      lys_g, met_g, cys_g, thr_g, trp_g, pdcaas, npu,
+      pdcaas_qpm, npu_qpm),
+    ~ sum(!is.na(.x))
+  )) |>
+  pivot_longer(everything(), names_to = "Column", values_to = "Non-missing") |>
+  mutate(Total = nrow(df_food_composition))
+
+tbl_coverage |>
+  gt() |>
+  tab_header(
+    title = "Composition Column Coverage",
+    subtitle = "Non-missing value count per nutrient column"
+  ) |>
+  fmt_number(columns = c(`Non-missing`, Total), decimals = 0) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+# Save Outputs
+
+```{r}
+#| label: save-outputs
+
+# Composition table (one row per food)
+write_parquet(
+  df_food_composition,
+  here("01_data", "03_external", "incap_food_composition.parquet")
+)
+
+# Equivalences table (one row per food and unit)
+write_parquet(
+  df_food_equivalences,
+  here("01_data", "03_external", "incap_food_equivalences.parquet")
+)
+```
+
+# Notes
+
+## Source and Lineage
+
+The source of truth is `incap_finut_master.xlsx` in `03_external`. Its
+`food_composition` and `food_equivalences` sheets are transferred here
+to typed Parquet tables without modification of values. Provenance for
+each protein-quality value is documented in the workbook's
+`source_notes` sheet, and the directory `README.md`
+describes the three provenance layers (INCAP composition base, FINUT
+protein-quality layer, Azahar Data Insights derived layer).
+
+## Build Behaviour
+
+This script transfers values as stored in the workbook. Nutrient
+values in `food_composition` remain on a per-100 g basis. The
+per-gram normalization and the conservative PDCAAS imputation for
+foods without a score are applied downstream in Script 01_01, where
+they belong as analytical decisions of the pipeline.
+
+## Outputs
+
+- `incap_food_composition.parquet` — one row per food (`codine`),
+  consumed by Script 01_01.
+- `incap_food_equivalences.parquet` — one row per food and
+  presentation unit, consumed by Script 01_01. Row order follows the
+  workbook (foods in ascending `codine` order of first appearance);
+  Script 01_02 derives food factor levels from this order.

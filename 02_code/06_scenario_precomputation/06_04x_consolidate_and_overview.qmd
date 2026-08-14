@@ -1,0 +1,782 @@
+---
+title: "Consolidate Scenarios and Generate Overview Table — `r params$pathway_label` Pathway"
+subtitle: "`r if (params$pathway == 'pco') 'Unify departmental and national parquets across seed and subsidy combinations and produce the overview table (GAM-based stunting model)' else 'Unify departmental and national parquets across seed and subsidy combinations and produce the overview table (Gunaratna et al. 2010 effect size)'`"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+params:
+  pathway: "pco"
+  pathway_label: "Covariate"
+---
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Setup: Load packages, configure environment, resolve parameters
+# =============================================================================
+
+# Clean environment (preserve params injected by Quarto)
+rm(list = setdiff(ls(), "params"))
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Professional table formatting
+  glue,               # String interpolation
+  tidyverse           # General purpose data manipulation
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+drop   <- base::drop
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# --- Resolve parameters into local variables -------------------------------
+
+pathway       <- params$pathway
+pathway_label <- params$pathway_label
+is_pco        <- pathway == "pco"
+
+# File prefix for all output artefacts (parquet + web_resources rds)
+file_prefix <- paste0("06_04_", pathway)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# scenarios/
+ensure_output_dir(here("01_data", "02_processed", "scenarios"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Overview
+
+> **`r pathway_label` Pathway** — This script corresponds to the consolidation step under the `r tolower(pathway_label)` pathway. The methodology is identical across all 18 upstream combinations (3 seeds x 3 subsidy regimes x 2 pathways); differences arise from the upstream yield factors (seed) and the upstream seed-price structure (subsidy regime). This parametrized template renders one HTML per pathway (2 combinations total).
+
+This script performs two sequential operations:
+
+**Section A — Consolidation**: Load the 9 departmental (06_02_`r pathway`) and 9 national (06_03_`r pathway`) parquets covering the cartesian product of three seed variants (S22, S26, S28) and three subsidy regimes (sub00, sub50, sub75). Append a `seed_year` identifier (the `subsidy_suffix` identifier already travels in the upstream parquets), and bind them into two consolidated parquets (one departmental, one national). These consolidated files serve as the canonical multi-combination datasets for the Shiny application.
+
+**Section B — Overview Table**: Combine the consolidated departmental and national datasets into a single overview table with the column names that the dashboard displays. Export as parquet, which the Shiny application loads directly and also uses to assemble the downloadable workbook on request.
+
+## Main Operations
+
+1. Load 9 departmental parquets (`06_02_{seed}_{sub}_`r pathway`_departmental_scenarios.parquet` for seed in {s22, s26, s28} and sub in {sub00, sub50, sub75}) and consolidate with `seed_year`
+2. Load 9 national parquets (`06_03_{seed}_{sub}_`r pathway`_national_scenarios.parquet` for the same combinations) and consolidate with `seed_year`
+3. Export consolidated parquets for Shiny consumption
+4. Combine departmental + national into single overview dataset
+5. Rename variables to specifications (including `Subsidy Regime` from `subsidy_suffix`)
+6. Validate schema dimensions
+7. Export overview table as parquet
+
+## Output Specification
+
+- **Consolidated departmental**: 2,178 rows (22 departments x 11 penetration levels x 3 seeds x 3 subsidy regimes)
+- **Consolidated national**: 99 rows (11 penetration levels x 3 seeds x 3 subsidy regimes)
+- **Overview table**: 2,277 rows (2,178 departmental + 99 national) x 82 columns (Seed Year + Subsidy Regime + Region + Penetration + 78 metrics)
+
+---
+
+# Phase A: Consolidation of Seed Variants
+
+## A1. Load and Consolidate Departmental Scenarios
+
+Load the nine seed × subsidy departmental parquets from Script 06_02_`r pathway` and bind them with a `seed_year` identifier. The `subsidy_suffix` identifier already travels in each upstream parquet and flows through `bind_rows()` automatically.
+
+```{r}
+#| label: a1-consolidate-departmental
+
+# =============================================================================
+# A1. Consolidate Departmental Scenarios Across Seed x Subsidy Combinations
+# =============================================================================
+
+scenarios_path <- here("01_data", "02_processed", "scenarios")
+
+# Define seed and subsidy variants and form the cartesian product
+seed_variants    <- c("s22", "s26", "s28")
+subsidy_variants <- c("sub00", "sub50", "sub75")
+
+combos <- tidyr::expand_grid(
+  seed    = seed_variants,
+  subsidy = subsidy_variants
+)
+
+df_departmental_consolidated <- map2(
+  combos$seed, combos$subsidy,
+  \(seed, subsidy) {
+    read_parquet(
+      file.path(scenarios_path,
+                glue("06_02_{seed}_{subsidy}_{pathway}_departmental_scenarios.parquet"))
+    ) |>
+      mutate(seed_year = seed, .before = 1)
+  }
+) |>
+  list_rbind()
+```
+
+## A2. Load and Consolidate National Scenarios
+
+Load the nine seed × subsidy national parquets from Script 06_03_`r pathway` and bind them with a `seed_year` identifier.
+
+```{r}
+#| label: a2-consolidate-national
+
+# =============================================================================
+# A2. Consolidate National Scenarios Across Seed x Subsidy Combinations
+# =============================================================================
+
+df_national_consolidated <- map2(
+  combos$seed, combos$subsidy,
+  \(seed, subsidy) {
+    read_parquet(
+      file.path(scenarios_path,
+                glue("06_03_{seed}_{subsidy}_{pathway}_national_scenarios.parquet"))
+    ) |>
+      mutate(seed_year = seed, .before = 1)
+  }
+) |>
+  list_rbind()
+```
+
+## A3. Validation of Consolidated Datasets
+
+```{r}
+#| label: tbl-a3-consolidation-validation
+#| tbl-cap: "Consolidated dataset dimensions"
+
+# =============================================================================
+# A3. Validate Consolidated Dimensions
+# =============================================================================
+
+df_tbl_a3 <- tibble(
+  Dataset = c("Departmental", "National"),
+  `Expected Rows` = c(
+    22 * 11 * 3 * 3,  # 22 depts x 11 penetration levels x 3 seeds x 3 subsidies
+    11 * 3 * 3        # 11 penetration levels x 3 seeds x 3 subsidies
+  ),
+  `Actual Rows` = c(
+    nrow(df_departmental_consolidated),
+    nrow(df_national_consolidated)
+  ),
+  `Columns` = c(
+    ncol(df_departmental_consolidated),
+    ncol(df_national_consolidated)
+  ),
+  `Seed Variants` = c(
+    n_distinct(df_departmental_consolidated$seed_year),
+    n_distinct(df_national_consolidated$seed_year)
+  ),
+  `Subsidy Regimes` = c(
+    n_distinct(df_departmental_consolidated$subsidy_suffix),
+    n_distinct(df_national_consolidated$subsidy_suffix)
+  )
+) |>
+  mutate(
+    Status = if_else(`Expected Rows` == `Actual Rows`, "\u2713", "\u2717")
+  )
+
+export(df_tbl_a3, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_a3_consolidation_validation.rds")))
+
+df_tbl_a3 |>
+  gt() |>
+  tab_header(
+    title = "Consolidation Validation",
+    subtitle = glue("Row counts across seed x subsidy combinations \u2014 Pathway: {pathway_label}")
+  ) |>
+  tab_style(
+    style = cell_text(color = "#2E7D32", weight = "bold"),
+    locations = cells_body(columns = Status, rows = Status == "\u2713")
+  ) |>
+  tab_style(
+    style = cell_text(color = "#C62828", weight = "bold"),
+    locations = cells_body(columns = Status, rows = Status == "\u2717")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_a3)
+```
+
+## A4. Export Consolidated Parquets
+
+These consolidated files are the canonical multi-seed datasets consumed by the Shiny application.
+
+```{r}
+#| label: a4-export-consolidated
+
+# =============================================================================
+# A4. Export Consolidated Parquets for Shiny Application
+# =============================================================================
+
+write_parquet(
+  df_departmental_consolidated,
+  here("01_data", "02_processed",
+       "scenarios", paste0(file_prefix, "_departmental_scenarios_consolidated.parquet"))
+)
+
+write_parquet(
+  df_national_consolidated,
+  here("01_data", "02_processed",
+       "scenarios", paste0(file_prefix, "_national_scenarios_consolidated.parquet"))
+)
+```
+
+---
+
+# Phase B: Overview Table Construction
+
+## B1. Combine Datasets
+
+```{r}
+#| label: b1-combine-datasets
+
+# =============================================================================
+# B1. Combine Departmental and National Data
+# =============================================================================
+
+# Standardize region column name across datasets
+df_dept_combined <- df_departmental_consolidated |>
+  mutate(region = departamento) |>
+  select(-departamento)
+
+# Identify common columns (national doesn't have quantiles)
+common_cols <- intersect(names(df_dept_combined), names(df_national_consolidated))
+
+df_combined <- bind_rows(
+  df_national_consolidated |> select(all_of(common_cols)),
+  df_dept_combined |> select(all_of(common_cols))
+) |>
+  # Order: within each (seed_year, subsidy_suffix) and penetration,
+  # Guatemala Total first, then departments alphabetically
+  mutate(
+    sort_order = if_else(region == "Guatemala Total", 0, 1),
+    region = factor(region)
+  ) |>
+  arrange(seed_year, subsidy_suffix, penetration, sort_order, region) |>
+  select(-sort_order)
+```
+
+## B2. Select and Rename Variables
+
+Map internal variable names to column specification, including the new `seed_year` identifier.
+
+```{r}
+#| label: b2-select-rename
+
+# =============================================================================
+# B2. Select and Rename Variables to Specifications
+# =============================================================================
+
+df_overview <- df_combined |>
+  transmute(
+    # =========================================================================
+    # IDENTIFIERS
+    # =========================================================================
+    `Seed Year` = seed_year,
+    `Subsidy Regime` = subsidy_suffix,
+    `Region` = region,
+    `Penetration (%)` = penetration * 100,
+
+    # =========================================================================
+    # FARMERS
+    # =========================================================================
+    `Maize Farmers (n)` = n_farmers_total,
+    `Biofort. Farmers (n)` = n_farmers_bio,
+    `Biofort. Farmers (%)` = farmers_bio_pct,
+    `Hybrid Farmers (n)` = n_farmers_hybrid,
+    `Hybrid Biofort. (n)` = n_hybrid_bio,
+    `Hybrid Biofort. (%)` = hybrid_bio_pct,
+    `OPV Farmers (n)` = n_farmers_opv,
+    `OPV Biofort. (n)` = n_opv_bio,
+    `OPV Biofort. (%)` = opv_bio_pct,
+
+    # =========================================================================
+    # LAND
+    # =========================================================================
+    `Maize Land (ha)` = land_ha_total,
+    `Biofort. Land (ha)` = land_bio_ha,
+    `Biofort. Land (%)` = land_bio_pct,
+    `Yield Increase (MT/ha)` = if_else(
+        land_bio_ha > 0,
+        production_increment_mt / land_bio_ha,
+        0
+    ),
+
+    # =========================================================================
+    # ECONOMIC
+    # =========================================================================
+    `Additional Maize (MT)` = production_increment_mt,
+    `Income Increase (GTQ)` = income_increment_total,
+    `Seed Cost Diff. (GTQ)` = cost_seeds_increment_total,
+    `Income/Farmer (GTQ)` = income_per_farmer_total,
+    `Income/Adopter (GTQ)` = income_per_farmer_adopter,
+
+    # =========================================================================
+    # SUBSIDY
+    # =========================================================================
+    `Bio Seed Cost No Subsidy (GTQ)` = cost_seeds_bio_no_subsidy_total,
+    `Bio Seed Cost Current Regime (GTQ)` = cost_seeds_bio_current_regime_total,
+    `Total Subsidy (GTQ)` = subsidy_amount_absolute_total,
+    `NewSeed Subsidy (GTQ)` = newseed_subsidy_total,
+    `Producer Absorption (GTQ)` = producer_absorption_total,
+    `Farmer Extra Cost (GTQ)` = subsidy_reduction_cost_total,
+    `NewSeed Savings vs Current (GTQ)` = newseed_savings_vs_current_total,
+
+    # =========================================================================
+    # COVERAGE
+    # =========================================================================
+    `Maize Consumed (MT)` = consumption_fsi_mt,
+    `Biofort. Consumed (MT)` = bio_consumed_mt,
+    `Biofort. Consumed (%)` = coverage_pct,
+    `Iron Added (kg/yr)` = iron_added_kg_year,
+    `Zinc Added (kg/yr)` = zinc_added_kg_year,
+
+    # =========================================================================
+    # POPULATION
+    # =========================================================================
+    `Total Population` = population,
+
+    # =========================================================================
+    # CONSUMPTION
+    # =========================================================================
+    `Maize Consumption Baseline (g/d)` = maize_g_day_mean_baseline,
+    `Maize Consumption Biofort. (g/d)` = maize_g_day_mean,
+
+    # =========================================================================
+    # ENERGY
+    # =========================================================================
+    `Energy Baseline (kcal/d)` = mean_energy_baseline,
+    `Energy Biofort. (kcal/d)` = mean_energy,
+    `Energy <36m Baseline (kcal/d)` = mean_energy_under36_baseline,
+    `Energy <36m Biofort. (kcal/d)` = mean_energy_under36,
+    `Energy 36-59m Baseline (kcal/d)` = mean_energy_36to59_baseline,
+    `Energy 36-59m Biofort. (kcal/d)` = mean_energy_36to59,
+
+    # =========================================================================
+    # CHILDREN
+    # =========================================================================
+    `Children (n)` = n_children,
+    `Children Biofort. (n)` = n_children_biofortified,
+    `Children Biofort. (%)` = children_coverage_pct,
+
+    # =========================================================================
+    # STUNTING
+    # =========================================================================
+    `Stunting Baseline (n)` = n_stunted_baseline,
+    `Stunting Baseline (%)` = stunting_pct_baseline,
+    `Stunting Biofort. (n)` = n_stunted_scenario,
+    `Stunting Biofort. (%)` = stunting_pct,
+    `Stunting Averted (n)` = n_stunting_averted,
+    `Stunting Averted (%)` = stunting_change_pct,
+    `ZLEN Baseline` = mean_zlen_baseline,
+    `ZLEN Biofort.` = mean_zlen,
+    `ZLEN Change` = zlen_change,
+
+    # =========================================================================
+    # ZINC
+    # =========================================================================
+    `Zinc Baseline (mg/d)` = mean_zinc_baseline,
+    `Zinc Biofort. (mg/d)` = mean_zinc,
+    `Zinc Inad. Baseline (n)` = n_zinc_inad_baseline,
+    `Zinc Inad. Baseline (%)` = zinc_inad_pct_baseline,
+    `Zinc Inad. Biofort. (n)` = n_zinc_inad_scenario,
+    `Zinc Inad. Biofort. (%)` = zinc_inad_pct,
+    `Zinc Inad. Averted (n)` = n_zinc_inad_averted,
+    `Zinc Inad. Averted (%)` = zinc_inad_change_pp,
+
+    # =========================================================================
+    # IRON
+    # =========================================================================
+    `Iron Intake Baseline (mg/d)` = mean_iron_total_baseline,
+    `Iron Intake Biofort. (mg/d)` = mean_iron_total,
+    `Iron Absorbed Baseline (mg/d)` = mean_iron_baseline,
+    `Iron Absorbed Biofort. (mg/d)` = mean_iron,
+    `Iron Inad. Baseline (n)` = n_iron_inad_baseline,
+    `Iron Inad. Baseline (%)` = iron_inad_pct_baseline,
+    `Iron Inad. Biofort. (n)` = n_iron_inad_scenario,
+    `Iron Inad. Biofort. (%)` = iron_inad_pct,
+    `Iron Inad. Averted (n)` = n_iron_inad_averted,
+    `Iron Inad. Averted (%)` = iron_inad_change_pp,
+
+    # =========================================================================
+    # PROTEIN
+    # =========================================================================
+    `Protein Baseline (g/d)` = mean_protein_baseline,
+    `Protein Biofort. (g/d)` = mean_protein,
+    `Protein Inad. Baseline (n)` = n_protein_inad_baseline,
+    `Protein Inad. Baseline (%)` = protein_inad_pct_baseline,
+    `Protein Inad. Biofort. (n)` = n_protein_inad_scenario,
+    `Protein Inad. Biofort. (%)` = protein_inad_pct,
+    `Protein Inad. Averted (n)` = n_protein_inad_averted,
+    `Protein Inad. Averted (%)` = protein_inad_change_pp
+  )
+```
+
+---
+
+# Phase C: Validation
+
+## C1. Schema Validation
+
+```{r}
+#| label: tbl-c1-schema-validation
+#| tbl-cap: "Overview table schema validation"
+
+# =============================================================================
+# C1. Schema Validation
+# =============================================================================
+
+df_tbl_c1 <- tibble(
+  Dimension = c("Total Rows", "Seed Variants", "Subsidy Regimes",
+                "Departments", "National Rows per (Seed,Subsidy)",
+                "Penetration Levels", "Columns"),
+  Expected = c(2277, 3, 3, 22, 11, 11, 80),
+  Actual = c(
+    nrow(df_overview),
+    n_distinct(df_overview$`Seed Year`),
+    n_distinct(df_overview$`Subsidy Regime`),
+    n_distinct(df_overview$Region) - 1,  # Exclude Guatemala Total
+    sum(df_overview$Region == "Guatemala Total") / 9,  # 3 seeds x 3 subsidies
+    n_distinct(df_overview$`Penetration (%)`),
+    ncol(df_overview)
+  )
+) |>
+  mutate(
+    Status = if_else(Expected == Actual, "\u2713", "\u2717")
+  )
+
+export(df_tbl_c1, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c1_schema_validation.rds")))
+
+df_tbl_c1 |>
+  gt() |>
+  tab_header(
+    title = "Overview Table Dimensions",
+    subtitle = glue("Validation against expected structure (3 seeds x 3 subsidies) \u2014 Pathway: {pathway_label}")
+  ) |>
+  tab_style(
+    style = cell_text(color = "#2E7D32", weight = "bold"),
+    locations = cells_body(columns = Status, rows = Status == "\u2713")
+  ) |>
+  tab_style(
+    style = cell_text(color = "#C62828", weight = "bold"),
+    locations = cells_body(columns = Status, rows = Status == "\u2717")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_c1)
+```
+
+## C2. Cross-Seed Baseline Consistency
+
+Verify that baseline metrics (0% penetration) are identical across seed variants — no biofortification means no seed effect.
+
+```{r}
+#| label: tbl-c2-baseline-consistency
+#| tbl-cap: "Baseline consistency check across seed variants"
+
+# =============================================================================
+# C2. Cross-Seed Baseline Consistency
+# =============================================================================
+
+df_tbl_c2 <- df_overview |>
+  filter(`Penetration (%)` == 0, Region == "Guatemala Total") |>
+  select(
+    `Seed Year`,
+    `Subsidy Regime`,
+    `Total Population`,
+    `Stunting Baseline (%)`,
+    `ZLEN Baseline`,
+    `Zinc Baseline (mg/d)`,
+    `Iron Intake Baseline (mg/d)`,
+    `Protein Baseline (g/d)`,
+    `Maize Consumption Baseline (g/d)`,
+    `Energy Baseline (kcal/d)`,
+    `Energy <36m Baseline (kcal/d)`,
+    `Energy 36-59m Baseline (kcal/d)`
+  )
+
+export(df_tbl_c2, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c2_baseline_consistency.rds")))
+
+df_tbl_c2 |>
+  gt() |>
+  tab_header(
+    title = "Baseline Metrics at 0% Penetration",
+    subtitle = glue("Values must be identical across all seed x subsidy combinations (Guatemala Total) \u2014 Pathway: {pathway_label}")
+  ) |>
+  fmt_number(columns = `Total Population`, decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = `Stunting Baseline (%)`, decimals = 1) |>
+  fmt_number(columns = `ZLEN Baseline`, decimals = 3) |>
+  fmt_number(columns = c(`Zinc Baseline (mg/d)`, `Iron Intake Baseline (mg/d)`),
+             decimals = 3) |>
+  fmt_number(columns = `Protein Baseline (g/d)`, decimals = 2) |>
+  fmt_number(columns = `Maize Consumption Baseline (g/d)`, decimals = 1) |>
+  fmt_number(columns = `Energy Baseline (kcal/d)`, decimals = 0) |>
+  fmt_number(columns = c(`Energy <36m Baseline (kcal/d)`,
+                          `Energy 36-59m Baseline (kcal/d)`), decimals = 0) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_c2)
+```
+
+## C3. Cross-Seed Impact Comparison at 100% Penetration
+
+```{r}
+#| label: tbl-c3-impact-comparison
+#| tbl-cap: "Impact metrics at 100% penetration by seed variant"
+
+# =============================================================================
+# C3. Cross-Seed Impact Comparison
+# =============================================================================
+
+df_tbl_c3 <- df_overview |>
+  filter(`Penetration (%)` == 100, Region == "Guatemala Total") |>
+  select(
+    `Seed Year`,
+    `Subsidy Regime`,
+    `Biofort. Consumed (%)`,
+    `Stunting Biofort. (%)`,
+    `Stunting Averted (n)`,
+    `Zinc Inad. Averted (%)`,
+    `Iron Inad. Averted (%)`,
+    `Income Increase (GTQ)`,
+    `NewSeed Subsidy (GTQ)`
+  )
+
+export(df_tbl_c3, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c3_impact_comparison.rds")))
+
+df_tbl_c3 |>
+  gt() |>
+  tab_header(
+    title = "Impact Comparison at Maximum Penetration",
+    subtitle = glue("Guatemala Total \u2014 Pathway: {pathway_label} \u2014 expected monotonic improvement S22 < S26 < S28 (within each subsidy regime)")
+  ) |>
+  fmt_number(columns = c(`Biofort. Consumed (%)`, `Stunting Biofort. (%)`,
+                          `Zinc Inad. Averted (%)`, `Iron Inad. Averted (%)`),
+             decimals = 1) |>
+  fmt_number(columns = `Stunting Averted (n)`, decimals = 0, use_seps = TRUE) |>
+  fmt_number(columns = c(`Income Increase (GTQ)`, `NewSeed Subsidy (GTQ)`),
+             decimals = 0, use_seps = TRUE) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_c3)
+```
+
+## C4. Sample Data Preview
+
+```{r}
+#| label: tbl-c4-sample-preview
+#| tbl-cap: "Sample data preview (100% penetration, S28)"
+
+# =============================================================================
+# C4. Sample Data Preview
+# =============================================================================
+
+df_tbl_c4 <- df_overview |>
+  filter(`Penetration (%)` == 100,
+         `Seed Year` == "s28",
+         `Subsidy Regime` == "sub00") |>
+  select(
+    `Seed Year`,
+    `Subsidy Regime`,
+    Region,
+    `Penetration (%)`,
+    `Biofort. Farmers (n)`,
+    `Biofort. Land (ha)`,
+    `Biofort. Consumed (%)`,
+    `Stunting Averted (n)`,
+    `Zinc Inad. Averted (n)`,
+    `Iron Inad. Averted (n)`
+  ) |>
+  head(10)
+
+export(df_tbl_c4, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c4_sample_preview.rds")))
+
+df_tbl_c4 |>
+  gt() |>
+  tab_header(
+    title = "Overview Table Sample",
+    subtitle = glue("First 10 rows at 100% penetration \u2014 Seed 2028, sub00 \u2014 Pathway: {pathway_label}")
+  ) |>
+  fmt_number(
+    columns = c(`Biofort. Farmers (n)`, `Biofort. Land (ha)`,
+                `Stunting Averted (n)`, `Zinc Inad. Averted (n)`,
+                `Iron Inad. Averted (n)`),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(columns = `Biofort. Consumed (%)`, decimals = 1) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = Region == "Guatemala Total")
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_c4)
+```
+
+## C5. Column Names Verification
+
+```{r}
+#| label: tbl-c5-column-names
+#| tbl-cap: "Complete column list"
+
+# =============================================================================
+# C5. Column Names Verification
+# =============================================================================
+
+df_tbl_c5 <- tibble(
+  `#` = seq_along(names(df_overview)),
+  `Column Name` = names(df_overview),
+  `Category` = case_when(
+    `#` <= 4  ~ "Identifiers",
+    `#` <= 13 ~ "Farmers",
+    `#` <= 17 ~ "Land",
+    `#` <= 23 ~ "Economic",
+    `#` <= 30 ~ "Subsidy",
+    `#` <= 35 ~ "Coverage",
+    `#` <= 36 ~ "Population",
+    `#` <= 38 ~ "Consumption",
+    `#` <= 44 ~ "Energy",
+    `#` <= 47 ~ "Children",
+    `#` <= 56 ~ "Stunting",
+    `#` <= 64 ~ "Zinc",
+    `#` <= 74 ~ "Iron",
+    TRUE ~ "Protein"
+  )
+)
+
+export(df_tbl_c5, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c5_column_names.rds")))
+
+df_tbl_c5 |>
+  gt() |>
+  tab_header(
+    title = "Overview Table Column Specification",
+    subtitle = glue("82 columns: Seed Year + Subsidy Regime + Region + Penetration + 78 metrics \u2014 Pathway: {pathway_label}")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F5F5F5"),
+    locations = cells_body(
+      rows = Category %in% c("Farmers", "Economic", "Subsidy", "Population", "Energy", "Zinc", "Protein")
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Cleanup auxiliary objects
+rm(df_tbl_c5)
+```
+
+---
+
+# Phase D: Export
+
+## D1. Export Parquet (for Shiny)
+
+The overview parquet is the canonical multi-combination dataset consumed by the Shiny application, both for the interactive table and for the workbook the application assembles at download time.
+
+```{r}
+#| label: d1-export-parquet
+
+# =============================================================================
+# D1. Export Overview Table as Parquet
+# =============================================================================
+
+write_parquet(
+  df_overview,
+  here("01_data", "02_processed",
+       "scenarios", paste0(file_prefix, "_overview_table.parquet"))
+)
+```
+
+---
+
+# Notes
+
+## Pipeline Position
+
+This script consolidates the outputs of:
+
+- **Script 06_02_`r pathway`** (departmental scenarios): 9 parquets covering the cartesian product of 3 seeds (s22, s26, s28) and 3 subsidy regimes (sub00, sub50, sub75) for the `r tolower(pathway_label)` pathway, named `06_02_{seed}_{sub}_`r pathway`_departmental_scenarios.parquet`
+- **Script 06_03_`r pathway`** (national scenarios): 9 parquets with the same combination structure, named `06_03_{seed}_{sub}_`r pathway`_national_scenarios.parquet`
+
+## Seed Variant Architecture
+
+The three seed variants represent different biofortified maize varieties with distinct yield performance characteristics:
+
+- **S22**: Currently deployed seed (released 2022). Yield factors: OPV +31.6%, Low +25.6%, Mid +1.8%, High -13.8%
+- **S26**: Improved variety (expected release 2026). Yield factors: OPV +45%, Low +40%, Mid +10%, High -7%
+- **S28**: Next-generation variety (expected release 2028). Yield factors: OPV +55%, Low +55%, Mid +20%, High -2%
+
+All three share identical biofortification nutritional composition (QPM micronutrient concentrations). Differences in nutritional and stunting outcomes arise exclusively from differential market coverage driven by yield performance (more production per hectare enables greater redistribution and adoption).
+
+## Subsidy Regime Architecture
+
+The three subsidy regimes represent progressive reductions of the NewSeed contribution to the biofortified seed price relative to the current commercial price (547 GTQ/mz without subsidy):
+
+- **sub00 (current subsidy)**: NewSeed pays 242 GTQ/mz; farmer pays 305 GTQ/mz
+- **sub50 (subsidy reduced 50%)**: NewSeed pays 121 GTQ/mz; farmer pays 366 GTQ/mz
+- **sub75 (subsidy reduced 75%)**: NewSeed pays 61 GTQ/mz; farmer pays 396 GTQ/mz
+
+The subsidy regime affects the farmer adoption ranking and the monetary aggregations in the SUBSIDY block of the overview table; it does not alter physical production capacity, consumption demand, or the road network.
+
+## Output Files
+
+| File | Purpose | Rows | Consumer |
+|------|---------|------|----------|
+| `r paste0(file_prefix, "_departmental_scenarios_consolidated.parquet")` | Multi-combination departmental data | 2,178 | Shiny app |
+| `r paste0(file_prefix, "_national_scenarios_consolidated.parquet")` | Multi-combination national data | 99 | Shiny app |
+| `r paste0(file_prefix, "_overview_table.parquet")` | Flat overview with renamed columns | 2,277 | Shiny app (interactive table and download) |
+
+## Pathway Note
+
+This is the **`r tolower(pathway_label)` pathway** consolidation script. Both pathways produce identically structured overview tables with the same columns, enabling direct comparison between the two analytical approaches.

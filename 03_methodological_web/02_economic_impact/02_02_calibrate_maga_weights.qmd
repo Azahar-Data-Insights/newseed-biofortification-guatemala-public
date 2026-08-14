@@ -1,0 +1,693 @@
+---
+title: "MAGA Weight Calibration"
+subtitle: "Module 2: Economic Impact"
+---
+
+## Why Calibrate to MAGA?
+
+Survey data and administrative records often produce different estimates of
+agricultural activity. ENCOVI 2023 captures detailed farmer-level information
+but uses a general population sampling frame that may under- or over-represent
+certain agricultural regions. MAGA (Ministerio de Agricultura, Ganadería y
+Alimentación) publishes official departmental statistics based on comprehensive
+agricultural monitoring.
+
+By calibrating ENCOVI survey weights to match MAGA totals, we achieve:
+
+1. **Administrative consistency** — Weighted estimates align with official
+   government statistics used in policy planning
+2. **Improved representativeness** — Correct for differential sampling rates
+   across agricultural departments
+3. **Credibility for stakeholders** — Results match published figures that
+   donors and policymakers reference
+
+This calibration step is particularly important for economic impact projections,
+where departmental production volumes directly affect estimated benefits from
+biofortified maize adoption.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  gt,                 # Table formatting and presentation
+  scales,             # Number formatting for visualizations
+  tidyverse           # General purpose data manipulation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script (exported by framework 02_02).
+
+tbl_a2_scaling_factor <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_02_tbl_a2_scaling_factor.rds"),
+  trust = TRUE
+)
+
+tbl_a5_encovi_vs_maga <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_02_tbl_a5_encovi_vs_maga.rds"),
+  trust = TRUE
+)
+
+tbl_b2_calibration_validation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_02_tbl_b2_calibration_validation.rds"),
+  trust = TRUE
+)
+
+tbl_c1_calibration_diagnostics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_02_tbl_c1_calibration_diagnostics.rds"),
+  trust = TRUE
+)
+
+fig_c1_weight_distribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_02_fig_c1_weight_distribution.rds"),
+  trust = TRUE
+)
+
+tbl_d1_final_validation <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_02_tbl_d1_final_validation.rds"),
+  trust = TRUE
+)
+
+tbl_d2_transformation_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "02_02_tbl_d2_transformation_summary.rds"),
+  trust = TRUE
+)
+```
+
+```{r}
+#| label: inline-values
+#| include: false
+
+# Expansion configuration constants (defined in framework script 02_02, Phase C1).
+# Reproduced here as constants — these are pipeline configuration parameters,
+# not computed outputs.
+expansion_threshold      <- 500
+target_weight_per_record <- 100
+
+# Derived counts from the weight distribution dataframe (df_farmers_calibrated)
+n_to_expand <- fig_c1_weight_distribution |>
+  dplyr::summarise(n = sum(needs_expansion, na.rm = TRUE)) |>
+  dplyr::pull(n)
+
+n_final_records <- fig_c1_weight_distribution |>
+  dplyr::summarise(n = sum(n_copies, na.rm = TRUE)) |>
+  dplyr::pull(n)
+
+n_total_calibrated <- nrow(fig_c1_weight_distribution)
+
+n_departments_calibrated <- nrow(tbl_b2_calibration_validation)
+
+# Scaling factor applied to the ENCOVI weights before departmental calibration
+scaling_factor_value <- tbl_a2_scaling_factor |>
+  dplyr::filter(metric == "Scaling factor") |>
+  dplyr::pull(value)
+
+# Size of the pre-calibration gap against MAGA, in ratio terms
+ratio_prod_min <- min(tbl_a5_encovi_vs_maga$ratio_production)
+ratio_prod_max <- max(tbl_a5_encovi_vs_maga$ratio_production)
+n_dept_outside_half_double <- sum(tbl_a5_encovi_vs_maga$ratio_production < 0.5 |
+                                  tbl_a5_encovi_vs_maga$ratio_production > 2)
+
+# Weight dispersion before and after the departmental adjustment
+diag_value <- function(label) {
+  tbl_c1_calibration_diagnostics |>
+    dplyr::filter(Metric == label) |>
+    dplyr::pull(Value)
+}
+
+cv_weights_initial    <- diag_value("Weight CV (initial)")
+cv_weights_calibrated <- diag_value("Weight CV (calibrated)")
+deff_weights          <- diag_value("Design Effect (DEFF)")
+ratio_range_weights   <- diag_value("Adjustment ratio range")
+ratios_extreme_low    <- diag_value("Ratios < 0.3 (extreme low)")
+ratios_extreme_high   <- diag_value("Ratios > 3.0 (extreme high)")
+```
+
+
+## Calibration Approach
+
+The calibration process adjusts individual survey weights so that weighted
+departmental totals for **production** (quintales) and **cultivated land**
+(manzanas) match MAGA 2023 official statistics.
+
+### Data Sources
+
+| Source | Purpose |
+|--------|---------|
+| ENCOVI 2023 | Farmer-level characteristics, original survey weights |
+| MAGA 2023 | Departmental targets for production and land area |
+| INE 2011 | Total agricultural household reference (1,299,377) |
+
+### Calibration Variables
+
+- **Production** (`total_production`) — Total white maize harvested in quintales
+- **Land** (`land_wtcorn`) — Cultivated white maize area in manzanas
+
+Both variables are calibrated simultaneously within each department using linear
+calibration, ensuring weighted totals match MAGA targets exactly.
+
+
+## Initial Weight Scaling
+
+Before departmental calibration, we apply a scaling factor to align ENCOVI's
+total agricultural household estimate with official INE census figures.
+
+```{r}
+#| label: tbl-a2-scaling-factor
+#| tbl-cap: "Initial weight scaling to match INE agricultural census"
+
+tbl_a2_scaling_factor |>
+  gt() |>
+  tab_header(
+    title = "Farmer Population Scaling Factor",
+    subtitle = "Alignment of ENCOVI estimates with INE agricultural census"
+  ) |>
+  cols_label(metric = "Metric", value = "Value") |>
+  fmt_number(columns = value, rows = 1:2, use_seps = TRUE, decimals = 0) |>
+  fmt_number(columns = value, rows = 3, decimals = 4) |>
+  tab_source_note(
+    source_note = "Source: INE (2011) — Distribución de hogares agropecuarios según tipología"
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-note}
+## Scaling Factor
+At `r round(scaling_factor_value, 3)`, the factor places ENCOVI's original
+weights at around half the agricultural population the INE census estimates.
+ENCOVI draws on a general population sampling frame, not an
+agriculture-specific one, and the factor closes that gap before the
+departmental calibration runs.
+:::
+
+
+## Pre-Calibration Diagnostic
+
+Before applying calibration, we compare ENCOVI weighted estimates against MAGA
+departmental targets to quantify the magnitude of discrepancies.
+
+```{r}
+#| label: tbl-a5-encovi-vs-maga
+#| tbl-cap: "ENCOVI vs MAGA comparison before calibration"
+
+tbl_a5_encovi_vs_maga |>
+  select(
+    departamento, n_farmers,
+    production_encovi, production_maga_qq, ratio_production,
+    land_encovi, land_maga_mz, ratio_land
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Pre-Calibration: ENCOVI vs MAGA Comparison",
+    subtitle = "Weighted estimates before departmental calibration"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers = "N (sample)",
+    production_encovi = "ENCOVI",
+    production_maga_qq = "MAGA",
+    ratio_production = "Ratio",
+    land_encovi = "ENCOVI",
+    land_maga_mz = "MAGA",
+    ratio_land = "Ratio"
+  ) |>
+  tab_spanner(
+    label = "Production (qq)",
+    columns = c(production_encovi, production_maga_qq, ratio_production)
+  ) |>
+  tab_spanner(
+    label = "Land (mz)",
+    columns = c(land_encovi, land_maga_mz, ratio_land)
+  ) |>
+  fmt_number(
+    columns = c(production_encovi, production_maga_qq, land_encovi, land_maga_mz),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(ratio_production, ratio_land),
+    decimals = 2
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  tab_style(
+    style = cell_fill(color = "#FFCCCC"),
+    locations = cells_body(
+      columns = ratio_production,
+      rows = ratio_production < 0.5 | ratio_production > 2.0
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFCCCC"),
+    locations = cells_body(
+      columns = ratio_land,
+      rows = ratio_land < 0.5 | ratio_land > 2.0
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_farmers, production_encovi, production_maga_qq,
+                land_encovi, land_maga_mz),
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Ratio** = ENCOVI / MAGA. Values far from 1.0 indicate large discrepancies requiring calibration.<br>
+                      Red highlight: ratio < 0.5 or > 2.0")
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-warning}
+## Substantial Discrepancies
+Several departments show ratios far from 1.0, indicating that ENCOVI weighted
+estimates diverge substantially from MAGA administrative data. Calibration
+corrects these discrepancies departmentally.
+:::
+
+
+## Post-Calibration Validation
+
+After applying departmental calibration, we verify that weighted totals match
+MAGA targets exactly.
+
+```{r}
+#| label: tbl-b2-calibration-validation
+#| tbl-cap: "Validation of calibrated weights against MAGA targets"
+
+tbl_b2_calibration_validation |>
+  select(
+    departamento, n_farmers,
+    production_calibrated, production_maga_qq, ratio_production,
+    land_calibrated, land_maga_mz, ratio_land
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Post-Calibration Validation: ENCOVI vs MAGA",
+    subtitle = "Calibrated weighted estimates should match MAGA targets (ratio ≈ 1.00)"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_farmers = "N (sample)",
+    production_calibrated = "Calibrated",
+    production_maga_qq = "MAGA",
+    ratio_production = "Ratio",
+    land_calibrated = "Calibrated",
+    land_maga_mz = "MAGA",
+    ratio_land = "Ratio"
+  ) |>
+  tab_spanner(
+    label = "Production (qq)",
+    columns = c(production_calibrated, production_maga_qq, ratio_production)
+  ) |>
+  tab_spanner(
+    label = "Land (mz)",
+    columns = c(land_calibrated, land_maga_mz, ratio_land)
+  ) |>
+  fmt_number(
+    columns = c(production_calibrated, production_maga_qq,
+                land_calibrated, land_maga_mz),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(ratio_production, ratio_land),
+    decimals = 4
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = c(ratio_production, ratio_land),
+      rows = abs(ratio_production - 1) < 0.001 & abs(ratio_land - 1) < 0.001
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_farmers, production_calibrated, production_maga_qq,
+                land_calibrated, land_maga_mz),
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Ratio** = Calibrated / MAGA. Values of 1.0000 confirm exact calibration.<br>
+                      Green highlight: both ratios within ±0.1% of target.")
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+::: {.callout-note}
+## Calibration Result
+The `r n_departments_calibrated` departments reach a ratio of 1.0000 against
+their MAGA targets for both production and land. The calibration is exact by
+construction: it solves for the departmental weight adjustment that reproduces
+both totals. What the diagnostics below report is the size of the adjustment
+this required.
+:::
+
+
+## Record Expansion with Jitter
+
+Calibration can produce very large individual weights, which create artificial
+"steps" in cumulative distributions. These steps interfere with threshold-based
+farmer segmentation, where cutpoints may fall on weight discontinuities.
+
+We address this by **expanding** high-weight farmers into multiple records with
+controlled random variation (jitter). The following variables are jittered in
+the expanded records (the original base record of each farmer is left untouched):
+
+- `qty_sold_qq`, `qty_household_qq`, `qty_animal_seed_qq` — Destination quantities
+  (sales, household consumption, animal feed and seed reserves)
+- `total_production` — Recalculated as the sum of the jittered destination
+  quantities, so that allocation coherence is preserved
+- `land_wtcorn` — Cultivated land (manzanas)
+- `exp_seeds` — Seed expenditure (Q)
+- `revenue` — Sales revenue (Q)
+- `farmer_age` — Age of the farmer
+
+Jitter is applied with the following parameters:
+
+- **Intensity**: 3% of each variable's standard deviation
+- **Bounds**: non-negative values enforced post-jitter
+- **Allocation coherence**: `total_production` is derived from the jittered
+  destination quantities rather than jittered on its own, which keeps production
+  equal to the sum of its uses in every expanded record
+
+```{r}
+#| label: tbl-c1-calibration-diagnostics
+#| tbl-cap: "Weight diagnostics and expansion parameters"
+
+tbl_c1_calibration_diagnostics |>
+  gt() |>
+  tab_header(
+    title = "Calibration Diagnostics and Expansion Plan",
+    subtitle = "Weight validation metrics and jitter expansion parameters"
+  ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "center", columns = c(Value, Threshold, Status)) |>
+  tab_row_group(label = "Expansion Parameters", rows = 7:10) |>
+  tab_row_group(label = "Calibration Metrics", rows = 1:6) |>
+  row_group_order(groups = c("Calibration Metrics", "Expansion Parameters")) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(rows = str_detect(Status, "Pass"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFF3E0"),
+    locations = cells_body(rows = str_detect(Status, "Warning"))
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = Metric %in% c("Expansion threshold", "Target weight per record",
+                                                 "Farmers to expand", "Final record count"))
+  ) |>
+  tab_source_note(
+    source_note = md("**DEFF** = Design Effect (1 + CV²). Values > 2 indicate efficiency loss.<br>
+                      **Blue rows**: Expansion parameters to smooth distribution steps.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    row_group.font.weight = "bold"
+  )
+```
+
+```{r}
+#| label: fig-c1-weight-distribution
+#| fig-cap: "Distribution of calibrated weights with expansion threshold"
+#| fig-alt: >
+#|   Histogram of calibrated farmer weights along the x-axis against the number
+#|   of farmers on the y-axis. The distribution is right-skewed, with most
+#|   farmers concentrated at low weights and a long tail of high weights. A
+#|   dashed vertical line marks the expansion threshold of 500; farmers above
+#|   it are split into multiple records so that oversized weights, which create
+#|   artificial steps in the distribution, are smoothed out.
+#| fig-width: 10
+#| fig-height: 6
+
+ggplot(fig_c1_weight_distribution, aes(x = weight_calibrated)) +
+  geom_histogram(
+    bins = 50,
+    fill = "#3E7CB1",
+    alpha = 0.3,
+    color = "white"
+  ) +
+  geom_vline(
+    xintercept = expansion_threshold,
+    linetype = "dashed",
+    color = "#3AAF85",
+    linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = expansion_threshold,
+    y = Inf,
+    label = paste0("Expansion threshold: ", comma(expansion_threshold)),
+    vjust = 2,
+    hjust = -0.05,
+    color = "#3AAF85",
+    size = 3.5
+  ) +
+  annotate(
+    "text",
+    x = max(fig_c1_weight_distribution$weight_calibrated) * 0.7,
+    y = Inf,
+    label = paste0(n_to_expand, " farmers (",
+                   round(n_to_expand / n_total_calibrated * 100, 1),
+                   "%) will be\nexpanded to ", comma(n_final_records), " records"),
+    vjust = 3,
+    hjust = 0.5,
+    color = "#2C3E50",
+    size = 3.5
+  ) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Calibrated Weights",
+    subtitle = paste0("Farmers with weight > ", comma(expansion_threshold),
+                      " will be split into multiple records with target weight ≈ ",
+                      comma(target_weight_per_record)),
+    x = "Calibrated Weight",
+    y = "Number of Farmers"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 12, face = "bold", color = "#2C3E50"),
+    plot.subtitle = element_text(size = 10, color = "#566573"),
+    axis.title = element_text(size = 10, color = "#2C3E50"),
+    axis.text = element_text(size = 9, color = "#2C3E50")
+  )
+```
+
+::: {.callout-important}
+## Expansion Strategy
+Farmers with calibrated weight above the expansion threshold are split into
+multiple records, each with a target weight of approximately one fifth of the
+threshold. This brings the maximum weight down by an order of magnitude and
+smooths the large steps out of the distribution. A 3% standard deviation jitter
+is applied to base variables to introduce controlled variation among copies.
+:::
+
+::: {.callout-important}
+## What the Adjustment Costs
+The departmental targets are met exactly, and the adjustment needed to meet
+them is large. Individual weights are multiplied by factors spanning
+`r ratio_range_weights`, against the conventional working range of [0.3, 3.0]:
+`r ratios_extreme_low` of records fall below 0.3 and
+`r ratios_extreme_high` above 3.0.
+
+The dispersion of the weights rises accordingly, with their coefficient of
+variation moving from `r cv_weights_initial` to `r cv_weights_calibrated` and a
+design effect of `r deff_weights`. This is the arithmetic consequence of the
+pre-calibration gap: the ENCOVI-to-MAGA production ratio runs from
+`r round(ratio_prod_min, 2)` to `r round(ratio_prod_max, 2)` across
+departments, so the weights carry the whole of that correction.
+:::
+
+
+## Final Validation
+
+After expansion, jitter application, and re-calibration (to correct small
+jitter-induced bias), we verify the final dataset still matches MAGA targets.
+
+```{r}
+#| label: tbl-d1-final-validation
+#| tbl-cap: "Final validation: Expanded dataset weighted totals vs MAGA targets"
+
+tbl_d1_final_validation |>
+  select(
+    departamento, n_records, n_households, n_farmers_weighted,
+    production_final, production_maga_qq, ratio_production,
+    land_final, land_maga_mz, ratio_land
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Final Validation: Expanded Dataset vs MAGA Targets",
+    subtitle = "Weighted totals after expansion and re-calibration"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    n_records = "Records",
+    n_households = "Households",
+    n_farmers_weighted = "Farmers",
+    production_final = "Final",
+    production_maga_qq = "MAGA",
+    ratio_production = "Ratio",
+    land_final = "Final",
+    land_maga_mz = "MAGA",
+    ratio_land = "Ratio"
+  ) |>
+  tab_spanner(
+    label = "Sample",
+    columns = c(n_records, n_households, n_farmers_weighted)
+  ) |>
+  tab_spanner(
+    label = "Production (qq)",
+    columns = c(production_final, production_maga_qq, ratio_production)
+  ) |>
+  tab_spanner(
+    label = "Land (mz)",
+    columns = c(land_final, land_maga_mz, ratio_land)
+  ) |>
+  fmt_number(
+    columns = c(production_final, production_maga_qq, land_final, land_maga_mz,
+                n_farmers_weighted),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(ratio_production, ratio_land),
+    decimals = 4
+  ) |>
+  fmt_number(
+    columns = c(n_records, n_households),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  cols_align(align = "left", columns = departamento) |>
+  cols_align(align = "right", columns = -departamento) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = c(ratio_production, ratio_land),
+      rows = abs(ratio_production - 1) < 0.0001 & abs(ratio_land - 1) < 0.0001
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(n_records, n_households, n_farmers_weighted,
+                production_final, production_maga_qq,
+                land_final, land_maga_mz),
+    fns = list(Total = ~ sum(.)),
+    fmt = ~ fmt_number(., use_seps = TRUE, decimals = 0)
+  ) |>
+  tab_source_note(
+    source_note = md("**Ratio** = Final / MAGA. Values of 1.0000 confirm exact calibration.<br>
+                      **Farmers** = Weighted total of white maize farmers represented.<br>
+                      Green highlight: both ratios within ±0.01% of target.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+
+## Transformation Pipeline
+
+```{r}
+#| label: tbl-d2-transformation-summary
+#| tbl-cap: "Complete transformation from ENCOVI sample to calibrated dataset"
+
+tbl_d2_transformation_summary |>
+  gt() |>
+  tab_header(
+    title = "Dataset Transformation Pipeline",
+    subtitle = "From ENCOVI sample to MAGA-calibrated expanded dataset"
+  ) |>
+  cols_align(align = "left", columns = c(Stage, Description)) |>
+  cols_align(align = "right", columns = c(Records, `Weight Range`)) |>
+  tab_style(
+    style = cell_fill(color = "#E3F2FD"),
+    locations = cells_body(rows = Stage == "D. Final output")
+  ) |>
+  tab_source_note(
+    source_note = "Pipeline progresses from cleaned ENCOVI input through calibration, expansion with jitter, and re-calibration to the final dataset ready for segmentation modeling"
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    heading.title.font.size = 13,
+    table.width = pct(100)
+  )
+```
+
+
+## Summary
+
+### Key Findings
+
+1. **Initial discrepancies**: Before calibration the ENCOVI-to-MAGA production
+   ratio ranges from `r round(ratio_prod_min, 2)` to
+   `r round(ratio_prod_max, 2)`, with `r n_dept_outside_half_double` of the
+   `r n_departments_calibrated` departments outside the [0.5, 2.0] range.
+
+2. **Calibration**: Linear calibration brings both production and land area
+   onto the MAGA departmental targets, with ratios at 1.0000.
+
+3. **Cost in weight dispersion**: Meeting those targets moves the weight
+   coefficient of variation from `r cv_weights_initial` to
+   `r cv_weights_calibrated`, with a design effect of `r deff_weights` and
+   adjustment ratios spanning `r ratio_range_weights`.
+
+4. **Weight smoothing**: Record expansion with controlled jitter removes the
+   discontinuities from the distribution while holding the weighted totals,
+   and a re-calibration pass corrects the small bias the non-negativity
+   constraint introduces.
+
+### Application
+
+The calibrated and expanded dataset provides:
+
+- **Representative farmer population** — Weighted totals match official MAGA
+  statistics for economic impact projections
+- **Smooth distributions** — No artificial steps for threshold-based
+  segmentation in farmer classification
+- **Internal consistency** — Allocation coherence between total production and
+  destination quantities preserved through the jitter procedure

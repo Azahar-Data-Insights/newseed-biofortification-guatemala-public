@@ -1,0 +1,581 @@
+---
+title: "Intake Calculation"
+subtitle: "Module 1: Nutrient Intakes"
+---
+
+## Overview
+
+Household consumption surveys like ENCOVI report food acquisition at the
+household level, while nutrient intake analysis requires individual-level
+estimates. This document transforms household food consumption into individual
+nutrient intake through three key steps:
+
+1. **Standardize maize products** — Convert tortillas and flour to grain
+   equivalent weight to isolate the fraction affected by biofortification.
+2. **Separate food sources** — Calculate intake from maize and non-maize
+   sources independently, enabling scenario modeling where only maize nutrients
+   change.
+3. **Distribute to individuals** — Apply Adult Male Equivalent (AME) factors to
+   allocate household consumption to each member proportionally to their energy
+   requirements.
+
+The separation of maize from other food sources is fundamental to
+biofortification impact modeling. Because biofortification only affects
+specific nutrient levels in maize, we need to know precisely how much of each
+person's iron, zinc, and protein intake comes from maize versus other foods.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Clear environment and unload packages
+rm(list = ls())
+pacman::p_unload(all = TRUE)
+
+# Load required packages (using pacman for automatic installation)
+pacman::p_load(
+  rio,            # Robust import/export for various formats
+  here,           # Robust file path management
+  tidyverse,      # General purpose data manipulation
+  gt              # Table formatting and presentation
+)
+
+# Set display options
+options(scipen = 999, digits = 4)
+```
+
+```{r}
+#| label: load-rds
+#| include: false
+
+# Centralized load of web_resources for this script.
+tbl_c_summary <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_02_tbl_c_summary.rds"),
+  trust = TRUE
+)
+
+tbl_d1_summary_sample_characteristics <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_04_tbl_d1_summary_sample_characteristics.rds"),
+  trust = TRUE
+)
+
+tbl_d2a_summary_total_maize_intake <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_04_tbl_d2a_summary_total_maize_intake.rds"),
+  trust = TRUE
+)
+
+tbl_d2b_summary_maize_contribution <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_04_tbl_d2b_summary_maize_contribution.rds"),
+  trust = TRUE
+)
+
+tbl_d2c_summary_intake_by_age <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_04_tbl_d2c_summary_intake_by_age.rds"),
+  trust = TRUE
+)
+
+tbl_d2d_summary_diet_composition <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_04_tbl_d2d_summary_diet_composition.rds"),
+  trust = TRUE
+)
+
+tbl_d3a_quality_check_missing <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_04_tbl_d3a_quality_check_missing.rds"),
+  trust = TRUE
+)
+
+tbl_d3b_quality_check_extremes <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "01_04_tbl_d3b_quality_check_extremes.rds"),
+  trust = TRUE
+)
+```
+
+
+## Household Food Processing
+
+### Maize Standardization
+
+In Guatemala, maize is rarely consumed as raw grain. Most households eat
+tortillas — the staple food prepared through nixtamalization — or use
+commercially milled maize flour. To assess the impact of biofortification, we
+must convert these processed products back to their **maize grain equivalent**.
+
+Following INCAP guidelines for dietary intake assessment in Guatemala, weight
+conversion factors are applied:
+
+| Product | Factor | Rationale |
+|---------|--------|-----------|
+| Tortillas | ×0.52 | Nixtamalization adds water and calcium hydroxide (*cal*); ~52% of final weight is maize grain |
+| Maize flour | ×0.98 | Dry milling retains ~98% of grain weight |
+| Raw grain | ×1.00 | No conversion needed |
+
+After weight conversion, nutrient values are reassigned to match raw white
+maize composition from the INCAP Food Composition Table (per 100g: 365 kcal,
+9.42g protein, 2.71mg iron, 2.21mg zinc). Nutrient calculations then reflect
+the maize fraction that biofortification modifies.
+
+::: {.callout-tip}
+## Raw Maize Composition After Weight Conversion
+Tortilla composition carries nutrients contributed by the nixtamalization
+process (calcium from *cal*) and water content that dilutes nutrient density.
+Applying raw maize values to the converted grain-equivalent weight isolates
+the component of a tortilla that biofortification modifies. Total dietary
+energy intake is unchanged by this step: the conversion identifies the
+maize-derived nutrient fraction within the household diet.
+
+Source: Conversion factors derived from INCAP dietary assessment protocols.
+:::
+
+
+### Separating Maize from Non-Maize Sources
+
+Biofortification increases the micronutrient content of food crops through
+conventional plant breeding. When farmers adopt biofortified maize varieties,
+only the maize-derived portion of dietary intake changes — nutrients from
+beans, eggs, vegetables, and other foods remain constant.
+
+To model intervention scenarios accurately, we calculate intake separately for:
+
+- **Maize sources**: Grain, tortillas, and flour (codine 7, 17, 21).
+- **Non-maize sources**: All other foods (calculated by subtraction).
+
+
+### Plant-Based and Animal-Based Foods
+
+The proportion of plant-based foods in the diet is a descriptor of dietary
+composition at the household level. It is computed here and used in downstream
+analyses to characterise the dietary patterns of the target population.
+
+**Plant-based foods** (`vegetal_cereal == "si"`) include cereals (maize, rice,
+wheat), legumes (black beans, lentils), vegetables, fruits, tubers, and oils.
+
+**Animal-based foods** (`vegetal_cereal == "no"`) include meat (beef, pork,
+chicken), dairy products (milk, cheese), eggs, and fish.
+
+These datasets track weight only (grams per day), not full nutrient profiles:
+they are used to derive the plant-based percentage of each household's diet,
+which is reported as a descriptor of dietary composition.
+
+
+### Household Daily Intake
+
+```{r}
+#| label: tbl-c-summary
+
+tbl_c_summary |>
+  gt() |>
+  tab_header(
+    title = "Household Daily Intake Summary",
+    subtitle = "Median and interquartile range (IQR) by food group"
+  ) |>
+  cols_label(
+    Metric = "Metric",
+    Total = "Total Foods",
+    Maize = "Maize Only",
+    `Plant-based` = "Plant-based",
+    `Animal-based` = "Animal-based"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = Metric,
+      rows = Metric %in% c("Households (N)", "Grams (median)", "Energy - kcal (median)",
+                           "Protein - g (median)", "Iron - mg (median)", "Zinc - mg (median)")
+    )
+  ) |>
+  tab_style(
+    style = cell_text(style = "italic", color = "gray50"),
+    locations = cells_body(
+      columns = Metric,
+      rows = grepl("IQR", Metric)
+    )
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Plant-based and animal-based datasets only track weight (grams), not full nutritional composition.",
+    locations = cells_column_labels(columns = c(`Plant-based`, `Animal-based`))
+  )
+```
+
+::: {.callout-note}
+## Data Processing Details
+
+- **Unit conversions**: All food quantities converted to grams using
+  expert-provided equivalence table.
+- **Recall period**: Daily intake calculated by dividing 15-day recall period
+  by 15.
+- **Edible portion**: All calculations include adjustment for edible portion
+  (`pct_aprov`) to account for the inedible portion of food (peels, bones,
+  etc.).
+- **Food groupings**: Total (all foods), Maize (grain, tortillas, flour),
+  Plant-based (cereals, grains, vegetables, fruits), Animal-based (meat,
+  dairy, eggs, fish).
+:::
+
+
+## Individual Intake Distribution
+
+ENCOVI reports what the household acquired, not what each person consumed.
+Nutrient intake, requirements, and subsequent health outcomes, however, are
+individual-level phenomena. Aggregate household consumption data masks
+individual-level variation — a 3-year-old and an adult man have very different
+nutrient requirements that simple per-capita division would not capture.
+
+
+### Adult Male Equivalent (AME)
+
+Individual nutrient intake distribution requires assigning each household
+member a fraction of household intake proportional to their energy
+requirements. This is done via Adult Male Equivalent (AME) factors, calculated
+on the synthetic `edad_meses` variable produced by
+[Estimate Age in Months](01_02_estimate_age_in_months.qmd). Month-level
+resolution is what allows AME to be assigned within the 6-11 month range, the
+complementary feeding window.
+
+The **Adult Male Equivalent (AME)** method assigns each household member a
+factor proportional to their energy requirements relative to an adult male
+aged 18-30 years (AME = 1.0) [@Weisell2012_AME]. Household food intake is then
+distributed according to each member's share of total household AME.
+
+The AME factors used here follow INCAP's dietary recommendations for Guatemala
+[@INCAP2012_AME]:
+
+| Age Group | Males | Females |
+|-----------|-------|---------|
+| 0 – 5 months | 0 | 0 |
+| 6 months – 1 year | 0.21 | 0.21 |
+| 1 – 2 years | 0.27 | 0.27 |
+| 2 – 4 years | 0.37 | 0.37 |
+| 4 – 7 years | 0.44 | 0.44 |
+| 7 – 10 years | 0.56 | 0.51 |
+| 10 – 14 years | 0.73 | 0.65 |
+| 14 – 18 years | 0.96 | 0.73 |
+| 18 – 30 years | 1.00 | 0.74 |
+| 30 – 60 years | 0.95 | 0.74 |
+| 60+ years | 0.76 | 0.65 |
+
+For example, in a household with a 25-year-old man (AME = 1.0), a 25-year-old
+woman (AME = 0.74), and a 3-year-old child (AME = 0.37), the total household
+AME is 2.11. The child's share is 0.37/2.11 = 17.5% of household food intake.
+
+::: {.callout-note}
+## Infants Under 6 Months
+Infants under 6 months receive `ame_porcentaje = 0`, reflecting the WHO
+recommendation for exclusive breastfeeding during this period. These infants
+are not allocated any household food consumption in subsequent calculations,
+as their nutrient requirements are assumed to be met through breastmilk.
+The synthetic `edad_meses` variable enables this precise distinction between
+infants under 6 months (excluded) and children aged 6-11 months (included with
+AME = 0.21).
+:::
+
+
+### Maize vs Non-Maize Separation
+
+Individual intake is calculated separately for maize and non-maize sources.
+
+::: {.callout-important}
+## Why This Separation Matters
+This separation is essential for biofortification modeling — only
+maize-derived nutrients will change in intervention scenarios, while non-maize
+intake remains constant.
+:::
+
+
+### Survey Design
+
+ENCOVI uses a complex sampling design with Primary Sampling Units (UPM) and
+expansion weights that allow inference to the full Guatemalan population (see
+@tbl-d1-summary-sample-characteristics for the weighted population estimate).
+All population-level statistics require survey-weighted estimation, with
+standard errors accounting for clustering within UPMs.
+
+
+## Summary
+
+### Sample Characteristics
+
+```{r}
+#| label: tbl-d1-summary-sample-characteristics
+
+tbl_d1_summary_sample_characteristics |>
+  gt() |>
+  tab_header(
+    title = "Sample Characteristics",
+    subtitle = "Survey-weighted estimates for Guatemala"
+  ) |>
+  cols_label(
+    Characteristic = "Characteristic",
+    Value = "Value"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+
+### Total and Maize Daily Intake
+
+```{r}
+#| label: tbl-d2a-summary-total-maize-intake
+
+tbl_d2a_summary_total_maize_intake |>
+  gt() |>
+  tab_header(
+    title = "Total and Maize Daily Intake",
+    subtitle = "Survey-weighted population estimates with 95% confidence intervals"
+  ) |>
+  cols_label(
+    Nutrient = "Nutrient/Metric",
+    `Mean (95% CI)` = "Mean (95% CI)"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Estimates account for complex survey design (clustering, weights).",
+    locations = cells_title(groups = "subtitle")
+  )
+```
+
+
+### Maize Contribution to Nutrient Intake
+
+The table below shows mean daily intake for key nutrients, separated by source.
+The "% from Maize" column is the biofortification-modifiable fraction: the
+share of intake that would increase if households consumed biofortified
+varieties. For protein, biofortification does not change the total protein
+content of the grain — it changes the amino acid profile (lysine, tryptophan),
+and with it the utilizable protein fraction.
+
+```{r}
+#| label: tbl-d2b-summary-maize-contribution
+
+tbl_d2b_summary_maize_contribution |>
+  gt() |>
+  tab_header(
+    title = "Maize Contribution to Total Nutrient Intake",
+    subtitle = "Percentage of daily nutrients from maize products"
+  ) |>
+  cols_label(
+    Nutrient = "Nutrient",
+    `% from Maize (95% CI)` = "% from Maize (95% CI)"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+
+### Intake by Age Group
+
+The table below describes the distribution of mean daily nutrient intake across
+age groups under the Adult Male Equivalent allocation, where household food is
+distributed to each member in proportion to energy requirements.
+
+```{r}
+#| label: tbl-d2c-summary-intake-by-age
+
+tbl_d2c_summary_intake_by_age |>
+  gt() |>
+  tab_header(
+    title = "Daily Nutrient Intake by Age Group",
+    subtitle = "Survey-weighted population estimates"
+  ) |>
+  fmt_number(
+    columns = c(mean_kcal, mean_kcal_se, mean_prot, mean_prot_se,
+                mean_fe, mean_fe_se, mean_zn, mean_zn_se,
+                pct_maiz_kcal, pct_maiz_kcal_se),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = n,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  cols_label(
+    edad_grupos = "Age Group",
+    n = "N",
+    mean_kcal = "Energy (kcal)",
+    mean_kcal_se = "Energy (SE)",
+    mean_prot = "Protein (g)",
+    mean_prot_se = "Protein (SE)",
+    mean_fe = "Iron (mg)",
+    mean_fe_se = "Iron (SE)",
+    mean_zn = "Zinc (mg)",
+    mean_zn_se = "Zinc (SE)",
+    pct_maiz_kcal = "Maize Energy (%)",
+    pct_maiz_kcal_se = "Maize Energy (SE)"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+
+### Diet Composition {#diet-composition}
+
+Plant-based diets predominate in Guatemala (see
+@tbl-d2d-summary-diet-composition for the population distribution across
+plant-based food share categories). The pattern is consistent with limited
+access to animal-source foods in rural and low-income populations.
+
+```{r}
+#| label: tbl-d2d-summary-diet-composition
+
+tbl_d2d_summary_diet_composition |>
+  gt() |>
+  tab_header(
+    title = "Distribution of Plant-Based Diet Categories",
+    subtitle = "Survey-weighted population proportions"
+  ) |>
+  fmt_number(
+    columns = n,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_percent(
+    columns = c(proportion, proportion_low, proportion_upp),
+    decimals = 1
+  ) |>
+  cols_label(
+    per_vegetales_estratificado = "Plant-based Foods (%)",
+    n = "Sample N",
+    proportion = "Population %",
+    proportion_low = "95% CI Lower",
+    proportion_upp = "95% CI Upper"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Categories based on percentage of grams from plant-based foods.",
+    locations = cells_column_labels(columns = per_vegetales_estratificado)
+  )
+```
+
+::: {.callout-tip}
+## Plant Percentage Application
+The distribution of the plant-based food percentage across the population is
+reported here as a descriptor of dietary composition. This distribution is
+also referenced in the
+[iron absorption decision](../04_covariate_prediction/04_03_calculate_bioavailability_adjustments.qmd#imp-iron-absorption-rate),
+where it supports the choice of a uniform 5% iron absorption factor for the
+target population.
+:::
+
+
+### Data Quality
+
+Data completeness is high across key variables. Infants under 6 months are
+assigned `ame_porcentaje = 0` under the exclusive breastfeeding assumption
+and are excluded from household-level food allocation — these are not treated
+as missing values in the analysis.
+
+```{r}
+#| label: tbl-d3a-quality-check-missing
+
+tbl_d3a_quality_check_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Values by Key Variable",
+    subtitle = "Data completeness assessment"
+  ) |>
+  fmt_number(
+    columns = `Missing N`,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = `Missing %`,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  cols_label(
+    Variable = "Variable",
+    `Missing N` = "N",
+    `Missing %` = "%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+```
+
+Extreme values are present in a non-trivial share of records, consistent with
+unusual household compositions or recall error. Handling of these values in
+subsequent analyses is described in
+[Modeling Data Preparation](../03_transfer_models/03_01_prepare_modeling_data.qmd).
+
+```{r}
+#| label: tbl-d3b-quality-check-extremes
+
+tbl_d3b_quality_check_extremes |>
+  gt() |>
+  tab_header(
+    title = "Extreme Value Detection",
+    subtitle = "Potential data quality issues or outliers"
+  ) |>
+  fmt_number(
+    columns = Count,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = Percentage,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  cols_label(
+    Check = "Quality Check",
+    Count = "N",
+    Percentage = "%"
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  ) |>
+  tab_footnote(
+    footnote = "Extreme values may indicate data entry errors, unusual household compositions, or recall bias.",
+    locations = cells_title(groups = "subtitle")
+  )
+```
+
+::: {.callout-note}
+## Data Quality Considerations
+
+- **Infants under 6 months**: Have `ame_porcentaje = 0`, resulting in zero
+  calculated intake from solid foods under the exclusive breastfeeding
+  assumption.
+- **Missing values**: Typically occur for individuals in households with no
+  food consumption data reported. These are genuine missing data, not
+  calculation errors.
+- **Extreme values**: May reflect data entry errors, unusual household
+  compositions (e.g., large families, guests), or reporting period issues
+  (recall bias).
+:::

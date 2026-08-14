@@ -1,0 +1,551 @@
+---
+title: "Download and Verify Raw Data Sources"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script provisions the `01_data/01_raw/` directory with the original
+data sources required by the framework. The workflow:
+
+1. Reads the source manifest from `02_code/_config/raw_sources.yml`
+2. Downloads each file from its authoritative public URL
+3. Extracts the SIVESNU 2018 datasets from the SIINSAN omnibus archive
+4. Moves staged files to their final source-specific directories
+5. Verifies the SHA256 hash of each active file against the manifest
+6. Writes a CSV log of all hashes and download metadata
+7. Cleans up the temporary download staging directory
+
+Archival packaging of the active originals into a ZIP bundle is
+performed by `00_02_convert_to_parquet.qmd` after conversion and
+fidelity verification.
+
+This script is intended to be executed once during initial setup, or
+whenever the source manifest is updated. Subsequent analyses read the
+unpacked originals directly from `01_data/01_raw/{SOURCE}/`.
+
+::: {.callout-note}
+## Hash verification mode
+The default behaviour is strict: any mismatch between the downloaded
+file's hash and the manifest aborts the script. Set `strict_hash <- FALSE`
+in the configuration block below for a permissive run that warns instead
+of aborting (use only for debugging or when the source has been verified
+to publish the same content under a new technical identifier).
+:::
+
+# Setup
+
+```{r}
+#| label: setup
+
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+pacman::p_load(
+  yaml,           # Manifest parsing
+  rio,            # Data import/export
+  here,           # Robust file paths
+  janitor,        # Data cleaning utilities
+  gt,             # Publication tables
+  curl,           # HTTP downloads in download_with_retry()
+  digest,         # SHA256 hashing in compute_file_hash()
+  fs,             # Filesystem operations in IO helpers
+  tidyverse       # Data manipulation and visualisation (includes purrr, stringr)
+)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load IO utility functions
+source(here("02_code", "00_functions", "00_functions_provisioning.R"))
+```
+
+# Configuration
+
+```{r}
+#| label: configuration
+
+# Hash verification mode
+#   TRUE  - abort if any file's hash does not match the manifest
+#   FALSE - log mismatches and continue (debugging / known-OK content)
+strict_hash <- TRUE
+
+# Force re-download even if the file already exists locally
+force_download <- FALSE
+
+# Directories
+raw_root        <- here("01_data", "01_raw")
+tmp_download    <- here("01_data", "_tmp_download")
+
+# Output: hash log
+hash_log_path <- here("01_data", "01_raw", "_hashes_active.csv")
+```
+
+# Load Manifest
+
+```{r}
+#| label: load-manifest
+
+manifest <- yaml::read_yaml(
+  here("02_code", "_config", "raw_sources.yml")
+)
+
+manifest_flat <- flatten_manifest(manifest) |>
+  mutate(
+    target_dir = case_when(
+      source_label == "ENCOVI_2023"     ~ here(raw_root, "ENCOVI_2023"),
+      source_label == "SIVESNU"         ~ here(raw_root, "SIVESNU_2018"),
+      source_label == "INE_NACIMIENTOS" ~ here(raw_root, "INE_NACIMIENTOS"),
+      source_label == "WHO_GROWTH"      ~ here(raw_root, "WHO_GROWTH"),
+      TRUE                              ~ NA_character_
+    ),
+    target_path = file.path(target_dir, filename)
+  )
+```
+
+```{r}
+#| label: tbl-manifest-summary
+#| tbl-cap: "Source manifest summary by data source"
+
+manifest_flat |>
+  summarise(
+    n_files = n(),
+    n_active = sum(active),
+    total_size_mb = sum(size_mb, na.rm = TRUE),
+    .by = source_label
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Manifest summary",
+    subtitle = "Files declared per source, with active subset and total volume"
+  ) |>
+  fmt_number(columns = total_size_mb, decimals = 1) |>
+  cols_label(
+    source_label = "Source",
+    n_files = "Total files",
+    n_active = "Active",
+    total_size_mb = "Total size (MB)"
+  )
+```
+
+# Phase A: Download Direct Files
+
+ENCOVI 2023, INE Nacimientos, and WHO Growth Reference are each composed
+of multiple files with direct download URLs. Downloads occur into a
+temporary staging directory and are moved to the final location only
+after successful hash verification.
+
+```{r}
+#| label: a1-prepare-directories
+
+fs::dir_create(tmp_download)
+walk(unique(na.omit(manifest_flat$target_dir)), fs::dir_create)
+```
+
+```{r}
+#| label: a2-direct-downloads
+
+direct_files <- manifest_flat |>
+  filter(source_label %in% c("ENCOVI_2023", "INE_NACIMIENTOS",
+                              "WHO_GROWTH")) |>
+  filter(active)
+
+direct_results <- direct_files |>
+  mutate(
+    staged_path = file.path(tmp_download, filename),
+    needs_download = force_download | !file.exists(target_path)
+  ) |>
+  mutate(
+    download_outcome = pmap(
+      list(url, staged_path, needs_download),
+      function(u, p, n) {
+        if (!n) {
+          return(tibble(success = TRUE, attempts = 0L,
+                        error_message = NA_character_))
+        }
+        download_with_retry(url = u, dest_path = p) |>
+          select(success, attempts, error_message)
+      }
+    )
+  ) |>
+  unnest(download_outcome)
+```
+
+```{r}
+#| label: tbl-a2-direct-download-status
+#| tbl-cap: "Direct download status by file"
+
+direct_results |>
+  mutate(
+    status = case_when(
+      !needs_download         ~ "cached",
+      success                 ~ "downloaded",
+      TRUE                    ~ "failed"
+    )
+  ) |>
+  select(source_label, filename, status, attempts, error_message) |>
+  gt() |>
+  tab_header(
+    title = "Phase A - Direct downloads",
+    subtitle = "Files retrieved from authoritative public URLs"
+  ) |>
+  cols_label(
+    source_label = "Source",
+    filename = "File",
+    status = "Status",
+    attempts = "Attempts",
+    error_message = "Error (if any)"
+  ) |>
+  sub_missing(missing_text = "-") |>
+  data_color(
+    columns = status,
+    palette = c("downloaded" = "#3AAF85",
+                "cached"     = "#1B6CA8",
+                "failed"     = "#C44441")
+  )
+```
+
+```{r}
+#| label: a3-direct-download-guard
+
+n_failed <- direct_results |>
+  filter(needs_download, !success) |>
+  nrow()
+
+if (n_failed > 0) {
+  stop(sprintf(
+    "Phase A halted: %d file(s) failed to download. Review the table above.",
+    n_failed
+  ))
+}
+```
+
+# Phase B: Acquire SIVESNU Omnibus Archive
+
+The SIINSAN portal ships SIVESNU 2013-2018 as a single ZIP archive. The
+script downloads it into the staging directory, then extracts only the
+years needed.
+
+```{r}
+#| label: b1-download-sivesnu-zip
+
+sivesnu_zip_url <- manifest$sivesnu$archive_url
+sivesnu_zip_staged <- file.path(tmp_download, "BASE-DE-DATOS-SIVESNU.zip")
+
+sivesnu_zip_status <- if (!file.exists(sivesnu_zip_staged) ||
+                          force_download) {
+  download_with_retry(url = sivesnu_zip_url,
+                      dest_path = sivesnu_zip_staged,
+                      max_attempts = 3,
+                      timeout_sec = 600)
+} else {
+  tibble(url = sivesnu_zip_url, dest_path = sivesnu_zip_staged,
+         success = TRUE, attempts = 0L, error_message = NA_character_)
+}
+```
+
+```{r}
+#| label: tbl-b1-sivesnu-zip-status
+#| tbl-cap: "SIVESNU omnibus ZIP acquisition"
+
+sivesnu_zip_status |>
+  mutate(
+    archive_size_mb = if (file.exists(sivesnu_zip_staged)) {
+      round(as.numeric(fs::file_size(sivesnu_zip_staged)) / 1024^2, 2)
+    } else NA_real_
+  ) |>
+  select(url, success, attempts, archive_size_mb, error_message) |>
+  gt() |>
+  tab_header(
+    title = "Phase B - SIVESNU archive download",
+    subtitle = "Single ZIP containing years 2013-2018"
+  ) |>
+  cols_label(
+    url = "URL",
+    success = "Success",
+    attempts = "Attempts",
+    archive_size_mb = "Archive size (MB)",
+    error_message = "Error"
+  ) |>
+  sub_missing(missing_text = "-")
+
+if (!sivesnu_zip_status$success) {
+  stop("Phase B halted: SIVESNU archive could not be downloaded.")
+}
+```
+
+```{r}
+#| label: b2-extract-sivesnu-2018
+
+sivesnu_2018_dir <- here(raw_root, "SIVESNU_2018")
+
+extract_2018 <- extract_zip_selective(
+  zip_path = sivesnu_zip_staged,
+  internal_filter = "2018/[Dd]atasets/.*\\.dta$",
+  dest_dir = sivesnu_2018_dir
+)
+```
+
+```{r}
+#| label: tbl-b-extraction-summary
+#| tbl-cap: "SIVESNU selective extraction (2018 active)"
+
+extract_2018 |>
+  mutate(filename = basename(dest_path)) |>
+  select(filename, extracted) |>
+  gt() |>
+  tab_header(
+    title = "Phase B - SIVESNU extraction",
+    subtitle = "Selective unpack of 2018 .dta files"
+  ) |>
+  cols_label(
+    filename = "File",
+    extracted = "Extracted"
+  )
+```
+
+# Phase C: Move Direct Files to Final Locations
+
+Direct downloads from Phase A are validated and moved from the staging
+directory to their final source-specific folders.
+
+```{r}
+#| label: c1-move-direct-files
+
+stage_to_final <- direct_results |>
+  filter(needs_download, success) |>
+  mutate(
+    moved = pmap_lgl(
+      list(staged_path, target_path),
+      function(src, dst) {
+        if (!file.exists(src)) return(FALSE)
+        fs::file_copy(src, dst, overwrite = TRUE)
+        fs::file_delete(src)
+        file.exists(dst)
+      }
+    )
+  )
+```
+
+# Phase D: Verify Hashes
+
+All active files (downloaded direct + extracted from SIVESNU) are
+hashed and compared against the manifest expectations.
+
+```{r}
+#| label: d1-verify-active-hashes
+
+active_for_check <- manifest_flat |> filter(active)
+
+verification <- active_for_check |>
+  mutate(
+    check = pmap(
+      list(target_path, sha256),
+      function(p, h) verify_hash_sha256(p, h)
+    )
+  ) |>
+  unnest(check, names_sep = "_") |>
+  select(source_label, filename, sha256, check_observed_hash, check_status)
+```
+
+```{r}
+#| label: tbl-d1-hash-verification
+#| tbl-cap: "Hash verification status by file (active sources only)"
+
+verification |>
+  rename(
+    expected = sha256,
+    observed = check_observed_hash,
+    status = check_status
+  ) |>
+  mutate(
+    expected_short = if_else(is.na(expected),
+                             NA_character_,
+                             paste0(substr(expected, 1, 12), "...")),
+    observed_short = if_else(is.na(observed),
+                             NA_character_,
+                             paste0(substr(observed, 1, 12), "..."))
+  ) |>
+  select(source_label, filename, expected_short, observed_short, status) |>
+  gt() |>
+  tab_header(
+    title = "Phase D - Hash verification",
+    subtitle = "SHA256 comparison against manifest expectations"
+  ) |>
+  cols_label(
+    source_label = "Source",
+    filename = "File",
+    expected_short = "Expected (manifest)",
+    observed_short = "Observed (downloaded)",
+    status = "Status"
+  ) |>
+  sub_missing(missing_text = "-") |>
+  data_color(
+    columns = status,
+    palette = c("match"     = "#3AAF85",
+                "no_expect" = "#1B6CA8",
+                "mismatch"  = "#C44441",
+                "missing"   = "#C44441")
+  )
+```
+
+```{r}
+#| label: d2-strict-hash-guard
+
+n_mismatch <- sum(verification$check_status == "mismatch")
+n_missing  <- sum(verification$check_status == "missing")
+
+if (n_missing > 0) {
+  stop(sprintf(
+    "Phase D halted: %d expected file(s) are missing on disk.",
+    n_missing
+  ))
+}
+
+if (n_mismatch > 0 && strict_hash) {
+  stop(sprintf(paste(
+    "Phase D halted: %d file(s) failed hash verification under strict mode.",
+    "Review the table above and either (a) update the manifest after",
+    "manually confirming the new content is intended, or (b) re-run with",
+    "strict_hash <- FALSE if you have already confirmed the content is",
+    "equivalent."), n_mismatch))
+}
+```
+
+# Phase E: Cleanup Temporary Files
+
+The staging directory is removed unconditionally. All active files have
+already been moved to their final directories in Phase C.
+
+```{r}
+#| label: e1-cleanup-tmp
+
+cleanup_tmp_download(tmp_download)
+```
+
+# Save Outputs
+
+```{r}
+#| label: save-hash-log
+
+hash_log <- verification |>
+  filter(check_status %in% c("match", "no_expect")) |>
+  rename(
+    sha256_expected = sha256,
+    sha256_observed = check_observed_hash,
+    status = check_status
+  ) |>
+  left_join(
+    manifest_flat |> select(filename, size_mb, recorded_on, citation),
+    by = "filename"
+  ) |>
+  select(source_label, filename, sha256_observed, sha256_expected,
+         size_mb, status, recorded_on, citation)
+
+rio::export(
+  hash_log,
+  hash_log_path
+)
+```
+
+```{r}
+#| label: tbl-save-final-summary
+#| tbl-cap: "Final outputs persisted on disk"
+
+tibble(
+  output = "Hash log (CSV)",
+  path = hash_log_path,
+  exists = file.exists(hash_log_path)
+) |>
+  gt() |>
+  tab_header(
+    title = "Final outputs",
+    subtitle = "Files persisted on disk after script execution"
+  ) |>
+  cols_label(
+    output = "Output",
+    path = "Path",
+    exists = "Exists"
+  )
+```
+
+# Notes
+
+## Methodology
+
+The manifest separates active sources (consumed by the framework
+pipeline) from inactive sources (retained in the manifest for reference).
+The ENCOVI 2023 active subset is restricted to the five files the
+current pipeline reads; the SIVESNU omnibus ZIP is selectively extracted
+to populate `01_data/01_raw/SIVESNU_2018/` with the four active .dta
+files.
+
+Hash verification operates in strict mode by default: any divergence
+between the manifest's expected SHA256 and the observed value aborts
+the script. This protects the analytical pipeline against silent
+upstream changes (a publisher re-uploading a file with the same URL
+but different content). The permissive mode exists for the rare case
+where the publisher has been verified to publish identical content
+under a new technical artefact (e.g., metadata-only change).
+
+Archival packaging of the active originals into a ZIP bundle is handled
+by `00_02_convert_to_parquet.qmd`, which creates the archive after
+conversion and fidelity verification.
+
+## Data Quality
+
+All active hashes were recorded from the same machine on the dates
+listed in the manifest's `recorded_on` field. WHO source URLs include
+a `?sfvrsn=` cache-busting parameter that may rotate when WHO
+republishes. Such rotation does not affect content as long as the
+SHA256 hash matches the manifest; if it does not, the strict-mode
+guard will surface the change.
+
+INE Guatemala URLs use opaque hashes in their path. These URLs may
+change if the INE re-uploads a file. The `landing_url` field of the
+manifest provides the stable public page where current URLs can be
+re-discovered if a download fails.
+
+## Limitations
+
+The SIVESNU omnibus archive is large (~95 MB) and downloads in a
+single transfer. On unstable networks, the timeout in
+`download_with_retry()` may need adjustment via the `timeout_sec`
+argument.
+
+## References
+
+INE Guatemala data portal (CC BY-SA 4.0):
+<https://www.ine.gob.gt/pobreza-menu/>,
+<https://www.ine.gob.gt/vitales/>.
+
+SIINSAN - SIVESNU databases:
+<https://portal.siinsan.gob.gt/monitoreo-y-evaluacion/>.
+
+WHO Child Growth Standards:
+<https://www.who.int/tools/child-growth-standards/standards/length-height-for-age>.
+
+WHO Growth Reference 5-19:
+<https://www.who.int/tools/growth-reference-data-for-5to19-years>.

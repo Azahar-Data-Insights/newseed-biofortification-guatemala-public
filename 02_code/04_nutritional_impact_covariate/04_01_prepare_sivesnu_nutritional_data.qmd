@@ -1,0 +1,1552 @@
+---
+title: "Prepare SIVESNU Nutrient Data - Transfer Models Application"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This script applies the nutrient transfer models trained in Module 3 (ENCOVI 2023) to SIVESNU 2018 data, generating predicted nutrient intake values for all individuals in the population.
+
+Main operations:
+
+1. Load SIVESNU 2018 household and individual data
+2. Load Module 3 transfer models, Yeo-Johnson transformations, and ENCOVI reference data
+3. Harmonize and recode SIVESNU variables to match ENCOVI structure
+4. Impute missing values
+5. Apply Yeo-Johnson transformations to continuous predictors
+6. Predict nutrient values using Module 3 models (iron, zinc, protein, lysine, tryptophan, energy, plant percentage)
+7. Filter to the target population (children 6-59 months)
+8. Apply quantile mapping against an age-matched ENCOVI reference
+9. Validate distributions and save processed dataset
+
+**Key methodological decision**: Quantile mapping is age-matched. The target population is filtered to children 6-59 months before calibration, and the ENCOVI reference is restricted to the same age range, so that source and reference describe comparable populations.
+
+# Setup
+
+```{r}
+#| label: setup
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  arrow,              # Parquet file handling
+  rio,                # Robust import/export for various formats
+  here,               # Robust file path management
+  janitor,            # Data cleaning utilities
+  haven,              # Manage Stata files
+  bestNormalize,      # Yeo-Johnson predict() S3 method dispatch
+  car,                # Yeo-Johnson diagnostic profiles (boxCox)
+  cowplot,            # Fig dispositions
+  gt,                 # Table formatting
+  mirai,              # Persistent daemon pool for parallel quantile mapping
+  RhpcBLASctl,        # BLAS/OpenMP thread control inside daemons
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to minimize memory footprint)
+# missRanger — missRanger() via impute_rf_parallel() for RF-based imputation
+# ggpubr     — get_legend() for plot composition
+
+# Resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+# Load utility functions from centralized file
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# transfer/
+ensure_output_dir(here("01_data", "02_processed", "transfer"))
+
+# web_resources/
+ensure_output_dir(here("01_data", "02_processed", "web_resources"))
+```
+
+# Phase A: Data Loading
+
+## A1. Load SIVESNU Raw Data and ENCOVI Reference Data
+
+Load SIVESNU 2018 household and individual databases and ENCOVI 2023 reference nutrient distributions for quantile mapping calibration.
+
+```{r}
+#| label: a1-load-data
+
+# Load SIVESNU 2018 household data
+sivesnu_hogar <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018", "sivesnu_gt18_hogar_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Load SIVESNU 2018 individual data
+sivesnu_individuos <- read_parquet(
+  here("01_data", "01_raw", "SIVESNU_2018", "sivesnu_gt18_miembros_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+
+# Load SIVESNU children data to get age in months for filtering
+sivesnu_nino_edad <- read_parquet(
+ here("01_data", "01_raw", "SIVESNU_2018", "sivesnu_gt18_nino_publico.parquet")
+) |>
+  clean_names() |>
+  zap_label() |>
+  zap_labels() |>
+  zap_formats() |>
+  transmute(
+    nboletahogar,
+    conglomerado,
+    edad_mes,
+    sexo_nino = case_when(
+      sexonino == 1 ~ "Hombre",
+      sexonino == 2 ~ "Mujer",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Load ENCOVI 2023 reference data for quantile mapping
+# This dataset contains the observed nutritional distributions from ENCOVI.
+#
+# The reference is restricted to the target age range. Nutrient intake scales
+# with body size, and ENCOVI children aged 6-59 months consume roughly half of
+# what the all-age population does (median ratios 0.57 for maize-source and
+# 0.47-0.49 for non-maize components). Calibrating child predictions against an
+# all-age distribution therefore mis-scales them, and does so by a different
+# amount per nutrient, which distorts the composition of any index built from
+# them rather than merely its level.
+df_encovi_reference <- read_parquet(
+  here("01_data", "02_processed",
+       "transfer", "01_04_individual_nutritional_intake_complete.parquet")
+) |>
+  filter(edad_meses >= 6, edad_meses < 60) |>
+  # Select only nutritional variables needed for quantile mapping
+  transmute(
+    departamento,
+    fe_maiz = fe_individuo_dia_maiz, 
+    fe_no_maiz = fe_individuo_dia_no_maiz,
+    zn_maiz = zn_individuo_dia_maiz,
+    zn_no_maiz = zn_individuo_dia_no_maiz,
+    prot_apro_maiz = prot_apro_individuo_dia_maiz,
+    prot_apro_no_maiz = prot_apro_individuo_dia_no_maiz,
+    lys_maiz = lys_individuo_dia_maiz,
+    lys_no_maiz = lys_individuo_dia_no_maiz,
+    trp_maiz = trp_individuo_dia_maiz,
+    trp_no_maiz = trp_individuo_dia_no_maiz, 
+    kcal_maiz = kcal_individuo_dia_maiz,
+    kcal_no_maiz = kcal_individuo_dia_no_maiz
+  ) |>
+  drop_na()
+```
+
+## A2. Load Transfer Models
+
+Load Module 3 nutrient transfer models (iron, zinc, protein, lysine, tryptophan, energy, plant percentage) and Yeo-Johnson transformation objects for continuous predictors.
+
+```{r}
+#| label: a2-load-models
+
+# Load Yeo-Johnson transformation objects
+yj_transforms <- import(
+  here("01_data", "02_processed", 
+       "models", "03_01_yj_transforms.rds"),
+  trust = TRUE
+)
+
+# Extract individual transformation objects
+yj_miembros_hogar <- yj_transforms$yj_miembros_hogar
+yj_n_cuartos <- yj_transforms$yj_n_cuartos
+
+# Load iron models (maize and non-maize)
+iron_models <- import(
+  here("01_data", "02_processed", 
+       "models", "03_02_iron_models.rds"),
+  trust = TRUE
+)
+modelo_fe_maiz <- iron_models$model_fe_maize
+modelo_fe_no_maiz <- iron_models$model_fe_non_maize
+
+# Load zinc models (maize and non-maize)
+zinc_models <- import(
+  here("01_data", "02_processed", 
+       "models", "03_03_zinc_models.rds"),
+  trust = TRUE
+)
+modelo_zn_maiz <- zinc_models$model_zn_maize
+modelo_zn_no_maiz <- zinc_models$model_zn_non_maize
+
+# Load digestible protein models (maize and non-maize)
+protein_models <- import(
+  here("01_data", "02_processed", 
+       "models", "03_04_digestible_protein_models.rds"),
+  trust = TRUE
+)
+modelo_prot_apro_maiz <- protein_models$model_prot_apro_maize
+modelo_prot_apro_no_maiz <- protein_models$model_prot_apro_non_maize
+
+# Load lysine models (maize and non-maize)
+lysine_models <- import(
+  here("01_data", "02_processed", 
+       "models", "03_05_lysine_models.rds"),
+  trust = TRUE
+)
+modelo_lys_maiz <- lysine_models$model_lys_maize
+modelo_lys_no_maiz <- lysine_models$model_lys_non_maize
+
+# Load tryptophan models (maize and non-maize)
+tryptophan_models <- import(
+  here("01_data", "02_processed", 
+       "models", "03_06_tryptophan_models.rds"),
+  trust = TRUE
+)
+modelo_trp_maiz <- tryptophan_models$model_trp_maize
+modelo_trp_no_maiz <- tryptophan_models$model_trp_non_maize
+
+# Load energy models (maize and non-maize)
+energy_models <- import(
+  here("01_data", "02_processed", 
+       "models", "03_07_energy_models.rds"),
+  trust = TRUE
+)
+modelo_kcal_maiz <- energy_models$model_kcal_maize
+modelo_kcal_no_maiz <- energy_models$model_kcal_non_maize
+
+# Load plant percentage model
+plant_model <- import(
+  here("01_data", "02_processed", 
+       "models", "03_08_plant_percentage_model.rds"),
+  trust = TRUE
+)
+modelo_vegetales <- plant_model$model_plant_percentage
+
+# Clean auxiliary list objects (keep only extracted models)
+rm(yj_transforms, iron_models, zinc_models, protein_models, 
+   lysine_models, tryptophan_models, energy_models, plant_model)
+```
+
+---
+
+# Phase B: Variable Harmonization
+
+## B1. Merge and Recode SIVESNU Variables
+
+Recode SIVESNU 2018 variables to match ENCOVI 2023 structure and coding. This includes factor level alignment, variable renaming, and creation of derived variables needed for transfer model prediction.
+
+```{r}
+#| label: b1-merge-and-recode
+
+# Merge household and individual tables, recode variables
+df_merge <- sivesnu_individuos |>
+  left_join(sivesnu_hogar, by = join_by(nboletahogar, conglomerado)) |>
+  transmute(
+    # Identifiers
+    nboletahogar, 
+    conglomerado, 
+    # Survey weight (SIVESNU 2018 has no sampling weights, assign equal weight)
+    pesohogar = 1,
+    # Department
+    departamento = factor(
+      departamento,
+      levels = c("Guatemala", "", "Sacatepéquez", "Chimaltenango", 
+                 "Escuintla", "Santa Rosa", "Sololá", "Totonicapán", "Quezaltenango", 
+                 "Suchitepéquez", "Retalhuleu", "San Marcos", "Huehuetenango", "Quiché", 
+                 "Baja Verapaz", "Alta Verapaz", "Petén", "Izabal", "Zacapa", "Chiquimula", 
+                 "Jalapa", "Jutiapa"),
+      labels = c("Guatemala", "El Progreso", "Sacatepéquez", "Chimaltenango", 
+                 "Escuintla", "Santa Rosa", "Sololá", "Totonicapán", "Quetzaltenango", 
+                 "Suchitepéquez", "Retalhuleu", "San Marcos", "Huehuetenango", "Quiché", 
+                 "Baja Verapaz", "Alta Verapaz", "Petén", "Izabal", "Zacapa", "Chiquimula", 
+                 "Jalapa", "Jutiapa"), 
+      ordered = TRUE
+    ),
+    # Urban/rural area
+    area = factor(
+      ruralurbano, 
+      levels = c(1, 2), 
+      labels = c("Urbana", "Rural")
+    ),
+    # Household size
+    miembros_hogar = num_miembros_hogar,
+    # Housing ownership
+    propiedad = factor(
+      ifelse(vivienda_propriedad == "", 96, vivienda_propriedad),
+      levels = c(1, 2, 3, 4, 96), 
+      labels = c("Propia y totalmente pagada", "Propia y pagandola a plazos", 
+                 "Alquilada", "Cedida o prestada", "Otro")
+    ),
+    # Wall material
+    material_paredes = factor(
+      ifelse(vivienda_material_pared == "" | vivienda_material_pared == 8 | is.na(vivienda_material_pared), 
+             96, vivienda_material_pared),
+      levels = c(6, 3, 2, 5, 4, 1, 7, 96), 
+      labels = c("Ladrillo", "Block", "Adobe", "Madera", 
+                 "Lamina metalica", "Bajareque", "Lepa, palo o caña", "Otro")
+    ),
+    # Roof material
+    material_techo = factor(
+      ifelse(vivienda_material_techo == "" | is.na(vivienda_material_techo), 96, vivienda_material_techo),
+      levels = c(5, 3, 4, 2, 1, 96), 
+      labels = c("Concreto", "Lamina metalica", "Asbesto cemento", 
+                 "Teja", "Paja, palma o similar", "Otro")
+    ),
+    # Floor material
+    material_piso = factor(
+      ifelse(vivienda_material_piso == "" | is.na(vivienda_material_piso), 96, vivienda_material_piso),
+      levels = c(6, 5, 2, 7, 4, 3, 1, 96), 
+      labels = c("Ladrillo ceramico", "Ladrillo de cemento", "Ladrillo de barro", 
+                 "Torta de cemento", "Tierra", "Madera", "Tierra", "Tierra")
+    ),
+    # Housing type
+    tipo_vivienda = factor(
+      ifelse(vivienda_tipo == "" | is.na(vivienda_tipo), NA, vivienda_tipo),
+      levels = c(1, 2, 3, 4, 5), 
+      labels = c("Casa formal", "Apartamento", "Cuarto en casa de vecindad", 
+                 "Rancho", "Casa improvisada")
+    ),
+    # Number of rooms
+    n_cuartos = vivienda_cuartos,
+    # Kitchen type
+    cocina = factor(
+      cocina_tiene, 
+      levels = c(1, 2), 
+      labels = c("De uso exclusivo", "De uso compartido")
+    ),
+    # Water source
+    fuente_agua = factor(
+      ifelse(agua_fuente %in% c("", 9), 96, agua_fuente),
+      levels = c(1, 3, 2, 5, 6, 8, 7, 96), 
+      labels = c("Tubería dentro de la vivienda", "Tubería fuera de la vivienda", 
+                 "Chorro publico", "Pozo perforado", "Río, lago, manantial", 
+                 "Camion cisterna", "Agua de lluvia", "Otro")
+    ),
+    # Sanitation type
+    tipo_sanitario = factor(
+      case_when(
+        serv_san_tipo == 1 ~ "Uso exclusivo",
+        serv_san_tipo == 2 ~ "Uso compartido",
+        serv_san_tipo == 3 ~ "Uso compartido",
+        serv_san_tipo == 4 ~ "Uso exclusivo",
+        serv_san_tipo == 5 ~ "Uso exclusivo",
+        serv_san_tipo == 6 ~ "Uso compartido",
+        serv_san_tipo == 96 ~ "Uso compartido",
+        TRUE ~ "Uso compartido"
+      ),
+      levels = c("Uso exclusivo", "Uso compartido")
+    ),
+    # Waste disposal
+    recoleccion_basura = factor(
+      ifelse(basura_deshacer == "", 96, basura_deshacer),
+      levels = c(3, 5, 4, 2, 1, 96), 
+      labels = c("Servicio municipal", "Servicio privado", 
+                 "Servicio municipal", "La queman o la entierran", 
+                 "La tiran en cualquier lugar", "La tiran en cualquier lugar")
+    ),
+    # Electricity access
+    electricidad = factor(
+      bienes_luz,
+      levels = c("Yes", "No"), 
+      labels = c("Si", "No")
+    ),
+    # TV ownership
+    televisor = factor(
+      bienes_television,
+      levels = c("Yes", "No"), 
+      labels = c("Si", "No")
+    ),
+    # Landline phone
+    telefonia_fija = factor(
+      bienes_telefonofija,
+      levels = c("Yes", "No"), 
+      labels = c("Si", "No")
+    ),
+    # Cell phone
+    telefonia_celular = factor(
+      bienes_celular,
+      levels = c("Yes", "No"), 
+      labels = c("Si", "No")
+    ),
+    # Computer
+    computadora = factor(
+      bienes_computadora,
+      levels = c("Yes", "No"), 
+      labels = c("Si", "No")
+    ),
+    # Relationship to household head
+    parentesco = factor(
+      case_when(
+        parentesco == 1 ~ "Jefe del hogar",
+        parentesco == 2 ~ "Esposo(a) o compañero(a)",
+        parentesco %in% c(3, 10) ~ "Hijo(a)",
+        parentesco == 4 ~ "Yerno o nuera",
+        parentesco == 5 ~ "Nieto(a)",
+        parentesco == 6 ~ "Padre o madre",
+        parentesco == 7 ~ "Suegro(a)",
+        parentesco == 8 ~ "Hermano(a)",
+        parentesco == 9 ~ "Otro pariente",
+        parentesco == 11 ~ "Empleado de casa particular",
+        parentesco == 12 ~ "Otro no pariente",
+        TRUE ~ "Otro pariente"
+      )
+    ),
+    # Sex
+    sexo = factor(
+      sexo,
+      levels = c(1, 2), 
+      labels = c("Hombre", "Mujer")
+    ),
+    # Age
+    edad = edad,
+    # Age groups
+    edad_grupos = factor(
+      cut(
+        edad, 
+        breaks = c(-Inf, 0.5, 1, 2, 4, 7, 10, 14, 18, 30, 60, Inf), 
+        labels = c("de 0 a 6 meses",
+                   "de 6 meses a 1 año",
+                   "de 1 a 2 años",
+                   "de 2 a 4 años",
+                   "de 4 a 7 años",
+                   "de 7 a 10 años",
+                   "de 10 a 14 años",
+                   "de 14 a 18 años",
+                   "de 18 a 30 años",
+                   "de 30 a 60 años",
+                   "más de 60 años")
+      )
+    ),
+    # Education level
+    grado_estudios = fct_relevel(
+      factor(
+        case_when(
+          grado_estudio %in% c("", "9-No sabe") ~ "Desconocido",
+          grado_estudio == "0-Ninguno" ~ "Ninguno",
+          grado_estudio == "4-Alfabetización" ~ "Solo sabe leer",
+          grado_estudio == "1-Primaria" ~ "Primaria",
+          grado_estudio == "2-Secundaria" ~ "Secundaria",
+          grado_estudio == "3-Superior/universitaria" ~ "Superior/universitaria"
+        ),
+        ordered = TRUE
+      ), 
+      c("Desconocido", "Ninguno", "Solo sabe leer", "Primaria", "Secundaria", "Superior/universitaria")
+    ),
+    # Education numeric for household average
+    grado_estudios_num = case_when(
+      grado_estudios == "Desconocido" ~ 1,
+      grado_estudios == "Ninguno" ~ 1,
+      grado_estudios == "Solo sabe leer" ~ 2,
+      grado_estudios == "Primaria" ~ 4,
+      grado_estudios == "Secundaria" ~ 7,
+      grado_estudios == "Superior/universitaria" ~ 10
+    ),
+    # Keep education numeric only for household heads and spouses
+    grado_estudios_num = if_else(
+      parentesco %in% c("Jefe del hogar", "Esposo(a) o compañero(a)"),  
+      grado_estudios_num, 
+      NA
+    ),
+    # Recode Food Insecurity Experience Scale (FIES) variables:
+    # 1=Yes→1, 2=No→0, 98/99→NA
+    across(
+      starts_with("fies"), 
+      ~ factor(
+        case_when(
+          . == 1 ~ "Yes",
+          . == 2 ~ "No",
+          . %in% c(98, 99) ~ NA_character_,
+          TRUE ~ NA_character_
+        ),
+        levels = c("No", "Yes")
+      )
+    )
+  ) |>
+  # Remove rows with missing identifiers or weights
+  drop_na(conglomerado, pesohogar) |>
+  # Calculate household-level education (mean of head and spouse)
+  mutate(
+    grado_estudios_hogar = mean(grado_estudios_num, na.rm = TRUE),
+    .by = "nboletahogar", 
+    .keep = "unused"
+  ) |>
+  # Remove Stata labels and formats for clean processing
+  zap_label() |>
+  zap_labels() |>
+  zap_formats()
+```
+
+## B2. Impute Missing Values
+
+Apply Random Forest-based multivariate imputation to handle missing values in predictor and FIES variables. This method preserves variable correlations, handles mixed data types (continuous and categorical), and provides out-of-bag error estimates for imputation quality.
+
+Implementation uses the `impute_rf_parallel()` utility function, which wraps `missRanger` with a multi-threaded `ranger` engine and returns imputed values alongside out-of-bag error estimates (OOBE for continuous variables, PFC for categorical).
+
+```{r}
+#| label: tbl-b2-impute-missing
+#| tbl-cap: "Random Forest imputation quality metrics"
+
+# Separate predictors and FIES variables for imputation
+predictors_to_impute <- df_merge |>
+  select(
+    parentesco, sexo, edad, edad_grupos, departamento, area,
+    miembros_hogar, grado_estudios, grado_estudios_hogar, propiedad,
+    tipo_vivienda, material_paredes, material_techo, material_piso,
+    n_cuartos, cocina, tipo_sanitario,
+    fuente_agua, recoleccion_basura, electricidad,
+    televisor, telefonia_fija, telefonia_celular, computadora,
+    starts_with("fies")
+  ) |>
+  # Convert ordered factors to regular factors for ranger compatibility
+  mutate(
+    departamento = factor(departamento, ordered = FALSE),
+    grado_estudios = factor(grado_estudios, ordered = FALSE)
+  ) |>
+  # Convert to data frame
+  as.data.frame()
+
+# =============================================================================
+# B2. Run Random Forest Imputation on Predictor and FIES Variables
+# =============================================================================
+# Uses impute_rf_parallel() (00_functions.R, section 6), which wraps
+# missRanger with a multi-threaded ranger engine and returns a list
+# containing ximp (imputed tibble) and OOBerror (OOBE, PFC).
+
+# --- Run Random Forest imputation ---
+set.seed(789) 
+
+imputed_result <- impute_rf_parallel(
+  data = predictors_to_impute,
+  maxiter = 10,
+  ntree = 100,
+  verbose = FALSE
+)
+
+# Extract imputed data
+predictors_imputed <- imputed_result$ximp
+
+# Store imputation quality metrics for table
+imputation_metrics <- imputed_result$OOBerror
+
+# Report each metric only when a variable of that type required imputation
+n_continuous <- imputed_result$n_continuous
+n_categorical <- imputed_result$n_categorical
+
+# Create quality metrics summary table
+tbl_b2_impute_missing <- tibble(
+  metric = c(
+    "OOBE (Continuous Variables)",
+    "PFC (Categorical Variables)",
+    "Number of Iterations",
+    "Trees per Iteration"
+  ),
+  value = c(
+    if (n_continuous > 0) imputation_metrics["OOBE"] else NA_real_,
+    if (n_categorical > 0) imputation_metrics["PFC"] else NA_real_,
+    10,
+    100
+  ),
+  interpretation = c(
+    if (n_continuous > 0) {
+      if_else(imputation_metrics["OOBE"] < 0.5, "Acceptable", "Review required")
+    } else {
+      "No continuous variables required imputation"
+    },
+    if (n_categorical > 0) {
+      if_else(imputation_metrics["PFC"] < 0.2, "Acceptable", "Review required")
+    } else {
+      "No categorical variables required imputation"
+    },
+    "Fixed parameter",
+    "Fixed parameter"
+  )
+)
+
+export(tbl_b2_impute_missing, here("01_data", "02_processed", "web_resources", "04_01_tbl_b2_impute_missing.rds"))
+
+tbl_b2_impute_missing |>
+  gt() |>
+  tab_header(
+    title = "Missing Value Imputation Quality Assessment",
+    subtitle = "Out-of-bag error estimates from Random Forest imputation (includes FIES variables)"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value",
+    interpretation = "Quality Assessment"
+  ) |>
+  fmt_number(
+    columns = value,
+    decimals = 4
+  ) |>
+  sub_missing(
+    columns = value,
+    missing_text = "N/A"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Acceptable"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "Review required"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D1ECF1"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "No continuous variables required imputation"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D1ECF1"),
+    locations = cells_body(
+      columns = interpretation,
+      rows = interpretation == "No categorical variables required imputation"
+    )
+  ) |>
+  tab_footnote(
+    footnote = "OOBE: out-of-bag error across continuous variables, the square root of the variance-weighted mean of per-variable unexplained variance. Values < 0.5 indicate acceptable imputation quality. N/A when no continuous variables had missing values.",
+    locations = cells_body(columns = metric, rows = 1)
+  ) |>
+  tab_footnote(
+    footnote = "PFC: Proportion of Falsely Classified entries. Values < 0.2 indicate acceptable imputation quality for categorical variables. N/A when no categorical variables had missing values.",
+    locations = cells_body(columns = metric, rows = 2)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Clean auxiliary objects from quality summary (keep predictors_imputed
+# and imputed_result alive; they are consumed by B2b below).
+rm(
+  predictors_to_impute,
+  imputation_metrics,
+  n_continuous,
+  n_categorical,
+  tbl_b2_impute_missing
+)
+```
+
+## B2b. Completion of Residual Missing Values
+
+The Random Forest imputation engine can leave a residual `NaN` for a small subset of rows when the out-of-bag prediction collapses inside a terminal node with zero within-leaf variance. This affects continuous discrete-scale predictors.
+
+Downstream analyses (Yeo-Johnson transformation, model prediction, quantile mapping) operate on a complete predictor matrix, so residual missing values are completed with a variable-specific rule:
+
+- **Numeric / integer variables**: median of the observed values, which preserves the support of discrete-scale ordinal variables (e.g. years of schooling take values such as 1, 1.5, 2, 2.5, ...).
+- **Factor variables**: mode of the observed values.
+
+Completing rather than discarding keeps every record in the predicted distributions. The count of values completed by each rule is reported in the table below.
+
+```{r}
+#| label: tbl-b2b-completion-summary
+#| tbl-cap: "Residual missing value completion after Random Forest imputation"
+
+# --- Identify residual missing values ---
+residual_summary <- predictors_imputed |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_completed") |>
+  filter(n_completed > 0) |>
+  mutate(
+    rule = vapply(
+      variable,
+      function(v) {
+        x <- predictors_imputed[[v]]
+        if (is.numeric(x)) "Median" else "Mode"
+      },
+      character(1)
+    )
+  ) |>
+  arrange(desc(n_completed))
+
+# --- Apply completion rules ---
+mode_value <- function(x) {
+  observed <- x[!is.na(x)]
+  tab <- table(observed)
+  names(tab)[which.max(tab)]
+}
+
+predictors_complete <- predictors_imputed |>
+  mutate(across(
+    where(is.numeric),
+    ~ if_else(is.na(.), median(., na.rm = TRUE), .)
+  )) |>
+  mutate(across(
+    where(is.factor),
+    ~ {
+      mv <- mode_value(.)
+      replace(., is.na(.), mv)
+    }
+  ))
+
+# --- Build summary with post-completion integrity row -----------------------
+n_residual_after <- sum(is.na(predictors_complete))
+
+completion_report <- residual_summary |>
+  bind_rows(
+    tibble(
+      variable    = "\u2014 Residual NAs after completion \u2014",
+      n_completed = n_residual_after,
+      rule        = if_else(n_residual_after == 0L,
+                            "Integrity check: passed",
+                            "Integrity check: review required")
+    )
+  )
+
+# --- Export summary for web resources ---
+export(
+  completion_report,
+  here("01_data", "02_processed", "web_resources", "04_01_tbl_b2b_completion_summary.rds")
+)
+
+# --- Present summary as GT table ---
+completion_report |>
+  gt() |>
+  tab_header(
+    title = "Residual Missing Value Completion",
+    subtitle = "Values completed by variable-specific rule after RF imputation"
+  ) |>
+  cols_label(
+    variable = "Variable",
+    n_completed = "N Completed",
+    rule = "Completion Rule"
+  ) |>
+  fmt_number(
+    columns = n_completed,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: passed"
+    )
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#F8D7DA"),
+    locations = cells_body(
+      rows = rule == "Integrity check: review required"
+    )
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# --- Combine complete predictors with identifiers ---
+df_imputed <- df_merge |>
+  select(nboletahogar, conglomerado, pesohogar) |>
+  bind_cols(predictors_complete)
+
+# Clean auxiliary objects
+rm(
+  imputed_result,
+  predictors_imputed,
+  predictors_complete,
+  residual_summary,
+  completion_report,
+  n_residual_after
+)
+```
+
+---
+
+# Phase C: Apply Transformations
+
+Apply Yeo-Johnson transformations to continuous predictors (`miembros_hogar` [number of household members] and `n_cuartos` [number of rooms]) using transformation objects fitted on ENCOVI 2023 data. These transformations normalize skewed distributions before prediction.
+
+```{r}
+#| label: fig-c-yj-miembros-hogar-pre
+#| fig-cap: "Yeo-Johnson transformation profile for household members (pre-transformation)"
+
+export(df_imputed, here("01_data", "02_processed", "web_resources", "04_01_fig_c_yj_miembros_hogar_pre.rds"))
+
+# Evaluate distribution before transformation
+boxCox(
+  lm(miembros_hogar ~ 1, data = df_imputed),
+  main = "Household Members - Pre-Transformation",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-c-yj-miembros-hogar-post
+#| fig-cap: "Yeo-Johnson transformation profile for household members (post-transformation)"
+
+# Apply transformation to evaluate post-transformation profile
+miembros_hogar_transformed <- predict(yj_miembros_hogar, newdata = df_imputed$miembros_hogar)
+
+export(tibble(miembros_hogar_transformed = miembros_hogar_transformed), here("01_data", "02_processed", "web_resources", "04_01_fig_c_yj_miembros_hogar_post.rds"))
+
+# Verify transformation improved normality
+boxCox(
+  lm(miembros_hogar_transformed ~ 1),
+  main = "Household Members - Post-Transformation",
+  family = "yjPower"
+)
+
+# Clean temporary object
+rm(miembros_hogar_transformed)
+```
+
+```{r}
+#| label: fig-c-yj-n-cuartos-pre
+#| fig-cap: "Yeo-Johnson transformation profile for number of rooms (pre-transformation)"
+
+export(df_imputed, here("01_data", "02_processed", "web_resources", "04_01_fig_c_yj_n_cuartos_pre.rds"))
+
+# Evaluate distribution before transformation
+boxCox(
+  lm(n_cuartos ~ 1, data = df_imputed),
+  main = "Number of Rooms - Pre-Transformation",
+  family = "yjPower"
+)
+```
+
+```{r}
+#| label: fig-c-yj-n-cuartos-post
+#| fig-cap: "Yeo-Johnson transformation profile for number of rooms (post-transformation)"
+
+# Apply transformation to evaluate post-transformation profile
+n_cuartos_transformed <- predict(yj_n_cuartos, newdata = df_imputed$n_cuartos)
+
+export(tibble(n_cuartos_transformed = n_cuartos_transformed), here("01_data", "02_processed", "web_resources", "04_01_fig_c_yj_n_cuartos_post.rds"))
+
+# Verify transformation improved normality
+boxCox(
+  lm(n_cuartos_transformed ~ 1),
+  main = "Number of Rooms - Post-Transformation",
+  family = "yjPower"
+)
+
+# Clean temporary object
+rm(n_cuartos_transformed)
+```
+
+```{r}
+#| label: apply-c-yj-transformations
+
+# Apply Yeo-Johnson transformations to create modeling-ready dataset
+df_yj <- df_imputed |>
+  mutate(
+    # Keep original values for reference
+    miembros_hogar_original = miembros_hogar,
+    n_cuartos_original = n_cuartos,
+    # Apply transformations
+    miembros_hogar = predict(yj_miembros_hogar, newdata = miembros_hogar),
+    n_cuartos = predict(yj_n_cuartos, newdata = n_cuartos)
+  )
+```
+
+---
+
+# Phase D: Nutrient Prediction
+
+Apply Module 3 transfer models to predict nutrient intake values for all SIVESNU individuals. Models predict maize and non-maize components separately for each nutrient.
+
+**Note**: GLM models with log link return predictions in log scale, requiring exp() back-transformation. Exception: plant percentage model uses identity link (no transformation needed).
+
+## D1. Predict Nutrient Values
+
+```{r}
+#| label: d1-predict-nutritional-values
+ 
+# Align nominal predictor levels with those used during model training in
+# Module 03. "Otro" is retired from tipo_vivienda because the level carries
+# no observations in either survey and is absent from the trained models.
+df_yj_predict <- df_yj |>
+  mutate(
+    tipo_vivienda = fct_drop(tipo_vivienda, only = "Otro")
+  )
+ 
+# Create list of all loaded models for automatic prediction
+lista_modelos <- mget(ls(pattern = "^modelo_"))
+ 
+# Predict nutritional values using all models
+df_predicted <- df_yj |>
+  bind_cols(
+    imap_dfc(lista_modelos, ~ {
+      # Remove 'modelo_' prefix from column name
+      nuevo_nombre <- str_replace(.y, "modelo_", "")
+      # Change 'vegetales' to 'per_vegetales'
+      if (nuevo_nombre == "vegetales") nuevo_nombre <- "per_vegetales"
+      # Predict and strip svystat attributes
+      # Note: per_vegetales model uses identity link (no back-transform needed)
+      #       All other models use log link (require exp() back-transform)
+      predictions <- if (nuevo_nombre == "per_vegetales") {
+        as.numeric(predict(.x, newdata = df_yj_predict))
+      } else {
+        exp(as.numeric(predict(.x, newdata = df_yj_predict)))
+      }
+      # Return clean numeric column
+      tibble(!!nuevo_nombre := predictions)
+    })
+  )
+ 
+# Clean auxiliary objects
+rm(df_yj_predict, lista_modelos)
+```
+
+## D2. Filter Target Population
+
+Filter to children 6-59 months, the target population for the stunting analysis.
+
+The filter precedes the quantile mapping. Calibration maps the quantiles of a source distribution onto those of a reference, so the two describe comparable populations: the reference loaded in A1 is restricted to ENCOVI children of the same age range, and filtering first keeps source and reference age-consistent.
+
+```{r}
+#| label: d2-filter-children
+
+# Filter to children 6-59 months using fuzzy join on household + demographics
+df_children <- df_predicted |>
+  left_join(
+    sivesnu_nino_edad,
+    by = c("nboletahogar", "conglomerado"),
+    relationship = "many-to-many"
+  ) |>
+  filter(
+    sexo == sexo_nino | is.na(sexo_nino),
+    edad >= 0 & edad <= 5
+  ) |>
+  filter(edad_mes >= 6 & edad_mes <= 59) |>
+  distinct(nboletahogar, conglomerado, sexo, edad, .keep_all = TRUE)
+
+# Clean auxiliary object
+rm(sivesnu_nino_edad)
+```
+
+## D3. Apply Quantile Mapping with FIES Adjustment
+
+Apply pre-quantile mapping adjustment based on FIES food security status, then calibrate predicted distributions to match the ENCOVI reference distributions using quantile mapping.
+
+**FIES-based adjustment rationale:**
+- Food Secure (score=0): Higher food access → predictions adjusted +5%
+- Mild Food Insecurity (score 1-3): Slight decrease in quantity and/or quality of food consumed → predictions adjusted +2%
+- Moderate Food Insecurity (score 4-6): Moderate reduction in quantity and/or quality of food consumed → predictions adjusted -2%
+- Severe Food Insecurity (score 7-8): Have run out of food for a day or more → predictions adjusted -5%
+
+```{r}
+#| label: d3-apply-quantile-mapping
+
+# Define nutritional variables for adjustment
+nutritional_vars <- c(
+  "fe_maiz", "fe_no_maiz", 
+  "zn_maiz", "zn_no_maiz",
+  "prot_apro_maiz", "prot_apro_no_maiz",
+  "lys_maiz", "lys_no_maiz",
+  "trp_maiz", "trp_no_maiz",
+  "kcal_maiz", "kcal_no_maiz"
+)
+
+# Calculate FIES raw score and apply food security adjustment
+df_qm_adjusted <- df_children |>
+  mutate(
+    # Calculate FIES raw score (sum of affirmative responses)
+    fies_raw_score = (fies1 == "Yes") + (fies2 == "Yes") + (fies3 == "Yes") + 
+                     (fies4 == "Yes") + (fies5 == "Yes") + (fies6 == "Yes") + 
+                     (fies7 == "Yes") + (fies8 == "Yes"),
+    # Apply FIES-based adjustment to nutritional variables
+    across(
+      all_of(nutritional_vars),
+      ~ case_when(
+        fies_raw_score == 0 ~ .x * 1.05,                              # Food Secure: +5%
+        fies_raw_score >= 1 & fies_raw_score <= 3 ~ .x * 1.02,        # Mild FI: +2%
+        fies_raw_score >= 4 & fies_raw_score <= 6 ~ .x * 0.98,        # Moderate FI: -2%
+        fies_raw_score >= 7 ~ .x * 0.95,                              # Severe FI: -5%
+        TRUE ~ .x
+      ),
+      .names = "{.col}_fies_adj"
+    )
+  )
+
+# Create filtered reference distributions (remove zeros and Tukey outliers).
+# This is a fast, vectorized operation; kept sequential.
+reference_filtered <- map(
+  df_encovi_reference[nutritional_vars],
+  filter_reference_distribution
+)
+
+# Define variable names for mapping
+fies_adjusted_vars <- paste0(nutritional_vars, "_fies_adj")
+qm_adjusted_vars <- paste0(nutritional_vars, "_qm_adj")
+
+# =============================================================================
+# Apply quantile mapping with gamma distribution (parallel via mirai)
+# =============================================================================
+# The 12 calls to quantile_mapping_gamma() are independent: each operates on
+# a distinct (source, reference) pair with no shared state. The bottleneck
+# inside each call is two iterative MLE fits via fitdistrplus::fitdist.
+# Since the age filter now precedes this step the source is the child
+# subpopulation rather than the full survey, so the fits are considerably
+# cheaper; the pool is retained because the 12 mappings still parallelise
+# cleanly and the setup cost is negligible.
+#
+# Execution is delegated to a local mirai daemon pool sized to the number
+# of nutrient pairs, capped by available physical cores. The pool is torn
+# down on exit of the local() block, leaving no lingering processes in the
+# user's R session.
+df_qm_adjusted[qm_adjusted_vars] <- local({
+
+  physical_cores <- parallel::detectCores(logical = FALSE)
+  n_daemons      <- min(length(qm_adjusted_vars), max(1, physical_cores - 4))
+  mirai_profile  <- "qm_gamma_04_01"
+
+  mirai::daemons(n_daemons, .compute = mirai_profile)
+  on.exit(mirai::daemons(0, .compute = mirai_profile), add = TRUE)
+
+  # Constrain BLAS/OpenMP threads inside each daemon and import the
+  # quantile mapping function so it is available without re-sourcing
+  # 00_functions.R from inside the worker.
+  mirai::everywhere(
+    {
+      if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+        RhpcBLASctl::blas_set_num_threads(1)
+        RhpcBLASctl::omp_set_num_threads(1)
+      }
+    },
+    .compute = mirai_profile
+  )
+
+  # Build paired argument list and dispatch
+  pairs <- map2(
+    df_qm_adjusted[fies_adjusted_vars],
+    reference_filtered,
+    ~ list(source_distribution = .x, reference_distribution = .y)
+  )
+
+  results <- mirai::mirai_map(
+    .x       = pairs,
+    .f       = function(p, qm_fun) {
+      qm_fun(
+        source_distribution    = p$source_distribution,
+        reference_distribution = p$reference_distribution
+      )
+    },
+    .args    = list(qm_fun = quantile_mapping_gamma),
+    .compute = mirai_profile
+  )[]
+
+  # Restore original names (mirai_map returns positional names)
+  names(results) <- qm_adjusted_vars
+  results
+})
+
+# Clean auxiliary objects
+rm(reference_filtered, fies_adjusted_vars)
+```
+
+## D4. Apply Nutrient Alignment
+
+Apply rank-based alignment to the maize-source variables.
+
+The alignment realigns each individual's maize-source values against their overall non-maize nutrient profile, under the assumption of intra-individual nutrient coherence. Maize dependency is itself a marker of household resources, so the maize-source block and the outcome share that gradient before the alignment.
+
+```{r}
+#| label: d4-apply-nutritional-alignment
+
+# Define variable groups for alignment
+maize_vars_qm <- c(
+  "fe_maiz_qm_adj", "zn_maiz_qm_adj", "prot_apro_maiz_qm_adj",
+  "lys_maiz_qm_adj", "trp_maiz_qm_adj", "kcal_maiz_qm_adj"
+)
+
+nomaize_vars_qm <- c(
+  "fe_no_maiz_qm_adj", "zn_no_maiz_qm_adj", "prot_apro_no_maiz_qm_adj",
+  "lys_no_maiz_qm_adj", "trp_no_maiz_qm_adj", "kcal_no_maiz_qm_adj"
+)
+
+# Apply rank-based nutritional coherence alignment
+# This preserves marginal distributions while correcting correlation direction
+df_children_aligned <- align_maize_nutrition(
+  data = df_qm_adjusted,
+  maize_vars = maize_vars_qm,
+  nomaize_vars = nomaize_vars_qm,
+  keep_diagnostics = FALSE
+)
+
+# Create final adjusted variables with consistent naming
+df_final_adjusted <- df_children_aligned |>
+  mutate(
+    # Final maize variables (from alignment)
+    fe_maiz_adjusted = fe_maiz_qm_adj_aligned,
+    zn_maiz_adjusted = zn_maiz_qm_adj_aligned,
+    prot_apro_maiz_adjusted = prot_apro_maiz_qm_adj_aligned,
+    lys_maiz_adjusted = lys_maiz_qm_adj_aligned,
+    trp_maiz_adjusted = trp_maiz_qm_adj_aligned,
+    kcal_maiz_adjusted = kcal_maiz_qm_adj_aligned,
+    
+    # Final non-maize variables (direct from QM, no alignment needed)
+    fe_no_maiz_adjusted = fe_no_maiz_qm_adj,
+    zn_no_maiz_adjusted = zn_no_maiz_qm_adj,
+    prot_apro_no_maiz_adjusted = prot_apro_no_maiz_qm_adj,
+    lys_no_maiz_adjusted = lys_no_maiz_qm_adj,
+    trp_no_maiz_adjusted = trp_no_maiz_qm_adj,
+    kcal_no_maiz_adjusted = kcal_no_maiz_qm_adj
+  ) |>
+  # Remove intermediate variables
+  select(-ends_with("_fies_adj"), -ends_with("_qm_adj"), -ends_with("_qm_adj_aligned"))
+
+# Update final_adjusted_vars for downstream use
+final_adjusted_vars <- paste0(nutritional_vars, "_adjusted")
+
+# Clean auxiliary objects
+rm(df_children, df_children_aligned, maize_vars_qm, nomaize_vars_qm, qm_adjusted_vars)
+```
+
+---
+
+# Phase E: Final Dataset Preparation
+
+## E1. Prepare Final Output
+
+Select and organize variables for the final SIVESNU nutrient dataset. This dataset will be used in subsequent scripts for synthetic population generation and stunting model application.
+
+```{r}
+#| label: e1-prepare-final-output
+
+# Raw transfer-model predictions, exported under the naming convention used
+# from 04_02 onwards plus an explicit `_raw` suffix. These columns hold the
+# model output before the FIES adjustment, the quantile mapping and the
+# maize-source alignment, and are preserved for downstream diagnostics.
+raw_prediction_vars <- c(
+  fe_mg_maiz_raw      = "fe_maiz",
+  fe_mg_nomaiz_raw    = "fe_no_maiz",
+  zn_mg_maiz_raw      = "zn_maiz",
+  zn_mg_nomaiz_raw    = "zn_no_maiz",
+  prot_g_maiz_raw     = "prot_apro_maiz",
+  prot_g_nomaiz_raw   = "prot_apro_no_maiz",
+  lys_mg_maiz_raw     = "lys_maiz",
+  lys_mg_nomaiz_raw   = "lys_no_maiz",
+  trp_mg_maiz_raw     = "trp_maiz",
+  trp_mg_nomaiz_raw   = "trp_no_maiz",
+  ene_kcal_maiz_raw   = "kcal_maiz",
+  ene_kcal_nomaiz_raw = "kcal_no_maiz"
+)
+
+# Select and organize final variables
+df_sivesnu_nutritional <- df_final_adjusted |>
+  select(
+    # === Identifiers ===
+    nboletahogar, conglomerado, pesohogar,
+    
+    # === Demographics ===
+    parentesco, sexo, edad, edad_grupos,
+    
+    # === Geographic ===
+    departamento, area,
+    
+    # === Household characteristics ===
+    miembros_hogar_original, n_cuartos_original, 
+    grado_estudios, grado_estudios_hogar,
+    propiedad, tipo_vivienda,
+    material_paredes, material_techo, material_piso,
+    
+    # === Basic services ===
+    cocina, tipo_sanitario, fuente_agua, recoleccion_basura,
+    
+    # === Household assets ===
+    electricidad, televisor, telefonia_fija, telefonia_celular, computadora,
+    
+    # === Food security (FIES) ===
+    fies1, fies2, fies3, fies4, fies5, fies6, fies7, fies8,
+    fies_raw_score,
+    
+    # === Nutritional values (raw transfer-model predictions) ===
+    all_of(raw_prediction_vars),
+    
+    # === Nutritional values (FIES + quantile mapping adjusted) ===
+    all_of(final_adjusted_vars),
+    
+    # === Plant-based food percentage ===
+    per_vegetales
+  )
+```
+
+## E2. Dataset Structure Summary
+
+```{r}
+#| label: tbl-e2-final-validation
+#| tbl-cap: "Final dataset structure summary"
+
+# Generate summary of final dataset
+tbl_e2_final_validation <- tibble(
+  category = c(
+    "Identifiers",
+    "Demographics",
+    "Geographic",
+    "Household characteristics",
+    "Basic services",
+    "Household assets",
+    "Food security (FIES)",
+    "Nutritional (raw predictions)",
+    "Nutritional (adjusted)",
+    "Other",
+    "TOTAL"
+  ),
+  n_variables = c(
+    3,   # nboletahogar, conglomerado, pesohogar
+    4,   # parentesco, sexo, edad, edad_grupos
+    2,   # departamento, area
+    8,   # miembros_hogar_original, n_cuartos_original, grado_estudios, etc.
+    4,   # cocina, tipo_sanitario, fuente_agua, recoleccion_basura
+    5,   # electricidad, televisor, telefonia_fija, telefonia_celular, computadora
+    9,   # fies1-8 + fies_raw_score
+    12,  # raw_prediction_vars
+    12,  # final_adjusted_vars
+    1,   # per_vegetales
+    ncol(df_sivesnu_nutritional)
+  ),
+  observations = c(
+    rep(nrow(df_sivesnu_nutritional), 11)
+  )
+)
+
+export(tbl_e2_final_validation, here("01_data", "02_processed", "web_resources", "04_01_tbl_e2_final_validation.rds"))
+
+tbl_e2_final_validation |>
+  gt() |>
+  tab_header(
+    title = "Final Dataset Structure",
+    subtitle = "SIVESNU 2018 with predicted nutritional values"
+  ) |>
+  cols_label(
+    category = "Variable Category",
+    n_variables = "N Variables",
+    observations = "N Observations"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = category == "TOTAL")
+  ) |>
+  tab_options(
+    table.font.size = 11,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(tbl_e2_final_validation)
+```
+
+## E3. Validation and Quality Assessment
+
+Assess the quality of the nutrient transfer by comparing predicted SIVESNU distributions with ENCOVI reference distributions. Successful transfer should show similar distribution shapes between populations.
+
+```{r}
+#| label: fig-e3-density-comparison
+#| fig-cap: "Distribution comparison: SIVESNU predicted vs ENCOVI reference"
+#| fig-width: 10
+#| fig-height: 8
+
+# Prepare ENCOVI reference data
+df_encovi_plot <- df_encovi_reference |>
+  transmute(
+    source = "ENCOVI 2023 (Reference)",
+    fe_total = fe_maiz + fe_no_maiz,
+    zn_total = zn_maiz + zn_no_maiz,
+    prot_total = prot_apro_maiz + prot_apro_no_maiz,
+    lys_total = lys_maiz + lys_no_maiz,
+    trp_total = trp_maiz + trp_no_maiz,
+    kcal_total = kcal_maiz + kcal_no_maiz
+  )
+
+# Prepare SIVESNU predicted data
+df_sivesnu_plot <- df_qm_adjusted |>
+  transmute(
+    source = "SIVESNU 2018 (Predicted)",
+    fe_total = fe_maiz_qm_adj + fe_no_maiz_qm_adj,
+    zn_total = zn_maiz_qm_adj + zn_no_maiz_qm_adj,
+    prot_total = prot_apro_maiz_qm_adj + prot_apro_no_maiz_qm_adj,
+    lys_total = lys_maiz_qm_adj + lys_no_maiz_qm_adj,
+    trp_total = trp_maiz_qm_adj + trp_no_maiz_qm_adj,
+    kcal_total = kcal_maiz_qm_adj + kcal_no_maiz_qm_adj
+  )
+
+# Combine datasets
+df_comparison <- bind_rows(df_encovi_plot, df_sivesnu_plot) |>
+  mutate(source = factor(source, levels = c("ENCOVI 2023 (Reference)", "SIVESNU 2018 (Predicted)")))
+
+export(df_comparison, here("01_data", "02_processed", "web_resources", "04_01_fig_e3_density_comparison.rds"))
+
+# Define color palette
+color_palette <- c("ENCOVI 2023 (Reference)" = "#5C946E", "SIVESNU 2018 (Predicted)" = "#E07A5F")
+
+# Define nutrients and labels
+nutrients <- c("fe_total", "zn_total", "prot_total", "lys_total", "trp_total", "kcal_total")
+nutrient_labels <- c(
+  "fe_total" = "Iron (mg/day)",
+  "zn_total" = "Zinc (mg/day)", 
+  "prot_total" = "Digestible Protein (g/day)",
+  "lys_total" = "Lysine (mg/day)",
+  "trp_total" = "Tryptophan (mg/day)",
+  "kcal_total" = "Energy (kcal/day)"
+)
+
+# Create individual density plots (without legend)
+plot_list <- map(nutrients, ~ {
+  upper_limit <- quantile(df_comparison[[.x]], 0.95, na.rm = TRUE)
+  
+  df_comparison |>
+    filter(.data[[.x]] > 0, .data[[.x]] <= upper_limit) |>
+    ggplot(aes(x = .data[[.x]], fill = source)) +
+    geom_density(alpha = 0.6, color = NA) +
+    scale_fill_manual(values = color_palette, drop = FALSE) +
+    labs(title = nutrient_labels[.x], x = NULL, y = "Density") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 11, color = "azure4", face = "bold"),
+      axis.title = element_text(size = 9, color = "azure4"),
+      axis.text = element_text(size = 8, color = "azure4"),
+      legend.position = "none",
+      panel.grid.minor = element_blank()
+    )
+})
+
+# Create a plot just to extract the legend
+legend_plot <- df_comparison |>
+  ggplot(aes(x = fe_total, fill = source)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = color_palette, drop = FALSE) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11, color = "azure4")
+  ) +
+  guides(fill = guide_legend(override.aes = list(alpha = 0.6)))
+
+# Extract legend using ggpubr (more reliable)
+legend_grob <- ggpubr::get_legend(legend_plot)
+
+# Arrange plots in grid
+plot_grid <- plot_grid(plotlist = plot_list, ncol = 3, nrow = 2)
+
+# Combine with legend
+plot_grid(plot_grid, legend_grob, ncol = 1, rel_heights = c(1, 0.08))
+
+# Cleanup auxiliary objects
+rm(df_encovi_plot, df_sivesnu_plot, df_comparison, color_palette,
+   nutrient_labels, plot_list, legend_plot, legend_grob, plot_grid)
+```
+
+```{r}
+#| label: tbl-e3-distribution-comparison
+#| tbl-cap: "Distribution comparison: SIVESNU predicted vs ENCOVI reference"
+#| warning: FALSE
+
+# Function to calculate KS test and statistics (without filtering zeros)
+compare_distributions <- function(encovi_vec, sivesnu_vec, nutrient_name, component) {
+  
+  # Remove only NAs, keep zeros for median calculation
+  encovi_clean <- encovi_vec[!is.na(encovi_vec)]
+  sivesnu_clean <- sivesnu_vec[!is.na(sivesnu_vec)]
+  
+  # For KS test, filter positive values only (KS requires comparable distributions)
+  encovi_ks <- encovi_clean[encovi_clean > 0]
+  sivesnu_ks <- sivesnu_clean[sivesnu_clean > 0]
+  
+  # KS test
+ ks_result <- ks.test(encovi_ks, sivesnu_ks)
+  
+  tibble(
+    nutrient = nutrient_name,
+    component = component,
+    median_encovi = median(encovi_clean),
+    median_sivesnu = median(sivesnu_clean),
+    ratio = median(sivesnu_clean) / median(encovi_clean),
+    ks_statistic = ks_result$statistic,
+    p_value = ks_result$p.value
+  )
+}
+
+# Calculate for all nutrients. Both sides are children 6-59 months: the
+# reference was restricted in A1 and the source in D2, so this compares the
+# calibrated SIVESNU children against the ENCOVI children they were mapped onto.
+comparison_results <- bind_rows(
+  # Maize components
+  compare_distributions(df_encovi_reference$fe_maiz, df_qm_adjusted$fe_maiz_qm_adj, "Iron (mg/day)", "Maize"),
+  compare_distributions(df_encovi_reference$zn_maiz, df_qm_adjusted$zn_maiz_qm_adj, "Zinc (mg/day)", "Maize"),
+  compare_distributions(df_encovi_reference$prot_apro_maiz, df_qm_adjusted$prot_apro_maiz_qm_adj, "Digestible Protein (g/day)", "Maize"),
+  compare_distributions(df_encovi_reference$lys_maiz, df_qm_adjusted$lys_maiz_qm_adj, "Lysine (mg/day)", "Maize"),
+  compare_distributions(df_encovi_reference$trp_maiz, df_qm_adjusted$trp_maiz_qm_adj, "Tryptophan (mg/day)", "Maize"),
+  compare_distributions(df_encovi_reference$kcal_maiz, df_qm_adjusted$kcal_maiz_qm_adj, "Energy (kcal/day)", "Maize"),
+  # Non-maize components
+  compare_distributions(df_encovi_reference$fe_no_maiz, df_qm_adjusted$fe_no_maiz_qm_adj, "Iron (mg/day)", "Non-Maize"),
+  compare_distributions(df_encovi_reference$zn_no_maiz, df_qm_adjusted$zn_no_maiz_qm_adj, "Zinc (mg/day)", "Non-Maize"),
+  compare_distributions(df_encovi_reference$prot_apro_no_maiz, df_qm_adjusted$prot_apro_no_maiz_qm_adj, "Digestible Protein (g/day)", "Non-Maize"),
+  compare_distributions(df_encovi_reference$lys_no_maiz, df_qm_adjusted$lys_no_maiz_qm_adj, "Lysine (mg/day)", "Non-Maize"),
+  compare_distributions(df_encovi_reference$trp_no_maiz, df_qm_adjusted$trp_no_maiz_qm_adj, "Tryptophan (mg/day)", "Non-Maize"),
+  compare_distributions(df_encovi_reference$kcal_no_maiz, df_qm_adjusted$kcal_no_maiz_qm_adj, "Energy (kcal/day)", "Non-Maize")
+)
+
+# Pivot wider for cleaner table
+comparison_wide <- comparison_results |>
+  pivot_wider(
+    id_cols = nutrient,
+    names_from = component,
+    values_from = c(median_encovi, median_sivesnu, ratio, ks_statistic, p_value),
+    names_glue = "{component}_{.value}"
+  ) |>
+  select(
+    nutrient,
+    Maize_median_encovi, Maize_median_sivesnu, Maize_ratio, Maize_ks_statistic, Maize_p_value,
+    `Non-Maize_median_encovi`, `Non-Maize_median_sivesnu`, `Non-Maize_ratio`, `Non-Maize_ks_statistic`, `Non-Maize_p_value`
+  )
+
+export(comparison_wide, here("01_data", "02_processed", "web_resources", "04_01_tbl_e3_distribution_comparison.rds"))
+
+# Create GT table
+comparison_wide |>
+  mutate(
+    # Format p-values as threshold categories
+    Maize_p_formatted = case_when(
+      Maize_p_value < 0.001 ~ "< 0.001",
+      Maize_p_value < 0.01 ~ "< 0.01",
+      Maize_p_value < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", Maize_p_value)
+    ),
+    `Non-Maize_p_formatted` = case_when(
+      `Non-Maize_p_value` < 0.001 ~ "< 0.001",
+      `Non-Maize_p_value` < 0.01 ~ "< 0.01",
+      `Non-Maize_p_value` < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", `Non-Maize_p_value`)
+    )
+  ) |>
+  select(-Maize_p_value, -`Non-Maize_p_value`) |>
+  gt() |>
+  tab_header(
+    title = "Nutritional Distribution Calibration Assessment",
+    subtitle = "Kolmogorov-Smirnov test comparing SIVESNU (predicted) vs ENCOVI (reference)"
+  ) |>
+  cols_label(
+    nutrient = "Nutrient",
+    Maize_median_encovi = "ENCOVI",
+    Maize_median_sivesnu = "SIVESNU",
+    Maize_ratio = "Ratio",
+    Maize_ks_statistic = "KS",
+    Maize_p_formatted = "p-value",
+    `Non-Maize_median_encovi` = "ENCOVI",
+    `Non-Maize_median_sivesnu` = "SIVESNU",
+    `Non-Maize_ratio` = "Ratio",
+    `Non-Maize_ks_statistic` = "KS",
+    `Non-Maize_p_formatted` = "p-value"
+  ) |>
+  tab_spanner(label = "From Maize", columns = starts_with("Maize")) |>
+  tab_spanner(label = "From Non-Maize", columns = starts_with("Non-Maize")) |>
+  fmt_number(columns = contains("median"), decimals = 1) |>
+  fmt_number(columns = contains("ratio"), decimals = 2) |>
+  fmt_number(columns = contains("ks_statistic"), decimals = 3) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Maize_ratio, rows = Maize_ratio >= 0.9 & Maize_ratio <= 1.1)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = `Non-Maize_ratio`, rows = `Non-Maize_ratio` >= 0.9 & `Non-Maize_ratio` <= 1.1)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = Maize_ks_statistic, rows = Maize_ks_statistic < 0.1)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#D4EDDA"),
+    locations = cells_body(columns = `Non-Maize_ks_statistic`, rows = `Non-Maize_ks_statistic` < 0.1)
+  ) |>
+  tab_footnote(
+    footnote = "Ratio = SIVESNU median / ENCOVI median. Values 0.9-1.1 indicate good calibration.",
+    locations = cells_column_labels(columns = Maize_ratio)
+  ) |>
+  tab_footnote(
+    footnote = "KS: Kolmogorov-Smirnov statistic (lower = better match). Green highlights: KS < 0.1 or Ratio 0.9-1.1.",
+    locations = cells_column_labels(columns = Maize_ks_statistic)
+  ) |>
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    table.width = pct(100)
+  )
+
+# Cleanup auxiliary objects
+rm(compare_distributions, comparison_results, comparison_wide)
+```
+
+---
+
+# Phase F: Export
+
+```{r}
+#| label: f-save-output
+
+# Save final dataset as parquet
+write_parquet(
+  df_sivesnu_nutritional,
+  here("01_data", "02_processed", 
+       "transfer", "04_01_sivesnu_nutritional_predicted.parquet")
+)
+```
+
+
+# Notes
+
+## Processing Summary
+
+This script applies Module 3 transfer models to SIVESNU 2018 data to predict nutrient intake values for all individuals. The workflow includes:
+
+1. **Data loading**: SIVESNU 2018 household and individual datasets merged
+2. **Variable harmonization**: Recoding to match ENCOVI 2023 predictor structure
+3. **Missing value imputation**: Random Forest-based multivariate imputation (via `impute_rf_parallel`) for predictors and FIES variables, with median/mode completion of any residual values
+4. **Yeo-Johnson transformation**: Applied to continuous predictors (miembros_hogar, n_cuartos)
+5. **Model prediction**: Module 3 gamma regression models applied with exp() back-transformation for log-link models. Plant percentage model uses identity link (no back-transformation).
+6. **Target population filter**: children 6-59 months, applied before calibration so that source and reference are age-comparable
+7. **FIES adjustment**: Food security-based fine-tuning (±2-5% based on FIES raw score)
+8. **Quantile mapping**: Distribution calibration using filtered, age-matched ENCOVI reference distributions
+9. **Maize alignment**: rank-based realignment of the maize block against the non-maize composite
+
+## Methodology
+
+**FIES for food security assessment**: Food security status is measured using the Food Insecurity Experience Scale (FIES), an 8-question instrument available in SIVESNU 2018. FIES follows FAO international methodology and provides comprehensive assessment of household food security across multiple dimensions (worry, quality, quantity, and severe deprivation).
+
+**Population scope and age-matched calibration**: Prediction runs on all SIVESNU individuals, but the target population is filtered to children 6-59 months *before* the quantile mapping, and the ENCOVI reference is restricted to the same age range.
+
+Quantile mapping transports the quantiles of a source distribution onto those of a reference, so the two describe comparable populations. Nutrient intake scales with body size, and the child medians sit well below the all-age medians in the ENCOVI reference, by a ratio that differs by nutrient and by source. Matching the age range on both sides keeps the level and the composition of any index built from the result on the child scale, and makes the section E3 validation a like-for-like comparison.
+
+The mapping is estimated over the pooled age-matched range.
+
+**Quantile mapping reference filtering**: Reference distributions from ENCOVI are filtered to remove zeros and Tukey outliers (Q3 + 1.5*IQR) to match the preprocessing applied during model training. Note that this trim is applied to the *reference* only; script 04_08 applies its own plausibility rules to the synthetic population so that the two ends of the pipeline describe comparable supports.
+
+**Raw prediction preservation**: The exported dataset carries two parallel blocks of the twelve source-specific nutrient variables. The `_raw` block holds the transfer-model output before the FIES adjustment, the quantile mapping and the maize-source alignment; the `_adjusted` block holds the calibrated values consumed by the rest of the pipeline. Both blocks use the naming convention adopted from 04_02 onwards (`fe_mg_maiz`, `prot_g_maiz`, `ene_kcal_maiz`, ...), so each raw column pairs one-to-one with its calibrated counterpart. The `_raw` block is carried unchanged through 04_02 to 04_08 and is never used in any calculation; it exists so the effect of the calibration can be audited at any stage of the module.
+
+## Limitations
+
+Individual intake in ENCOVI was allocated from household consumption over a 15-day recall using an adult-male-equivalent scale, so the age gradient of the reference distribution partly reflects that allocation rule.

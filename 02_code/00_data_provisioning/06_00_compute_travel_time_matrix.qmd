@@ -1,0 +1,590 @@
+---
+title: "Compute Departmental Travel Time Matrix via OSRM"
+subtitle: "Module 6: Scenario Precomputation — External Infrastructure"
+author: "Azahar Data Insights"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+    fig-cap-location: top
+    tbl-cap-location: top
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+**One-time execution script.** This script computes the 22×22 departmental travel time matrix used by the gravity-based redistribution model in the market baseline scripts (06_01_sXX). The matrix is deterministic and depends only on OpenStreetMap road network data via the OSRM (Open Source Routing Machine) routing engine. It does not depend on any framework data and only needs to be re-executed if the underlying road network changes significantly.
+
+This script establishes the geographic infrastructure required for gravity-based surplus redistribution across Guatemala's 22 departments. Travel times between departmental capitals (cabeceras departamentales) are computed using OSRM, which routes over real road network data and inherently captures terrain, road quality, and geographic barriers.
+
+## Main Operations
+
+1. Define departmental capital coordinates (22 cabeceras departamentales)
+2. Query OSRM for the 22×22 travel time matrix (driving mode)
+3. Validate matrix completeness and symmetry
+4. Compute gravity weights from travel times (inverse power law)
+5. Visualize the travel time matrix as a heatmap
+6. Export travel time matrix and gravity weights to parquet
+
+## Methodological Notes
+
+**Source of coordinates**: Departmental capitals are the administrative seats (cabeceras) of each of Guatemala's 22 departments, as defined by Guatemala's Instituto Nacional de Estadística (INE). Coordinates correspond to the central urban area of each cabecera.
+
+**OSRM routing**: The Open Source Routing Machine computes shortest-path travel times using OpenStreetMap road network data. This captures Guatemala's actual road infrastructure, terrain constraints, and geographic barriers — including the mountain ranges and limited road access that make Euclidean distance a poor proxy for real accessibility.
+
+**Gravity model reference**: The redistribution formulation follows Anderson & van Wincoop (2003), analogous to IMPLAN inter-regional commodity flow estimation. Surplus production flows to deficit departments weighted by `deficit_j / travel_time_ij^beta`, where `beta = 2` (Newtonian decay).
+
+# Setup
+
+```{r}
+#| label: setup
+
+# =============================================================================
+# Environment Setup
+# =============================================================================
+
+# Clear environment and unload packages
+rm(list = ls())
+tryCatch(
+  suppressWarnings(pacman::p_unload(all)),
+  error = function(e) invisible(NULL)
+)
+
+# Load required packages
+pacman::p_load(
+  osrm,               # OpenStreetMap routing (travel times)
+  arrow,              # Parquet file handling
+  here,               # Robust file path management
+  gt,                 # Professional table formatting
+  tidyverse           # General purpose data manipulation
+)
+
+# Packages used via :: (not loaded to minimize memory footprint)
+# scales   — label_number() in ggplot scales
+
+# Resolve function conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Set display options
+options(scipen = 999, digits = 4)
+
+source(here("02_code", "00_functions", "00_functions.R"))
+
+# external/
+ensure_output_dir(here("01_data", "02_processed", "external"))
+```
+
+# Phase A: Define Departmental Capitals
+
+The 22 departmental capitals of Guatemala serve as reference points for the travel time matrix. Each capital is the administrative seat (cabecera departamental) as defined by INE Guatemala.
+
+## A1. Departmental Capital Coordinates
+
+Coordinates represent the central urban area of each cabecera departamental. Department names match the ENCOVI 2023 coding standard used throughout the framework.
+
+**Source of coordinates**: Departmental capitals (cabeceras departamentales) are the administrative seats of each of Guatemala's 22 departments. Coordinates were obtained from the GeoNames geographical database (www.geonames.org, Creative Commons Attribution 4.0 License), which aggregates data from official national mapping agencies and the OpenStreetMap community. Each coordinate corresponds to the populated place record classified as `feature class P` (populated place) and `feature code PPLA` (seat of a first-order administrative division) in GeoNames for the respective departmental capital. GeoNames data for Guatemala can be accessed at https://download.geonames.org/export/dump/GT.zip. Coordinates are in WGS84 (EPSG:4326).
+
+```{r}
+#| label: a1-define-capitals
+
+# =============================================================================
+# A1. Define Departmental Capital Coordinates
+# =============================================================================
+
+df_capitals <- tribble(
+  ~departamento,        ~cabecera,              ~lat,      ~lon,
+  "Guatemala",          "Guatemala City",       14.6349,   -90.5069,
+  "El Progreso",        "Guastatoya",           14.8536,   -90.0672,
+  "Sacatepéquez",       "Antigua Guatemala",    14.5586,   -90.7295,
+  "Chimaltenango",      "Chimaltenango",        14.6619,   -90.8193,
+  "Escuintla",          "Escuintla",            14.2980,   -90.7870,
+  "Santa Rosa",         "Cuilapa",              14.2765,   -90.2984,
+  "Sololá",             "Sololá",               14.7725,   -91.1866,
+  "Totonicapán",        "Totonicapán",          14.9082,   -91.3607,
+  "Quetzaltenango",     "Quetzaltenango",       14.8347,   -91.5183,
+  "Suchitepéquez",      "Mazatenango",          14.5336,   -91.5037,
+  "Retalhuleu",         "Retalhuleu",           14.5340,   -91.6781,
+  "San Marcos",         "San Marcos",           14.9647,   -91.7963,
+  "Huehuetenango",      "Huehuetenango",        15.3195,   -91.4714,
+  "Quiché",             "Santa Cruz del Quiché",15.0295,   -91.1502,
+  "Baja Verapaz",       "Salamá",               15.1025,   -90.3160,
+  "Alta Verapaz",       "Cobán",                15.4713,   -90.3707,
+  "Petén",              "Flores",               16.9316,   -89.8923,
+  "Izabal",             "Puerto Barrios",       15.7280,   -88.5940,
+  "Zacapa",             "Zacapa",               14.9719,   -89.5294,
+  "Chiquimula",         "Chiquimula",           14.7979,   -89.5449,
+  "Jalapa",             "Jalapa",               14.6354,   -89.9889,
+  "Jutiapa",            "Jutiapa",              14.2916,   -89.8953
+)
+```
+
+## A2. Departmental Capitals Summary
+
+```{r}
+#| label: tbl-a2-capitals-summary
+#| tbl-cap: "Departmental capitals of Guatemala with geographic coordinates"
+
+# =============================================================================
+# A2. Display Capital Coordinates
+# =============================================================================
+
+df_capitals |>
+  gt() |>
+  tab_header(
+    title = "Departmental Capitals of Guatemala",
+    subtitle = "Reference points for OSRM travel time computation"
+  ) |>
+  cols_label(
+    departamento = "Department",
+    cabecera = "Capital (Cabecera)",
+    lat = "Latitude",
+    lon = "Longitude"
+  ) |>
+  cols_align(align = "left", columns = c(departamento, cabecera)) |>
+  fmt_number(
+    columns = c(lat, lon),
+    decimals = 4
+  ) |>
+  tab_source_note(
+    source_note = "Source: INE Guatemala departmental administrative divisions. Coordinates from OpenStreetMap/Nominatim."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+---
+
+# Phase B: Compute OSRM Travel Time Matrix
+
+## B1. Query OSRM Travel Times
+
+Query the OSRM public routing server for driving travel times between all 22 departmental capitals. The result is a 22×22 matrix where entry (i, j) represents the estimated driving time in minutes from capital i to capital j.
+
+OSRM uses the OpenStreetMap road network and a contraction hierarchies algorithm for efficient routing. The public demo server is used for this one-time computation.
+
+```{r}
+#| label: b1-compute-osrm-matrix
+
+# =============================================================================
+# B1. Compute OSRM Travel Time Matrix
+# =============================================================================
+
+# Prepare coordinates for OSRM query
+# osrmTable with data.frame input expects: only lon, lat columns
+# Row names are used as identifiers
+df_osrm_input <- data.frame(
+  lon = df_capitals$lon,
+  lat = df_capitals$lat,
+  row.names = df_capitals$departamento
+)
+
+# Query OSRM for 22x22 travel time matrix (driving mode)
+# Using loc parameter since origins and destinations are the same set
+osrm_result <- osrmTable(
+  loc = df_osrm_input,
+  measure = "duration"
+)
+
+# Extract the travel time matrix (in minutes)
+mat_travel_time <- osrm_result$durations
+
+# Verify dimensions
+n_depts <- nrow(df_capitals)
+```
+
+## B2. Validate Matrix
+
+Verify that the travel time matrix is complete (no missing routes) and approximately symmetric (travel time A→B ≈ B→A, with minor differences due to one-way roads and routing asymmetries).
+
+```{r}
+#| label: tbl-b2-validate-matrix
+#| tbl-cap: "Travel time matrix validation summary"
+
+# =============================================================================
+# B2. Validate Travel Time Matrix
+# =============================================================================
+
+# Set diagonal to zero (self-travel)
+diag(mat_travel_time) <- 0
+
+# Check for missing values
+n_missing <- sum(is.na(mat_travel_time))
+
+# Characterize asymmetry: |t(i,j) - t(j,i)|
+mat_diff <- abs(mat_travel_time - t(mat_travel_time))
+max_asymmetry_min <- max(mat_diff, na.rm = TRUE)
+mean_asymmetry_min <- mean(mat_diff[upper.tri(mat_diff)], na.rm = TRUE)
+median_asymmetry_min <- median(mat_diff[upper.tri(mat_diff)], na.rm = TRUE)
+
+# Range of travel times (off-diagonal)
+off_diag <- mat_travel_time[row(mat_travel_time) != col(mat_travel_time)]
+min_travel <- min(off_diag, na.rm = TRUE)
+max_travel <- max(off_diag, na.rm = TRUE)
+mean_travel <- mean(off_diag, na.rm = TRUE)
+
+# Verify dimensions
+n_depts <- nrow(mat_travel_time)
+
+# Summary table
+tibble(
+  metric = c(
+    "Matrix dimensions",
+    "Missing values",
+    "Symmetric",
+    "Max asymmetry |t(i,j) - t(j,i)| (min)",
+    "Mean asymmetry (min)",
+    "Median asymmetry (min)",
+    "Min travel time (min)",
+    "Max travel time (min)",
+    "Mean travel time (min)"
+  ),
+  value = c(
+    paste0(n_depts, " x ", n_depts),
+    as.character(n_missing),
+    "No (by design — reflects real road network directionality)",
+    round(max_asymmetry_min, 1),
+    round(mean_asymmetry_min, 1),
+    round(median_asymmetry_min, 1),
+    round(min_travel, 1),
+    round(max_travel, 1),
+    round(mean_travel, 1)
+  )
+) |>
+  gt() |>
+  tab_header(
+    title = "Travel Time Matrix Validation",
+    subtitle = "OSRM driving times between 22 departmental capitals (asymmetric)"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  cols_align(align = "left", columns = metric) |>
+  cols_align(align = "right", columns = value) |>
+  tab_source_note(
+    source_note = "Source: OSRM routing over OpenStreetMap road network. Asymmetry is expected due to terrain, road directionality, and routing differences."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+```
+
+---
+
+# Phase C: Compute Gravity Weights
+
+## C1. Gravity Weight Calculation
+
+Convert travel times to gravity weights using an inverse power law decay function. The weight for department pair (i, j) is:
+
+$$w_{ij} = \frac{1}{t_{ij}^{\beta}}$$
+
+where $t_{ij}$ is the travel time in minutes and $\beta = 2$ (Newtonian decay, the standard gravitational exponent). This means that doubling the travel time reduces the flow weight by a factor of 4.
+
+The choice of $\beta = 2$ follows Anderson & van Wincoop (2003) and is the standard in trade gravity models. The value can be recalibrated if empirical data on actual maize trade flows becomes available.
+
+```{r}
+#| label: c1-gravity-weights
+
+# =============================================================================
+# C1. Compute Gravity Weights from Travel Times
+# =============================================================================
+
+# Gravity decay parameter
+BETA <- 2
+
+# Compute gravity weights: w_ij = 1 / t_ij^beta
+# Diagonal (self-flow) is set to 0 — departments do not redistribute to themselves
+mat_gravity_weights <- 1 / (mat_travel_time ^ BETA)
+
+# Set diagonal to zero (no self-redistribution)
+diag(mat_gravity_weights) <- 0
+
+# Handle any Inf values from zero travel times (shouldn't occur with symmetric matrix)
+mat_gravity_weights[is.infinite(mat_gravity_weights)] <- 0
+```
+
+## C2. Travel Time Heatmap
+
+```{r}
+#| label: fig-c2-travel-time-heatmap
+#| fig-cap: "Driving travel times between departmental capitals (minutes)"
+#| fig-width: 10
+#| fig-height: 9
+
+# =============================================================================
+# C2. Visualize Travel Time Matrix
+# =============================================================================
+
+# Convert matrix to long format for ggplot
+df_travel_long <- mat_travel_time |>
+  as_tibble(rownames = "origin") |>
+  pivot_longer(
+    cols = -origin,
+    names_to = "destination",
+    values_to = "travel_time_min"
+  ) |>
+  # Order departments by geographic region (north to south, west to east)
+  mutate(
+    origin = factor(origin, levels = df_capitals$departamento),
+    destination = factor(destination, levels = rev(df_capitals$departamento))
+  )
+
+# Heatmap visualization
+ggplot(df_travel_long, aes(x = origin, y = destination, fill = travel_time_min)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = round(travel_time_min, 0)),
+    size = 2.2,
+    color = "gray20"
+  ) +
+  scale_fill_gradient2(
+    low = "#E8F5E9",
+    mid = "#FFF9C4",
+    high = "#E53935",
+    midpoint = median(df_travel_long$travel_time_min),
+    name = "Travel Time\n(minutes)"
+  ) +
+  labs(
+    title = "Driving Travel Times Between Departmental Capitals",
+    subtitle = "OSRM routing over OpenStreetMap road network — asymmetric (directional)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40", size = 11),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+# Clean up
+rm(df_travel_long)
+```
+
+## C3. Gravity Weights Heatmap
+
+```{r}
+#| label: fig-c3-gravity-weights-heatmap
+#| fig-cap: "Gravity weights between departmental capitals (1 / travel_time²)"
+#| fig-width: 10
+#| fig-height: 9
+
+# =============================================================================
+# C3. Visualize Gravity Weights
+# =============================================================================
+
+# Convert matrix to long format for ggplot
+df_gravity_long <- mat_gravity_weights |>
+  as_tibble(rownames = "origin") |>
+  pivot_longer(
+    cols = -origin,
+    names_to = "destination",
+    values_to = "gravity_weight"
+  ) |>
+  mutate(
+    origin = factor(origin, levels = df_capitals$departamento),
+    destination = factor(destination, levels = rev(df_capitals$departamento))
+  )
+
+# Heatmap visualization (log scale for better contrast)
+ggplot(df_gravity_long, aes(x = origin, y = destination, fill = gravity_weight)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#1565C0",
+    name = "Gravity\nWeight",
+    trans = "sqrt",
+    labels = scales::label_number(accuracy = 0.0001)
+  ) +
+  labs(
+    title = "Gravity Weights Between Departmental Capitals",
+    subtitle = paste0("w(i,j) = 1 / travel_time(i,j)² — β = ", BETA),
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40", size = 11),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+# Clean up
+rm(df_gravity_long)
+```
+
+---
+
+# Phase D: Export
+
+## D1. Export Travel Time Matrix
+
+Export the symmetrized travel time matrix and gravity weights as parquet files for use by downstream market baseline scripts (06_01_sXX).
+
+```{r}
+#| label: d1-export-travel-times
+
+# =============================================================================
+# D1. Export Travel Time Matrix
+# =============================================================================
+
+# Convert symmetric matrix to tidy long format for parquet storage
+df_travel_time_export <- mat_travel_time |>
+  as_tibble(rownames = "origin") |>
+  pivot_longer(
+    cols = -origin,
+    names_to = "destination",
+    values_to = "travel_time_min"
+  ) |>
+  # Add gravity weights
+  left_join(
+    mat_gravity_weights |>
+      as_tibble(rownames = "origin") |>
+      pivot_longer(
+        cols = -origin,
+        names_to = "destination",
+        values_to = "gravity_weight"
+      ),
+    by = c("origin", "destination")
+  ) |>
+  # Add metadata
+  mutate(
+    beta = BETA,
+    osrm_mode = "driving"
+  )
+
+write_parquet(
+  df_travel_time_export,
+  file.path(here("01_data", "02_processed", "external"), 
+            "06_00_osrm_travel_time_matrix.parquet")
+)
+```
+
+## D2. Export Capital Coordinates
+
+Export the departmental capital coordinates as a reference dataset.
+
+```{r}
+#| label: d2-export-capitals
+
+# =============================================================================
+# D2. Export Capital Coordinates
+# =============================================================================
+
+write_parquet(
+  df_capitals,
+  file.path(here("01_data", "02_processed", "external"), 
+            "06_00_departmental_capitals.parquet")
+)
+```
+
+## D3. Data Dimensions Summary
+
+```{r}
+#| label: tbl-d3-export-summary
+#| tbl-cap: "Exported datasets summary"
+
+# =============================================================================
+# D3. Export Summary
+# =============================================================================
+
+tibble(
+  dataset = c(
+    "Travel time matrix + gravity weights",
+    "Departmental capitals"
+  ),
+  filename = c(
+    "06_00_osrm_travel_time_matrix.parquet",
+    "06_00_departmental_capitals.parquet"
+  ),
+  n_records = c(
+    nrow(df_travel_time_export),
+    nrow(df_capitals)
+  ),
+  n_variables = c(
+    ncol(df_travel_time_export),
+    ncol(df_capitals)
+  )
+) |>
+  gt() |>
+  tab_header(
+    title = "Phase D: Export Summary",
+    subtitle = "Datasets exported to 02_processed/external/"
+  ) |>
+  cols_label(
+    dataset = "Dataset",
+    filename = "Filename",
+    n_records = "Records",
+    n_variables = "Variables"
+  ) |>
+  cols_align(align = "left", columns = c(dataset, filename)) |>
+  fmt_number(
+    columns = c(n_records, n_variables),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  tab_source_note(
+    source_note = "Output directory: 01_data/02_processed/external/"
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Clean up
+rm(df_travel_time_export)
+```
+
+---
+
+# Notes
+
+This script generates the geographic infrastructure for the gravity-based surplus redistribution model of Module 06.
+
+## Methodology
+
+The travel time matrix is computed via OSRM (Open Source Routing Machine), which routes over the OpenStreetMap road network for Guatemala. This captures the country's actual road infrastructure, including the central mountain ranges (Sierra Madre, Sierra de los Cuchumatanes) that create significant travel time asymmetries between departments that are geographically close but poorly connected by road.
+
+Gravity weights follow the standard inverse power law formulation from trade gravity models (Anderson & van Wincoop, 2003). The decay parameter β = 2 corresponds to the classical Newtonian gravitational decay and is the most common specification in the trade literature. The parameter can be recalibrated if empirical data on actual maize trade flows becomes available.
+
+The travel time matrix is intentionally kept asymmetric: t(i,j) ≠ t(j,i) in general, reflecting real differences in road routing, terrain gradients, and directional constraints in Guatemala's road network. When the gravity model redistributes surplus from department i to department j, it uses the directional travel time t(i→j), which represents the actual cost of moving grain from the surplus origin to the deficit destination.
+
+## Data Quality
+
+The OSRM public demo server uses OpenStreetMap data which is community-maintained. Road network coverage in Guatemala is generally good for paved roads between departmental capitals, but may underrepresent unpaved rural roads. Since the gravity model uses travel times between cabeceras (which are connected by primary/secondary roads), this limitation has minimal impact.
+
+## Limitations
+
+1. **Static road network**: Travel times reflect the road network at the time of OSRM computation. Major infrastructure changes (new highways, bridge construction) would require re-execution.
+
+2. **Driving mode only**: The model assumes road transport. River or air transport routes are not captured.
+
+3. **No seasonal variation**: Travel times do not account for seasonal road conditions (rainy season closures, flooding).
+
+4. **Single reference point per department**: Travel times are measured between cabeceras departamentales. Intra-departmental distribution costs are not modeled.
+
+## References
+
+Anderson, J. E., & van Wincoop, E. (2003). Gravity with Gravitas: A Solution to the Border Puzzle. *American Economic Review*, 93(1), 170–192. https://doi.org/10.1257/000282803321455214
