@@ -1,6 +1,7 @@
 ---
 title: "MAGA Weight Calibration"
 subtitle: "Module 2: Economic Impact"
+description-meta: "Reconciling ENCOVI survey weights with MAGA administrative maize totals through scaling, record expansion with controlled jitter, and re-calibration."
 ---
 
 ## Why Calibrate to MAGA?

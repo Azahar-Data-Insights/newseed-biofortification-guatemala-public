@@ -1,6 +1,7 @@
 ---
 title: "Transfer Height to ENCOVI"
 subtitle: "Module 5: Meta-analysis"
+description-meta: "ENCOVI has no anthropometry. Predicting height for its children, calibrating by quantile mapping to Guatemalan references, then deriving HAZ."
 ---
 
 ## Why Transfer Height to ENCOVI?

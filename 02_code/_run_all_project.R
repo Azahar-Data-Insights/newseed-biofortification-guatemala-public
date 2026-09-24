@@ -1,5 +1,5 @@
 # ==============================================================================
-# Project Orchestrator: NewSeed Biofortification Framework
+# Project Orchestrator: New Seed Biofortification Framework
 # ==============================================================================
 #
 # Runs the full analytical pipeline end to end by sourcing each module

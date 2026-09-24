@@ -92,15 +92,19 @@ ensure_output_dir(here("01_data", "02_processed", "web_resources"))
 
 **Seed Variant: `r paste0(seed_year, " (", seed_code, ")")` — Subsidy Regime: `r subsidy_label`** — This script uses farmer adoption scores from the `r seed_code` × `r toupper(subsidy_suffix)` economic impact pathway. For alternative combinations, see the companion variants rendered from this parametrized template.
 
-This script establishes the market baseline metrics and redistribution infrastructure required for scenario modeling in Module 6. It calculates departmental production capacity, consumption requirements, and applies a gravity-based redistribution model to simulate inter-departmental surplus flows across all penetration levels.
+This script establishes the market baseline metrics and redistribution infrastructure required for scenario modeling in Module 6. It calculates departmental production capacity, consumption requirements, and applies a gravity-based redistribution model to simulate inter-departmental surplus flows across the eleven simulation levels of national biofortified maize land share.
 
-Penetration is implemented through the continuous adoption model: each farmer has a per-farmer entry point (`p_entry`) and a behavioural profile (`S`, `M`, `L`), which together determine the conversion ratio `r_i(p) = sigmoid_curve(p, p_entry_i, floor_profile, k_profile)` at each national penetration level `p`. At the farmer's entry point, the conversion ratio equals the profile-specific floor; it then rises along a sigmoid curve towards 1 as `p` increases. At full penetration (`p = 1`), all farmers have `r_i(1) = 1` by construction. The effective biofortified production of farmer `i` at penetration `p` is `production_biofortified_i × weight_calibrated_i × r_i(p)`.
+The simulation presents `penetration` as the national share of maize land cultivated with biofortified seed, evaluated at eleven levels from 0% to 100% in 10-percentage-point increments. The continuous adoption model operates on an internal adoption index `p_internal`, the position along the production-weighted adoption ranking defined in Script 02_06. Each farmer has a per-farmer entry point (`p_entry`) and a behavioural profile (`S`, `M`, `L`), which together determine the conversion ratio `r_i(p_internal) = sigmoid_curve(p_internal, p_entry_i, floor_profile, k_profile)`. At the farmer's entry point, the conversion ratio equals the profile-specific floor; it then rises along a sigmoid curve towards 1 as `p_internal` increases. At `p_internal = 1`, all farmers have `r_i(1) = 1` by construction. The effective biofortified production of farmer `i` is `production_biofortified_i × weight_calibrated_i × r_i(p_internal)`, and the effective biofortified maize land is `land_wtcorn_i × weight_calibrated_i × r_i(p_internal)`.
 
-The two outputs of this script behave differently with respect to the subsidy regime:
+A fine internal grid maps the continuous adoption index to the resulting national biofortified land share. The eleven simulation levels are obtained by associating the internal adoption index with national biofortified maize land targets from 0% to 100% in 10-percentage-point increments. All farmer-level adoption calculations are evaluated at `p_internal`, and all outputs are labelled with the external `penetration` value.
+
+The three outputs of this script behave differently with respect to the subsidy regime:
 
 - **`06_01_{seed}_{sub}_market_baseline.parquet`** captures structural departmental quantities — farmer counts, land allocation, FSI consumption demand, current production, and maximum biofortified production capacity at full adoption. These are physical and demographic in nature and are therefore **invariant to the subsidy regime** for a given seed: the subsidy affects seed prices, producer absorption, and farmer extra costs, but does not alter yields, segment composition, consumption demand, or the road network.
 
-- **`06_01_{seed}_{sub}_saturation_scenarios.parquet`** captures departmental coverage along the penetration curve (0–100%) after gravity-based redistribution. Penetration is implemented as a continuous adoption process driven by the Likely Adopters score (Script 02_06), which incorporates the economic-benefit component for the active subsidy regime. As the subsidy regime shifts the relative attractiveness of biofortified seed across farmers, the **order in which farmers enter the adoption pool changes**, and therefore the spatial distribution of biofortified production at intermediate penetration levels also changes. The endpoints (penetration = 0% and penetration = 100%) converge across subsidy regimes by construction, since they correspond respectively to no adopters and the full farmer set with `r_i(1) = 1`.
+- **`06_01_{seed}_{sub}_saturation_scenarios.parquet`** captures departmental coverage at the eleven levels of national biofortified maize land share (0–100%) after gravity-based redistribution. Adoption progresses as a continuous process driven by the Likely Adopters score (Script 02_06), which incorporates the economic-benefit component for the active subsidy regime. As the subsidy regime shifts the relative attractiveness of biofortified seed across farmers, the **order in which farmers enter the adoption pool changes**, and therefore both the internal adoption index associated with each land share level and the spatial distribution of biofortified production at intermediate levels also change. The endpoints (0% and 100% biofortified maize land) converge across subsidy regimes by construction, since they correspond respectively to an empty adoption pool and the full farmer set with `r_i(1) = 1`.
+
+- **`06_01_{seed}_{sub}_penetration_lookup.parquet`** records the association between each external `penetration` level and its internal adoption index `p_internal`, together with the biofortified maize land share achieved at that index. Downstream scenario scripts evaluate farmer-level adoption at the same internal adoption index that generates the departmental coverage stored in the saturation scenarios. The association is **subsidy-sensitive** at intermediate levels for the same reason as the saturation scenarios.
 
 ## Main Operations
 
@@ -112,18 +116,23 @@ The two outputs of this script behave differently with respect to the subsidy re
 6. Calculate baseline land allocation for maize production per department
 7. Calculate annual maize consumption by department using survey weights
 8. Calculate maximum current and biofortified production capacity per department
-9. Generate saturation diagnostic curves before redistribution
-10. Apply gravity-based redistribution across all penetration levels
-11. Validate production conservation through redistribution
-12. Export market baseline and saturation scenarios
+9. Build the internal adoption grid and the national biofortified maize land share at each grid value
+10. Associate the eleven simulation levels with their internal adoption index
+11. Validate the land share scale and report the verification table and curve
+12. Generate saturation diagnostic curves before redistribution
+13. Apply gravity-based redistribution across the eleven simulation levels
+14. Validate production conservation through redistribution
+15. Export market baseline, saturation scenarios, and land share lookup
 
 ## Methodological Notes
+
+**Biofortified Land Share Scale**: The national biofortified maize land share at internal adoption index `p_internal` is `Σ(land_wtcorn_i × r_i(p_internal) × weight_calibrated_i) / Σ(land_wtcorn_i × weight_calibrated_i)`. Numerator and denominator are expressed in manzanas, so the ratio requires no unit conversion. The share is non-decreasing in `p_internal`, equals 0 at `p_internal = 0` (empty adoption pool) and equals 1 at `p_internal = 1` (full adoption).
 
 **Gravity-Based Redistribution**: Surplus production flows from departments with excess to all departments with deficit, weighted proportionally to the deficit at the destination and inversely proportional to the real travel time between departments. The formulation follows Anderson & van Wincoop (2003), analogous to IMPLAN inter-regional commodity flow estimation.
 
 **Travel Time Matrix**: A 22×22 asymmetric matrix of driving times between departmental capitals, computed via OSRM over OpenStreetMap road network data. Asymmetry reflects real directional differences in Guatemala's road infrastructure (terrain gradients, one-way routing, etc.).
 
-**Continuous Adoption Model**: The conversion ratio `r_i(p)` determines the fraction of each farmer's potential biofortified production that is realised at penetration `p`. The model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05.
+**Continuous Adoption Model**: The conversion ratio `r_i(p_internal)` determines the fraction of each farmer's potential biofortified production and maize land that is realised at internal adoption index `p_internal`. The model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05.
 
 # Phase A: Data Loading
 
@@ -154,7 +163,7 @@ df_farmers_raw <- read_parquet(
 
 ## A2. Load Model Configuration for Continuous Adoption Curves
 
-Load the calibrated model configuration from Script 02_05 and extract the six continuous adoption parameters. These parameters govern the sigmoid conversion curves that determine the fraction of biofortified production realised by each farmer at each penetration level.
+Load the calibrated model configuration from Script 02_05 and extract the six continuous adoption parameters. These parameters govern the sigmoid conversion curves that determine the fraction of biofortified production realised by each farmer at each value of the internal adoption index.
 
 ```{r}
 #| label: a2-load-model-config
@@ -415,7 +424,7 @@ rm(df_gravity_off_diag, tbl_gravity_summary)
 
 # Phase B: Baseline Metrics Calculation
 
-This phase calculates departmental baseline metrics required for scenario modeling. All calculations use survey weights to produce population-representative estimates. Biofortified production aggregations apply the continuous adoption model explicitly: at full penetration (`p = 1`), every farmer has `r_i(1) = 1` by construction of the sigmoid curve, so `production_biofortified × weight_calibrated × r_i(1) = production_biofortified × weight_calibrated`. The formulas below include the `r_i(1)` factor for methodological transparency.
+This phase calculates departmental baseline metrics required for scenario modeling. All calculations use survey weights to produce population-representative estimates. Biofortified production aggregations apply the continuous adoption model explicitly: at full adoption (`p_internal = 1`), every farmer has `r_i(1) = 1` by construction of the sigmoid curve, so `production_biofortified × weight_calibrated × r_i(1) = production_biofortified × weight_calibrated`. The formulas below include the `r_i(1)` factor for methodological transparency.
 
 ## B1. Calculate Farmer Totals by Department
 
@@ -438,10 +447,9 @@ svy_farmers <- df_farmers_raw |>
 
 # Calculate farmer counts by department and segment
 df_farmers_by_segment <- svy_farmers |>
-  group_by(departamento, segment_final) |>
   summarise(
     n_farmers = survey_total(vartype = NULL, na.rm = TRUE),
-    .groups = "drop"
+    .by = c(departamento, segment_final)
   ) |>
   as_tibble()
 
@@ -486,10 +494,9 @@ Calculate total maize cultivation area by department and segment. Land is measur
 
 # Calculate land by department and segment
 df_land_by_segment <- svy_farmers |>
-  group_by(departamento, segment_final) |>
   summarise(
     land_mz = survey_total(land_wtcorn, vartype = NULL, na.rm = TRUE),
-    .groups = "drop"
+    .by = c(departamento, segment_final)
   ) |>
   as_tibble()
 
@@ -566,10 +573,9 @@ svy_individuals <- df_individuals_raw |>
 
 # Calculate population by department
 df_population_by_dept <- svy_individuals |>
-  group_by(departamento) |>
   summarise(
     population = survey_total(vartype = NULL, na.rm = TRUE),
-    .groups = "drop"
+    .by = departamento
   ) |>
   as_tibble()
 
@@ -591,7 +597,7 @@ rm(df_population_by_dept, CONSUMPTION_HUMAN_KG, CONSUMPTION_FSI_KG, KG_TO_QQ)
 
 ## B4. Calculate Maximum Current Production by Department
 
-Calculate the maximum current maize production capacity by department if all farmers continue with their current practices. This represents the baseline production scenario (penetration = 0%).
+Calculate the maximum current maize production capacity by department if all farmers continue with their current practices. This represents the baseline production scenario (0% biofortified maize land).
 
 ```{r}
 #| label: b4-current-production
@@ -602,14 +608,13 @@ Calculate the maximum current maize production capacity by department if all far
 
 # Calculate current production totals by department
 df_baseline_current_prod <- svy_farmers |>
-  group_by(departamento) |>
   summarise(
     current_production_qq = survey_total(
       total_production,
       vartype = NULL,
       na.rm = TRUE
     ),
-    .groups = "drop"
+    .by = departamento
   ) |>
   as_tibble() |>
   mutate(
@@ -619,7 +624,7 @@ df_baseline_current_prod <- svy_farmers |>
 
 ## B5. Calculate Maximum Biofortified Production by Department
 
-Calculate the maximum potential biofortified maize production by department at full adoption. This represents the ceiling scenario (penetration = 100%), where every farmer has `r_i(1) = 1` by the convergence property of the sigmoid curve, so the effective biofortified production equals `production_biofortified × weight_calibrated × 1`.
+Calculate the maximum potential biofortified maize production by department at full adoption. This represents the ceiling scenario (100% biofortified maize land), where every farmer has `r_i(1) = 1` by the convergence property of the sigmoid curve, so the effective biofortified production equals `production_biofortified × weight_calibrated × 1`.
 
 ```{r}
 #| label: b5-biofortified-production
@@ -636,14 +641,13 @@ Calculate the maximum potential biofortified maize production by department at f
 
 # Calculate biofortified production totals by department
 df_baseline_bio_prod <- svy_farmers |>
-  group_by(departamento) |>
   summarise(
     max_bio_production_qq = survey_total(
       production_biofortified,
       vartype = NULL,
       na.rm = TRUE
     ),
-    .groups = "drop"
+    .by = departamento
   ) |>
   as_tibble() |>
   mutate(
@@ -812,41 +816,511 @@ rm(tbl_baseline_summary)
 
 ---
 
-# Phase C: Redistribution Infrastructure & Validation
+# Phase C: Biofortified Land Share Scale
 
-## C1. Saturation Analysis Before Redistribution
+This phase establishes the scale on which the eleven simulation levels are defined. The simulation presents `penetration` as the national share of maize land cultivated with biofortified seed. The continuous adoption model operates on the internal adoption index `p_internal`, the position along the production-weighted adoption ranking defined in Script 02_06. A fine internal grid maps the continuous adoption index to the resulting national biofortified land share, and each simulation level is associated with the value of `p_internal` whose biofortified land share is closest to its target.
 
-This section generates departmental coverage curves across penetration levels (0-100%) using the continuous adoption model.
+The association is specific to each seed × subsidy combination, since the adoption ranking and the per-farmer entry points depend on the economic scenario. The computation relies exclusively on farmer-level adoption parameters and precedes the gravity-based redistribution, which is evaluated only at the eleven associated values of `p_internal`.
 
-At each national penetration level `p`, every farmer with `p_entry <= p` is in the adoption pool. The effective biofortified production of farmer `i` at penetration `p` is `production_biofortified_i × weight_calibrated_i × r_i(p)`, where `r_i(p) = apply_adoption_curve(p, p_entry_i, profile_i, ...)` is the profile-specific sigmoid conversion ratio. Departmental biofortified production is the sum of these effective contributions across all admitted farmers in that department.
+## C1. Internal Adoption Grid
 
-This approach reflects realistic adoption patterns where early adopters are not uniformly distributed across departments, and where each farmer's conversion intensity varies by their behavioural profile and position along the penetration curve.
+The grid evaluates the internal adoption index at 10,001 equally spaced values between 0 and 1 (step 0.0001). At each grid value, farmers with `p_entry <= p_internal` form the adoption pool, and each admitted farmer converts `land_wtcorn_i × r_i(p_internal)` manzanas of maize land to biofortified seed. The value `p_internal = 0` denotes the empty adoption pool. The national biofortified maize land share at each grid value is:
+
+`land_share(p_internal) = Σ(land_wtcorn_i × r_i(p_internal) × weight_calibrated_i) / Σ(land_wtcorn_i × weight_calibrated_i)`
+
+Numerator and denominator are expressed in manzanas, so the share requires no unit conversion. The denominator is the national maize land and is computed once for the whole grid.
+
+The resulting table `df_penetration_grid` contains, for each grid value, the internal adoption index (`p_internal`), the biofortified maize land (`land_bio`), the national maize land (`land_total`), and the biofortified land share as a proportion (`land_share`) and as a percentage (`land_pct`).
 
 ```{r}
-#| label: c1-saturation-data
+#| label: c1-land-share-grid
 
 # =============================================================================
-# C1. Generate Saturation Data - Before Redistribution (Continuous Adoption)
+# C1. Build Internal Adoption Grid and National Biofortified Land Share
+# =============================================================================
+
+# Grid resolution: 10,000 equal intervals on [0, 1]. Integer division keeps
+# both endpoints exactly at 0 and 1.
+GRID_N_INTERVALS <- 10000
+
+p_internal_grid <- (0:GRID_N_INTERVALS) / GRID_N_INTERVALS
+
+# Farmer-level adoption inputs (vectors reused at every grid value)
+farmer_p_entry   <- df_farmers_raw$p_entry
+farmer_profile   <- df_farmers_raw$profile
+farmer_land_mz   <- df_farmers_raw$land_wtcorn
+farmer_weight    <- df_farmers_raw$weight_calibrated
+
+# National maize land in manzanas (denominator, constant across the grid)
+land_total_mz <- sum(farmer_land_mz * farmer_weight, na.rm = TRUE)
+
+# Biofortified maize land at each value of the internal adoption index
+land_bio_grid <- map_dbl(
+  p_internal_grid,
+  function(p_int) {
+
+    # Farmers in the adoption pool at this internal adoption index
+    # (p_internal = 0 denotes the empty adoption pool)
+    is_admitted <- farmer_p_entry <= p_int & p_int > 0
+
+    # Per-farmer conversion ratio r_i(p_internal)
+    r_i <- apply_adoption_curve(p_int,
+                                farmer_p_entry[is_admitted],
+                                farmer_profile[is_admitted],
+                                floor_S, floor_M, floor_L,
+                                k_S, k_M, k_L)
+
+    # Weighted biofortified maize land (manzanas)
+    sum(farmer_land_mz[is_admitted] * r_i * farmer_weight[is_admitted],
+        na.rm = TRUE)
+  },
+  .progress = TRUE
+)
+
+# Complete equivalence table: internal adoption index -> biofortified land share
+df_penetration_grid <- tibble(
+  p_internal = p_internal_grid,
+  land_bio   = land_bio_grid
+) |>
+  mutate(
+    land_total = land_total_mz,
+    land_share = land_bio / land_total,
+    land_pct   = land_share * 100
+  ) |>
+  arrange(p_internal)
+
+# Clean up
+rm(GRID_N_INTERVALS, p_internal_grid, farmer_p_entry, farmer_profile,
+   farmer_land_mz, farmer_weight, land_total_mz, land_bio_grid)
+```
+
+## C2. Simulation Level Association
+
+The eleven simulation levels correspond to national biofortified maize land targets from 0% to 100% in 10-percentage-point increments. For each target, the association selects the grid value of `p_internal` whose biofortified land share is closest to the target; among grid values at equal distance, the lowest internal adoption index is selected. The endpoints are fixed explicitly: the 0% level corresponds to `p_internal = 0` (empty adoption pool) and the 100% level corresponds to `p_internal = 1` (full adoption, with `r_i(1) = 1` for every farmer).
+
+The resulting table `df_penetration_lookup` separates the two values used by the simulation: `penetration` is the external level that labels every output, and `p_internal` is the internal value at which all farmer-level adoption calculations are evaluated. The table also records the biofortified land achieved at `p_internal` and the association error, both as a proportion (`error`) and in percentage points (`error_pp`).
+
+```{r}
+#| label: c2-penetration-lookup
+
+# =============================================================================
+# C2. Associate Simulation Levels with the Internal Adoption Index
+# =============================================================================
+
+# External simulation levels: national biofortified maize land share targets
+penetration_targets <- seq(0, 1, by = 0.10)
+
+# Nearest grid value for each target (lowest index among equal distances)
+nearest_grid_index <- map_int(
+  penetration_targets,
+  ~ which.min(abs(df_penetration_grid$land_share - .x))
+)
+
+# Lookup table: external simulation level -> internal adoption index
+df_penetration_lookup <- tibble(
+  penetration        = penetration_targets,
+  nearest_grid_index = nearest_grid_index
+) |>
+  mutate(
+    # Endpoints fixed explicitly: first grid value (empty adoption pool) and
+    # last grid value (full adoption)
+    grid_index = case_when(
+      near(penetration, 0) ~ 1L,
+      near(penetration, 1) ~ nrow(df_penetration_grid),
+      TRUE                 ~ nearest_grid_index
+    ),
+    p_internal          = df_penetration_grid$p_internal[grid_index],
+    land_bio            = df_penetration_grid$land_bio[grid_index],
+    land_total          = df_penetration_grid$land_total[grid_index],
+    land_share_achieved = df_penetration_grid$land_share[grid_index],
+    land_pct_achieved   = land_share_achieved * 100,
+    error               = land_share_achieved - penetration,
+    error_pp            = error * 100
+  ) |>
+  select(penetration, p_internal, land_bio, land_total,
+         land_share_achieved, land_pct_achieved, error, error_pp)
+
+# Clean up
+rm(nearest_grid_index)
+```
+
+## C3. Land Share Scale Validation
+
+The checks below confirm the integrity of the grid and of the simulation level association before the simulation proceeds. The grid covers [0, 1] in strictly increasing order without missing values, and its biofortified land share lies within [0, 1] and is non-decreasing along the internal adoption index; plateaus are admissible. The lookup contains exactly the eleven simulation levels, with a non-decreasing internal adoption index and achieved land share, the 0% level anchored at the empty adoption pool, the 100% level anchored at full adoption with a land share equal to 1 within the association tolerance, and an association error within 0.25 percentage points. A farmer whose entry point equals 1, at the very end of the ranking, stays at the profile floor at `p_internal = 1` through the numerical guard of `sigmoid_curve()`, so the full land share holds up to a deviation of the order of 10⁻⁷. The script halts if any check fails.
+
+```{r}
+#| label: tbl-c3-scale-validation
+#| tbl-cap: "Biofortified land share scale validation (grid and simulation level association)"
+
+# =============================================================================
+# C3. Validate Biofortified Land Share Scale
+# =============================================================================
+
+# Tolerances
+NUMERIC_TOLERANCE   <- 1e-9   # Floating-point tolerance for bounds and order
+LOOKUP_TOLERANCE_PP <- 0.25   # Maximum association error (percentage points)
+
+# Grid variables required by the association
+grid_required_vars <- df_penetration_grid |>
+  select(p_internal, land_bio, land_total, land_share, land_pct)
+
+# Steps between consecutive values
+grid_land_share_steps   <- diff(df_penetration_grid$land_share)
+lookup_p_internal_steps <- diff(df_penetration_lookup$p_internal)
+lookup_land_share_steps <- diff(df_penetration_lookup$land_share_achieved)
+
+# Endpoint rows of the lookup
+lookup_first <- slice_head(df_penetration_lookup, n = 1)
+lookup_last  <- slice_tail(df_penetration_lookup, n = 1)
+
+# Maximum absolute association error
+max_abs_error_pp <- max(abs(df_penetration_lookup$error_pp))
+
+# Validation table
+tbl_scale_validation <- tibble(
+  scope = c(rep("Grid", 5), rep("Lookup", 7)),
+  check = c(
+    "Internal adoption index within [0, 1]",
+    "Internal adoption index in strictly increasing order",
+    "No missing values in grid variables",
+    "Biofortified land share within [0, 1]",
+    "Biofortified land share non-decreasing (plateaus admissible)",
+    "Exactly 11 simulation levels",
+    "Simulation levels equal to 0, 0.1, ..., 1",
+    "Internal adoption index non-decreasing across levels",
+    "Achieved land share non-decreasing across levels",
+    "0% level at the empty adoption pool (p_internal = 0, land share = 0)",
+    "100% level at full adoption (p_internal = 1, land share = 1 within association tolerance)",
+    paste0("Maximum association error within ", LOOKUP_TOLERANCE_PP, " pp")
+  ),
+  value = c(
+    sprintf("[%.4f, %.4f]",
+            min(df_penetration_grid$p_internal), max(df_penetration_grid$p_internal)),
+    paste0(format(nrow(df_penetration_grid), big.mark = ","), " grid values"),
+    paste0(sum(is.na(grid_required_vars)), " missing values"),
+    sprintf("[%.6f, %.6f]",
+            min(df_penetration_grid$land_share), max(df_penetration_grid$land_share)),
+    sprintf("Minimum step: %.2e", min(grid_land_share_steps)),
+    paste0(nrow(df_penetration_lookup), " levels"),
+    paste(df_penetration_lookup$penetration, collapse = ", "),
+    sprintf("Minimum step: %.4f", min(lookup_p_internal_steps)),
+    sprintf("Minimum step: %.4f", min(lookup_land_share_steps)),
+    sprintf("p_internal = %.4f; land share = %.6f",
+            lookup_first$p_internal, lookup_first$land_share_achieved),
+    sprintf("p_internal = %.4f; deviation from full land share = %.2e",
+            lookup_last$p_internal, 1 - lookup_last$land_share_achieved),
+    sprintf("%.3f pp", max_abs_error_pp)
+  ),
+  passed = c(
+    all(df_penetration_grid$p_internal >= 0 & df_penetration_grid$p_internal <= 1),
+    !is.unsorted(df_penetration_grid$p_internal, strictly = TRUE),
+    !anyNA(grid_required_vars),
+    all(df_penetration_grid$land_share >= -NUMERIC_TOLERANCE &
+          df_penetration_grid$land_share <= 1 + NUMERIC_TOLERANCE),
+    all(grid_land_share_steps >= -NUMERIC_TOLERANCE),
+    nrow(df_penetration_lookup) == 11,
+    isTRUE(all.equal(df_penetration_lookup$penetration, (0:10) / 10)),
+    all(lookup_p_internal_steps >= 0),
+    all(lookup_land_share_steps >= -NUMERIC_TOLERANCE),
+    lookup_first$p_internal == 0 &&
+      abs(lookup_first$land_share_achieved) <= NUMERIC_TOLERANCE,
+    lookup_last$p_internal == 1 &&
+      abs(lookup_last$land_share_achieved - 1) <= LOOKUP_TOLERANCE_PP / 100,
+    max_abs_error_pp <= LOOKUP_TOLERANCE_PP
+  )
+) |>
+  mutate(status = if_else(passed %in% TRUE, "Pass", "Fail")) |>
+  select(scope, check, value, status)
+
+# Export for web resources
+export(tbl_scale_validation, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c3_scale_validation.rds")))
+
+# Display as GT table
+tbl_scale_validation |>
+  gt() |>
+  tab_header(
+    title = "Biofortified Land Share Scale Validation",
+    subtitle = "Grid integrity, monotonicity, and simulation level association"
+  ) |>
+  cols_label(
+    scope = "Scope",
+    check = "Check",
+    value = "Value",
+    status = "Status"
+  ) |>
+  cols_align(align = "left", columns = c(scope, check, value)) |>
+  cols_align(align = "center", columns = status) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(columns = status, rows = status == "Pass")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = status, rows = status == "Fail")
+  ) |>
+  tab_source_note(
+    source_note = paste0(
+      "Grid: ", format(nrow(df_penetration_grid), big.mark = ","),
+      " values of the internal adoption index on [0, 1]. Numeric tolerance: ",
+      format(NUMERIC_TOLERANCE, scientific = TRUE),
+      ". Association tolerance: ", LOOKUP_TOLERANCE_PP,
+      " pp. The script halts if any check fails."
+    )
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Halt the pipeline if any check fails
+n_failed_checks <- sum(tbl_scale_validation$status == "Fail")
+
+if (n_failed_checks > 0) {
+  stop(sprintf("Phase C halted: %d land share scale check(s) failed.",
+               n_failed_checks))
+}
+
+# Clean up
+rm(NUMERIC_TOLERANCE, LOOKUP_TOLERANCE_PP, grid_required_vars,
+   grid_land_share_steps, lookup_p_internal_steps, lookup_land_share_steps,
+   lookup_first, lookup_last, max_abs_error_pp, n_failed_checks,
+   tbl_scale_validation, penetration_targets)
+```
+
+## C4. Land Share Verification Table
+
+The table reports the eleven simulation levels with the internal adoption index at which each level is evaluated and the national biofortified maize land share achieved at that index. The difference column expresses the association error in percentage points. Biofortified and total maize land are reported in hectares (1 mz = 0.7 ha).
+
+```{r}
+#| label: tbl-c4-land-share-lookup
+#| tbl-cap: "National biofortified maize land share by simulation level"
+
+# =============================================================================
+# C4. Land Share Verification Table
+# =============================================================================
+
+# Prepare table data
+tbl_land_share_lookup <- df_penetration_lookup |>
+  transmute(
+    target_pct    = penetration * 100,
+    p_internal,
+    land_pct_achieved,
+    error_pp,
+    # Convert to hectares (1 mz = 0.7 ha)
+    land_bio_ha   = land_bio * 0.7,
+    land_total_ha = land_total * 0.7
+  )
+
+# Export for web resources
+export(tbl_land_share_lookup, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c4_land_share_lookup.rds")))
+
+# Generate GT table
+tbl_land_share_lookup |>
+  gt() |>
+  tab_header(
+    title = "Biofortified Maize Land Share by Simulation Level",
+    subtitle = paste0("Internal adoption index associated with each national land share target (",
+                      seed_code, ", ", subsidy_label, ")")
+  ) |>
+  cols_label(
+    target_pct = "% Biofortified Maize Land Target",
+    p_internal = "Internal Adoption Index",
+    land_pct_achieved = "% Biofortified Maize Land Achieved",
+    error_pp = "Difference (pp)",
+    land_bio_ha = "Biofortified Land (ha)",
+    land_total_ha = "Total Maize Land (ha)"
+  ) |>
+  cols_align(align = "right", columns = everything()) |>
+  fmt_number(
+    columns = target_pct,
+    decimals = 0,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = p_internal,
+    decimals = 4
+  ) |>
+  fmt_number(
+    columns = land_pct_achieved,
+    decimals = 2,
+    pattern = "{x}%"
+  ) |>
+  fmt_number(
+    columns = error_pp,
+    decimals = 3,
+    force_sign = TRUE
+  ) |>
+  fmt_number(
+    columns = c(land_bio_ha, land_total_ha),
+    use_seps = TRUE,
+    decimals = 0
+  ) |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023 (MAGA-calibrated weights) with continuous adoption parameters from Script 02_05. Internal adoption index = position along the production-weighted adoption ranking (Script 02_06). Land share = Σ(land_wtcorn × r_i × weight_calibrated) / Σ(land_wtcorn × weight_calibrated). Difference = achieved − target, in percentage points."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(10)
+  )
+
+# Clean up
+rm(tbl_land_share_lookup)
+```
+
+## C5. Land Share Curve
+
+The figure displays the national biofortified maize land share along the full internal adoption grid, with the eleven simulation levels overlaid at their associated internal adoption index. Guide lines connect each simulation level to both axes, so the correspondence between the internal adoption index and the land share it represents can be read directly.
+
+```{r}
+#| label: fig-c5-land-share-curve
+#| fig-cap: "National biofortified maize land share by internal adoption index, with the eleven simulation levels"
+#| fig-width: 10
+#| fig-height: 8
+
+# =============================================================================
+# C5. Visualization - Biofortified Land Share Curve
+# =============================================================================
+
+# Curve data: full internal adoption grid
+df_land_share_curve <- df_penetration_grid |>
+  select(p_internal, land_share, land_pct)
+
+# Simulation levels: selected points on the curve
+df_land_share_points <- df_penetration_lookup |>
+  transmute(
+    penetration,
+    p_internal,
+    land_pct_achieved,
+    point_label = paste0(round(penetration * 100), "%"),
+    # Label placement: right of the point at the origin, left elsewhere
+    label_hjust = if_else(near(penetration, 0), -0.4, 1.3)
+  )
+
+# Export for web resources
+export(df_land_share_curve, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_c5_land_share_curve.rds")))
+export(df_land_share_points, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_c5_land_share_points.rds")))
+
+# Main visualization
+ggplot() +
+  # Vertical guide lines (internal adoption index of each level)
+  geom_segment(
+    data = df_land_share_points,
+    aes(x = p_internal * 100, xend = p_internal * 100,
+        y = 0, yend = land_pct_achieved),
+    linetype = "dotted",
+    color = "gray60",
+    linewidth = 0.4
+  ) +
+  # Horizontal guide lines (land share achieved at each level)
+  geom_segment(
+    data = df_land_share_points,
+    aes(x = 0, xend = p_internal * 100,
+        y = land_pct_achieved, yend = land_pct_achieved),
+    linetype = "dotted",
+    color = "gray60",
+    linewidth = 0.4
+  ) +
+  # Land share curve along the internal adoption grid
+  geom_line(
+    data = df_land_share_curve,
+    aes(x = p_internal * 100, y = land_pct),
+    color = "#2E86AB",
+    linewidth = 1
+  ) +
+  # Simulation levels
+  geom_point(
+    data = df_land_share_points,
+    aes(x = p_internal * 100, y = land_pct_achieved),
+    color = "#08306B",
+    size = 3,
+    shape = 16
+  ) +
+  # Labels for simulation levels
+  geom_text(
+    data = df_land_share_points,
+    aes(x = p_internal * 100, y = land_pct_achieved,
+        label = point_label, hjust = label_hjust),
+    vjust = -0.6,
+    size = 3.3,
+    color = "#08306B",
+    fontface = "bold"
+  ) +
+  # Scales
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  # Labels
+  labs(
+    title = "National Biofortified Maize Land Share by Internal Adoption Index",
+    subtitle = paste0("Continuous adoption model — Points mark the eleven simulation levels (",
+                      seed_code, ", ", subsidy_label, ")"),
+    x = "Internal Adoption Index",
+    y = "National Biofortified Maize Land Share"
+  ) +
+  # Theme
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 12),
+    axis.title = element_text(color = "gray40")
+  )
+
+# Clean up
+rm(df_land_share_curve, df_land_share_points)
+```
+
+---
+
+# Phase D: Redistribution Infrastructure & Validation
+
+## D1. Saturation Analysis Before Redistribution
+
+This section generates departmental coverage curves across the eleven simulation levels of national biofortified maize land share (0-100%) using the continuous adoption model.
+
+At each simulation level, farmer-level adoption is evaluated at the associated internal adoption index `p_internal` from Phase C. Every farmer with `p_entry <= p_internal` is in the adoption pool, and the effective biofortified production of farmer `i` is `production_biofortified_i × weight_calibrated_i × r_i(p_internal)`, where `r_i(p_internal) = apply_adoption_curve(p_internal, p_entry_i, profile_i, ...)` is the profile-specific sigmoid conversion ratio. Departmental biofortified production is the sum of these effective contributions across all admitted farmers in that department. Each result row is labelled with the external `penetration` value of its simulation level.
+
+This approach reflects realistic adoption patterns where early adopters are not uniformly distributed across departments, and where each farmer's conversion intensity varies by their behavioural profile and position along the adoption ranking.
+
+```{r}
+#| label: d1-saturation-data
+
+# =============================================================================
+# D1. Generate Saturation Data - Before Redistribution (Continuous Adoption)
 # =============================================================================
 
 # Prepare farmer data with pre-computed base biofortified production
-# (the constant factor that is then scaled by r_i(p) at each penetration level)
+# (the constant factor that is then scaled by r_i(p_internal) at each level)
 df_farmers_prep <- df_farmers_raw |>
   mutate(
     bio_base = production_biofortified * weight_calibrated
   )
 
-# Penetration levels sequence
-penetration_levels <- seq(0, 1, by = 0.10)
+# Simulation levels: external label (penetration) and internal adoption
+# index (p_internal) associated in Phase C
+level_penetration <- df_penetration_lookup$penetration
+level_p_internal  <- df_penetration_lookup$p_internal
 
-# Calculate departmental coverage at each penetration level
-df_saturation_before <- map_dfr(penetration_levels, function(p) {
+# Calculate departmental coverage at each simulation level
+df_saturation_before <- map2_dfr(level_penetration, level_p_internal,
+                                 function(pen, p_int) {
 
-  # Farmers in the adoption pool at this penetration level
+  # Farmers in the adoption pool at this internal adoption index
+  # (p_internal = 0 denotes the empty adoption pool)
   df_admitted <- df_farmers_prep |>
-    filter(p_entry <= p) |>
+    filter(p_entry <= p_int, p_int > 0) |>
     mutate(
-      r_i = apply_adoption_curve(p, p_entry, profile,
+      r_i = apply_adoption_curve(p_int, p_entry, profile,
                                  floor_S, floor_M, floor_L,
                                  k_S, k_M, k_L),
       bio_weighted_p = bio_base * r_i
@@ -867,7 +1341,7 @@ df_saturation_before <- map_dfr(penetration_levels, function(p) {
     left_join(df_bio_by_dept, by = "departamento") |>
     replace_na(list(bio_production_qq = 0, n_adopters = 0)) |>
     mutate(
-      penetration = p,
+      penetration = pen,
       coverage_pct = bio_production_qq / consumption_fsi_qq * 100,
       is_saturated = coverage_pct >= 100
     ) |>
@@ -877,14 +1351,14 @@ df_saturation_before <- map_dfr(penetration_levels, function(p) {
 ```
 
 ```{r}
-#| label: fig-c1-saturation-curves
-#| fig-cap: "Departmental coverage evolution by national penetration level (before redistribution)"
+#| label: fig-d1-saturation-curves
+#| fig-cap: "Departmental coverage evolution by national biofortified maize land share (before redistribution)"
 #| fig-width: 10
 #| fig-height: 8
 #| warning: false
 
 # =============================================================================
-# C1. Visualization - Saturation Curves Before Redistribution
+# D1. Visualization - Saturation Curves Before Redistribution
 # =============================================================================
 
 # Saturation points for annotation
@@ -909,7 +1383,7 @@ df_saturation_plot <- df_saturation_before |>
   )
 
 # Export for web resources
-export(df_saturation_plot, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_c1_saturation_curves.rds")))
+export(df_saturation_plot, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_d1_saturation_curves.rds")))
 
 # Main visualization
 ggplot() +
@@ -976,9 +1450,9 @@ ggplot() +
   ) +
   # Labels
   labs(
-    title = "Departmental Coverage by National Penetration Level",
+    title = "Departmental Coverage by National Biofortified Maize Land Share",
     subtitle = "Before excess redistribution \u2014 Gray lines show non-saturating departments",
-    x = "National Penetration Level",
+    x = "National Biofortified Maize Land Share",
     y = "Departmental Coverage",
     color = "Saturating\nDepartments"
   ) +
@@ -998,28 +1472,30 @@ ggplot() +
 rm(df_saturation_points, dept_colors, df_saturation_plot)
 ```
 
-## C2. Apply Gravity-Based Redistribution
+## D2. Apply Gravity-Based Redistribution
 
-This section applies the gravity-based redistribution model to calculate departmental coverage at each penetration level. For each level, the biofortified production is calculated using the continuous adoption model (`r_i(p)` per farmer), then surplus is redistributed through the gravity-weighted network to all deficit departments.
+This section applies the gravity-based redistribution model to calculate departmental coverage at each simulation level. For each level, the biofortified production is calculated using the continuous adoption model evaluated at the associated internal adoption index (`r_i(p_internal)` per farmer), then surplus is redistributed through the gravity-weighted network to all deficit departments.
 
 The gravity model distributes surplus from each donor department to all receivers, weighted by `w(i,j) × deficit_j`, where `w(i,j) = 1 / travel_time(i→j)²`.
 
 ```{r}
-#| label: c2-gravity-redistribution
+#| label: d2-gravity-redistribution
 
 # =============================================================================
-# C2. Apply Gravity-Based Redistribution Across Penetration Levels
+# D2. Apply Gravity-Based Redistribution Across Simulation Levels
 #     (Continuous Adoption Model)
 # =============================================================================
 
 # Calculate departmental coverage WITH gravity redistribution at each level
-df_saturation_after <- map_dfr(penetration_levels, function(p) {
+df_saturation_redistributed <- map2_dfr(level_penetration, level_p_internal,
+                                        function(pen, p_int) {
 
-  # Farmers in the adoption pool at this penetration level
+  # Farmers in the adoption pool at this internal adoption index
+  # (p_internal = 0 denotes the empty adoption pool)
   df_admitted <- df_farmers_prep |>
-    filter(p_entry <= p) |>
+    filter(p_entry <= p_int, p_int > 0) |>
     mutate(
-      r_i = apply_adoption_curve(p, p_entry, profile,
+      r_i = apply_adoption_curve(p_int, p_entry, profile,
                                  floor_S, floor_M, floor_L,
                                  k_S, k_M, k_L),
       bio_weighted_p = bio_base * r_i
@@ -1045,10 +1521,10 @@ df_saturation_after <- map_dfr(penetration_levels, function(p) {
     travel_time_df = df_travel_time
   )
 
-  # Add penetration level and format output
+  # Add external simulation level label and format output
   df_redistributed |>
     mutate(
-      penetration = p,
+      penetration = pen,
       coverage_pct = coverage * 100,
       is_saturated = coverage >= 1
     ) |>
@@ -1057,24 +1533,27 @@ df_saturation_after <- map_dfr(penetration_levels, function(p) {
 })
 
 # Cap coverage at 100% (excess beyond local demand = implicit export)
-df_saturation_after <- df_saturation_after |>
+df_saturation_after <- df_saturation_redistributed |>
   mutate(
     bio_production = pmin(bio_production, annual_consumption),
     coverage_pct = pmin(coverage_pct, 100),
     is_saturated = coverage_pct >= 100
   )
+
+# Clean up
+rm(level_penetration, level_p_internal, df_saturation_redistributed)
 ```
 
-## C3. Production Conservation Validation
+## D3. Production Conservation Validation
 
-Total biofortified production must be conserved through the redistribution process. The check compares total production before and after redistribution at 100% national penetration.
+Total biofortified production must be conserved through the redistribution process. The check compares total production before and after redistribution at 100% national biofortified maize land.
 
 ```{r}
-#| label: tbl-c3-conservation-check
-#| tbl-cap: "Production conservation validation at 100% penetration"
+#| label: tbl-d3-conservation-check
+#| tbl-cap: "Production conservation validation at 100% biofortified maize land"
 
 # =============================================================================
-# C3. Validate Production Conservation
+# D3. Validate Production Conservation
 # =============================================================================
 
 # Total production before redistribution (at 100% penetration)
@@ -1126,13 +1605,13 @@ tbl_conservation_check <- tibble(
 )
 
 # Export for web resources
-export(tbl_conservation_check, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c3_conservation_check.rds")))
+export(tbl_conservation_check, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_d3_conservation_check.rds")))
 
 tbl_conservation_check |>
   gt() |>
   tab_header(
     title = "Production Conservation Check",
-    subtitle = "Validation at 100% national penetration \u2014 gravity redistribution"
+    subtitle = "Validation at 100% national biofortified maize land \u2014 gravity redistribution"
   ) |>
   cols_label(metric = "Metric", value = "Value") |>
   cols_align(align = "left", columns = metric) |>
@@ -1152,18 +1631,18 @@ rm(df_check_uncapped, total_before, total_after_capped,
    tbl_conservation_check)
 ```
 
-## C4. Saturation Order Summary
+## D4. Saturation Order Summary
 
-This table summarizes the penetration level at which each department first reaches 100% coverage after applying the gravity-based redistribution. Departments are ordered by saturation timing.
+This table summarizes the national biofortified maize land share at which each department first reaches 100% coverage after applying the gravity-based redistribution. Departments are ordered by saturation timing.
 
-Departments that do not reach saturation even at 100% national penetration are marked with "\u2014", indicating insufficient production flow through the redistribution network.
+Departments that do not reach saturation even at 100% national biofortified maize land are marked with "\u2014", indicating insufficient production flow through the redistribution network.
 
 ```{r}
-#| label: tbl-c4-saturation-order
-#| tbl-cap: "Departmental saturation order by penetration level (after gravity redistribution)"
+#| label: tbl-d4-saturation-order
+#| tbl-cap: "Departmental saturation order by national biofortified maize land share (after gravity redistribution)"
 
 # =============================================================================
-# C4. Saturation Order Table (After Redistribution)
+# D4. Saturation Order Table (After Redistribution)
 # =============================================================================
 
 # Identify first saturation point per department
@@ -1189,14 +1668,14 @@ tbl_saturation_order <- df_market_baseline |>
   select(rank, departamento, saturation_display)
 
 # Export for web resources
-export(tbl_saturation_order, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c4_saturation_order.rds")))
+export(tbl_saturation_order, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_d4_saturation_order.rds")))
 
 # Generate GT table
 tbl_saturation_order |>
   gt() |>
   tab_header(
     title = "Departmental Saturation Order",
-    subtitle = "Penetration level at which each department reaches 100% coverage (after gravity redistribution)"
+    subtitle = "National biofortified maize land share at which each department reaches 100% coverage (after gravity redistribution)"
   ) |>
   cols_label(
     rank = "Order",
@@ -1236,18 +1715,18 @@ rm(df_saturation_order, tbl_saturation_order)
 ```
 
 
-## C5. Saturation Curves After Redistribution
+## D5. Saturation Curves After Redistribution
 
-This section visualizes departmental coverage evolution after applying the gravity-based redistribution. Compared to the pre-redistribution curves (C1), departments that previously never reached 100% coverage should now show improved trajectories as they receive surplus from producing departments, weighted by geographic proximity.
+This section visualizes departmental coverage evolution after applying the gravity-based redistribution. Compared to the pre-redistribution curves (D1), departments that previously never reached 100% coverage should now show improved trajectories as they receive surplus from producing departments, weighted by geographic proximity.
 
 ```{r}
-#| label: fig-c5-saturation-after
-#| fig-cap: "Departmental coverage evolution by national penetration level (after gravity redistribution)"
+#| label: fig-d5-saturation-after
+#| fig-cap: "Departmental coverage evolution by national biofortified maize land share (after gravity redistribution)"
 #| fig-width: 10
 #| fig-height: 8
 
 # =============================================================================
-# C5. Visualization - Saturation Curves After Redistribution
+# D5. Visualization - Saturation Curves After Redistribution
 # =============================================================================
 
 # Identify saturation points (first penetration where coverage >= 100%)
@@ -1288,7 +1767,7 @@ df_plot_after <- df_saturation_after |>
   )
 
 # Export for web resources
-export(df_plot_after, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_c5_saturation_after.rds")))
+export(df_plot_after, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_fig_d5_saturation_after.rds")))
 
 # Main visualization
 ggplot() +
@@ -1345,10 +1824,10 @@ ggplot() +
   ) +
   # Labels
   labs(
-    title = "Departmental Coverage by National Penetration Level",
+    title = "Departmental Coverage by National Biofortified Maize Land Share",
     subtitle = paste0("After gravity-based redistribution \u2014 ", n_saturating,
                       " departments reach 100% coverage"),
-    x = "National Penetration Level",
+    x = "National Biofortified Maize Land Share",
     y = "Departmental Coverage",
     color = "Saturating Departments\n(dark = earlier saturation)"
   ) +
@@ -1373,16 +1852,16 @@ rm(df_saturation_points_after, saturating_depts_ordered, non_saturating_depts_or
    blue_palette, gray_palette, full_palette, df_plot_after, n_saturating, n_non_saturating)
 ```
 
-## C6. Market Metrics After Redistribution
+## D6. Market Metrics After Redistribution
 
-This table presents the final departmental metrics at 100% national penetration after applying the gravity-based redistribution. It validates that total production is conserved through the redistribution process and shows the final coverage achieved by each department.
+This table presents the final departmental metrics at 100% national biofortified maize land after applying the gravity-based redistribution. It validates that total production is conserved through the redistribution process and shows the final coverage achieved by each department.
 
 ```{r}
-#| label: tbl-c6-market-metrics-after
-#| tbl-cap: "Departmental market metrics at 100% penetration (after gravity redistribution)"
+#| label: tbl-d6-market-metrics-after
+#| tbl-cap: "Departmental market metrics at 100% biofortified maize land (after gravity redistribution)"
 
 # =============================================================================
-# C6. Market Metrics After Redistribution
+# D6. Market Metrics After Redistribution
 # =============================================================================
 
 # Extract data at 100% penetration
@@ -1417,14 +1896,14 @@ tbl_metrics_comparison <- df_market_baseline |>
   )
 
 # Export for web resources
-export(tbl_metrics_comparison, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_c6_market_metrics_after.rds")))
+export(tbl_metrics_comparison, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_d6_market_metrics_after.rds")))
 
 # Generate GT table
 tbl_metrics_comparison |>
   gt() |>
   tab_header(
     title = "Departmental Market Metrics Comparison",
-    subtitle = "Before vs. after gravity redistribution at 100% national penetration"
+    subtitle = "Before vs. after gravity redistribution at 100% national biofortified maize land"
   ) |>
   cols_label(
     departamento = "Department",
@@ -1506,56 +1985,198 @@ rm(df_metrics_after, tbl_metrics_comparison)
 
 ---
 
-# Phase D: Export
+# Phase E: Output Validation and Export
 
-## D1. Export Market Baseline
+## E1. Output Compatibility Validation
+
+The market baseline and the saturation scenarios form the data contract consumed by the downstream scenario scripts (06_02 and 06_03). The checks below confirm, before any file is written, that the saturation scenarios keep the expected column names, order, and types, that `penetration` contains exclusively the eleven simulation levels, and that all 22 departments are present in the market baseline and at every simulation level. Production conservation through redistribution is validated in D3. The script halts if any check fails.
+
+```{r}
+#| label: tbl-e1-output-compatibility
+#| tbl-cap: "Output compatibility validation for downstream scenario scripts"
+
+# =============================================================================
+# E1. Validate Output Compatibility
+# =============================================================================
+
+# Expected contract of the saturation scenarios parquet
+expected_columns <- c("departamento", "penetration", "bio_production_qq",
+                      "annual_consumption_qq", "coverage_pct", "is_saturated")
+expected_types   <- c("character", "numeric", "numeric",
+                      "numeric", "numeric", "logical")
+expected_levels  <- seq(0, 1, by = 0.10)
+expected_n_depts <- length(dept_order)
+
+# Market baseline in export format
+df_market_baseline_export <- df_market_baseline |>
+  mutate(departamento = as.character(departamento))
+
+# Saturation scenarios in export format
+df_saturation_export <- df_saturation_after |>
+  mutate(departamento = as.character(departamento)) |>
+  select(departamento, penetration, bio_production_qq = bio_production,
+         annual_consumption_qq = annual_consumption, coverage_pct, is_saturated)
+
+# Column types of the saturation scenarios
+export_types <- map_chr(df_saturation_export, ~ class(.x)[1])
+
+# Departments present at each simulation level
+df_depts_per_level <- df_saturation_export |>
+  summarise(
+    n_depts = n_distinct(departamento),
+    .by = penetration
+  )
+
+# Validation table
+tbl_output_compatibility <- tibble(
+  output = c(rep("Saturation scenarios", 5), "Market baseline"),
+  check = c(
+    "Column names and order match the downstream contract",
+    "Column types match the downstream contract",
+    "Simulation levels equal to 0, 0.1, ..., 1",
+    "All departments present at every simulation level",
+    "One row per department and simulation level",
+    "All departments present, one row per department"
+  ),
+  value = c(
+    paste(names(df_saturation_export), collapse = ", "),
+    paste(export_types, collapse = ", "),
+    paste(sort(unique(df_saturation_export$penetration)), collapse = ", "),
+    paste0(min(df_depts_per_level$n_depts), "–",
+           max(df_depts_per_level$n_depts), " departments per level"),
+    paste0(format(nrow(df_saturation_export), big.mark = ","), " rows"),
+    paste0(n_distinct(df_market_baseline_export$departamento), " departments, ",
+           nrow(df_market_baseline_export), " rows")
+  ),
+  passed = c(
+    identical(names(df_saturation_export), expected_columns),
+    identical(unname(export_types), expected_types),
+    identical(sort(unique(df_saturation_export$penetration)), expected_levels),
+    nrow(df_depts_per_level) == length(expected_levels) &&
+      all(df_depts_per_level$n_depts == expected_n_depts) &&
+      setequal(df_saturation_export$departamento,
+               df_market_baseline_export$departamento),
+    nrow(df_saturation_export) == expected_n_depts * length(expected_levels) &&
+      nrow(distinct(df_saturation_export, departamento, penetration)) ==
+        nrow(df_saturation_export),
+    n_distinct(df_market_baseline_export$departamento) == expected_n_depts &&
+      nrow(df_market_baseline_export) == expected_n_depts
+  )
+) |>
+  mutate(status = if_else(passed %in% TRUE, "Pass", "Fail")) |>
+  select(output, check, value, status)
+
+# Export for web resources
+export(tbl_output_compatibility, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_e1_output_compatibility.rds")))
+
+# Display as GT table
+tbl_output_compatibility |>
+  gt() |>
+  tab_header(
+    title = "Output Compatibility Check",
+    subtitle = "Data contract of the market baseline and saturation scenarios"
+  ) |>
+  cols_label(
+    output = "Output",
+    check = "Check",
+    value = "Value",
+    status = "Status"
+  ) |>
+  cols_align(align = "left", columns = c(output, check, value)) |>
+  cols_align(align = "center", columns = status) |>
+  tab_style(
+    style = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(columns = status, rows = status == "Pass")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(columns = status, rows = status == "Fail")
+  ) |>
+  tab_source_note(
+    source_note = "Contract consumed by Scripts 06_02 and 06_03. Production conservation through redistribution is validated in D3. The script halts if any check fails."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Halt the pipeline if any check fails
+n_failed_checks <- sum(tbl_output_compatibility$status == "Fail")
+
+if (n_failed_checks > 0) {
+  stop(sprintf("Phase E halted: %d output compatibility check(s) failed.",
+               n_failed_checks))
+}
+
+# Clean up
+rm(expected_columns, expected_types, expected_levels, expected_n_depts,
+   export_types, df_depts_per_level, n_failed_checks, tbl_output_compatibility)
+```
+
+## E2. Export Market Baseline
 
 This section exports the departmental market baseline metrics for use in downstream scenario analysis. The baseline contains static departmental characteristics: farmer counts, land area, consumption demand, and maximum biofortified production capacity.
 
 ```{r}
-#| label: d1-export-baseline
+#| label: e2-export-baseline
 
 # =============================================================================
-# D1. Export Market Baseline
+# E2. Export Market Baseline
 # =============================================================================
 
 write_parquet(
-  df_market_baseline |> mutate(departamento = as.character(departamento)),
+  df_market_baseline_export,
   here("01_data", "02_processed",
        "scenarios", paste0(file_prefix, "_market_baseline.parquet"))
 )
 ```
 
-## D2. Export Saturation Scenarios
+## E3. Export Saturation Scenarios
 
-This section exports the pre-calculated departmental coverage across all penetration levels (0-100%) with gravity-based redistribution already applied, so the redistribution is not recalculated during scenario simulation.
+This section exports the pre-calculated departmental coverage at the eleven simulation levels of national biofortified maize land share (0-100%) with gravity-based redistribution already applied, so the redistribution is not recalculated during scenario simulation.
 
-Each row represents a department × penetration level combination with the final biofortified production available after network redistribution.
+Each row represents a department × simulation level combination, labelled with the external `penetration` value, with the final biofortified production available after network redistribution.
 
 ```{r}
-#| label: d2-export-scenarios
+#| label: e3-export-scenarios
 
 # =============================================================================
-# D2. Export Saturation Scenarios
+# E3. Export Saturation Scenarios
 # =============================================================================
 
 write_parquet(
-  df_saturation_after |>
-    mutate(departamento = as.character(departamento)) |>
-    select(departamento, penetration, bio_production_qq = bio_production,
-           annual_consumption_qq = annual_consumption, coverage_pct, is_saturated),
+  df_saturation_export,
   here("01_data", "02_processed",
        "scenarios", paste0(file_prefix, "_saturation_scenarios.parquet"))
 )
 ```
 
+## E4. Export Land Share Lookup
+
+This section exports the association between each simulation level and its internal adoption index. Each row contains the external `penetration` value, the internal adoption index `p_internal` at which farmer-level adoption is evaluated, the biofortified and total maize land (manzanas), and the land share achieved together with its association error. Downstream scenario scripts read `p_internal` from this table to evaluate farmer-level adoption consistently with the departmental coverage stored in the saturation scenarios.
+
+```{r}
+#| label: e4-export-lookup
+
+# =============================================================================
+# E4. Export Land Share Lookup
+# =============================================================================
+
+write_parquet(
+  df_penetration_lookup,
+  here("01_data", "02_processed",
+       "scenarios", paste0(file_prefix, "_penetration_lookup.parquet"))
+)
+```
+
 # Notes
 
-This script corresponds to the **`r paste0("Seed ", seed_year, " (", seed_code, ")")`** seed variant under the **`r subsidy_label`** subsidy regime. The yield change factors applied to farmers in the upstream economic impact calculation (Script `r paste0("02_04_", seed_suffix, "_", subsidy_suffix)`) determine the `production_biofortified` values used here, and the Likely Adopters score (Script `r paste0("02_06_", seed_suffix, "_", subsidy_suffix)`) determines the order in which farmers enter the adoption pool along the penetration curve.
+This script corresponds to the **`r paste0("Seed ", seed_year, " (", seed_code, ")")`** seed variant under the **`r subsidy_label`** subsidy regime. The yield change factors applied to farmers in the upstream economic impact calculation (Script `r paste0("02_04_", seed_suffix, "_", subsidy_suffix)`) determine the `production_biofortified` values used here, and the Likely Adopters score (Script `r paste0("02_06_", seed_suffix, "_", subsidy_suffix)`) determines the order in which farmers enter the adoption pool along the internal adoption index. The association between the eleven simulation levels of national biofortified maize land share and the internal adoption index is specific to this seed-by-subsidy combination.
 
 The continuous adoption model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05. These parameters are invariant across the nine seed-by-subsidy combinations: the calibration is performed once on the s22 + sub00 baseline configuration and applied identically to all combinations.
 
-The two outputs differ in their sensitivity to the subsidy regime: the structural baseline (`market_baseline.parquet`) is invariant across regimes for a given seed — consumption demand, farmer counts, land area, and maximum biofortified production capacity depend only on physical and demographic quantities. The saturation scenarios (`saturation_scenarios.parquet`) are subsidy-sensitive at intermediate penetration levels because the adoption-order ranking is driven by an economic score that responds to the subsidy regime; both endpoints (0% and 100% penetration) converge across regimes by construction, since at 0% no farmer is admitted and at 100% every farmer has `r_i(1) = 1`.
+The outputs differ in their sensitivity to the subsidy regime: the structural baseline (`market_baseline.parquet`) is invariant across regimes for a given seed — consumption demand, farmer counts, land area, and maximum biofortified production capacity depend only on physical and demographic quantities. The saturation scenarios (`saturation_scenarios.parquet`) and the land share lookup (`penetration_lookup.parquet`) are subsidy-sensitive at intermediate simulation levels because the adoption-order ranking is driven by an economic score that responds to the subsidy regime; both endpoints (0% and 100% biofortified maize land) converge across regimes by construction, since at 0% the adoption pool is empty and at 100% every farmer has `r_i(1) = 1`.
 
 ## Methodological Assumptions
 
@@ -1567,17 +2188,19 @@ The gravity-based redistribution model incorporates the following assumptions:
 
    All coverage calculations use the **FSI estimate** as the denominator, since biofortified production must satisfy total domestic demand, not just direct human consumption.
 
-2. **Continuous adoption model**: Each farmer's effective biofortified production at national penetration `p` is `production_biofortified × r_i(p)`, where `r_i(p)` is a profile-specific sigmoid conversion ratio. The conversion ratio equals the profile floor at entry (`p = p_entry`) and converges to 1 at full penetration (`p = 1`) by construction. The three behavioural profiles (S, M, L) capture distinct adoption intensities: near-binary for small farmers, gradual for large farmers.
+2. **Continuous adoption model**: Each farmer's effective biofortified production at internal adoption index `p_internal` is `production_biofortified × r_i(p_internal)`, where `r_i(p_internal)` is a profile-specific sigmoid conversion ratio. The conversion ratio equals the profile floor at entry (`p_internal = p_entry`) and converges to 1 at full adoption (`p_internal = 1`) by construction. The three behavioural profiles (S, M, L) capture distinct adoption intensities: near-binary for small farmers, gradual for large farmers.
 
-3. **Gravity-weighted redistribution**: Surplus flows from each donor to all deficit departments, weighted by `w(i,j) × deficit_j / Σ_k(w(i,k) × deficit_k)`, where `w(i,j) = 1 / travel_time(i→j)²`. The travel time matrix is asymmetric by design, reflecting real directional differences in Guatemala's road infrastructure.
+3. **Biofortified land share scale**: Simulation levels are defined as national shares of maize land cultivated with biofortified seed, from 0% to 100% in 10-percentage-point increments. Each level is evaluated at the internal adoption index whose land share is nearest to the target on a grid of 10,001 values, with an association error within 0.25 percentage points. The 0% level corresponds to the empty adoption pool and the 100% level to full adoption.
 
-4. **Iterative convergence**: Redistribution proceeds in passes until total redistributable excess falls below 1 quintal. Departments that receive more than their deficit in one pass become donors in the next.
+4. **Gravity-weighted redistribution**: Surplus flows from each donor to all deficit departments, weighted by `w(i,j) × deficit_j / Σ_k(w(i,k) × deficit_k)`, where `w(i,j) = 1 / travel_time(i→j)²`. The travel time matrix is asymmetric by design, reflecting real directional differences in Guatemala's road infrastructure.
 
-5. **No transport costs**: The gravity model determines flow patterns but does not deduct transport costs from production volumes.
+5. **Iterative convergence**: Redistribution proceeds in passes until total redistributable excess falls below 1 quintal. Departments that receive more than their deficit in one pass become donors in the next.
 
-6. **No intermediaries**: Direct department-to-department flow without wholesale market hubs.
+6. **No transport costs**: The gravity model determines flow patterns but does not deduct transport costs from production volumes.
 
-7. **Capped coverage**: Departmental coverage is capped at 100%; excess beyond local demand represents implicit export outside the modeled system.
+7. **No intermediaries**: Direct department-to-department flow without wholesale market hubs.
+
+8. **Capped coverage**: Departmental coverage is capped at 100%; excess beyond local demand represents implicit export outside the modeled system.
 
 ## References
 

@@ -1032,7 +1032,7 @@ df_farmers_recalculated <- df_farmers_jittered |>
     value_self_consumption_total = value_household + value_animal_seed,
     value_total_economic = revenue + value_self_consumption_total,
     
-    # Solo asegurar NA para non-sellers (el jitter puede haber introducido valores)
+    # Ensure NA for non-sellers only (the jitter may have introduced values)
     price_per_qq = if_else(is_seller == 0, NA_real_, price_per_qq),
     
     # Allocation percentages

@@ -1,6 +1,7 @@
 ---
 title: "Agricultural Data Preparation"
 subtitle: "Module 2: Economic Impact"
+description-meta: "Standardizing ENCOVI maize farm land units and yields, then treating impossible values and structural missingness with random forest imputation."
 ---
 
 ## Overview

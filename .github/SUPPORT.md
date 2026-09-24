@@ -31,7 +31,7 @@ If you wish to use or adapt this code:
 
 1. Fork the repository
 2. Review [README.md](../README.md) for project overview
-3. Review the [Technical Documentation](https://newseed.azahardata.com/web-guatemala) for methodology details
+3. Review the [Technical Documentation](https://newseed.azahardata.com/web-guatemala/) for methodology details
 4. Consult standard R documentation for technical questions
 
 ## License Reminder

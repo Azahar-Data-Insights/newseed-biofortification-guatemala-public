@@ -1,6 +1,7 @@
 ---
 title: "Estimate Age in Months"
 subtitle: "Module 1: Nutrient Intakes"
+description-meta: "ENCOVI records age in whole years. Synthetic month assignment from INE birth seasonality, quota-matched at population level and validated on siblings."
 ---
 
 ## Why Estimate Age in Months?

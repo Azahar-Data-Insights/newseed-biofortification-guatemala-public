@@ -2,7 +2,7 @@
 # Subsidy Variants Configuration
 # ==============================================================================
 #
-# Single source of truth for seed subsidy parameters used across the NewSeed
+# Single source of truth for seed subsidy parameters used across the New Seed
 # biofortification framework. Consumed by parametrized Quarto scripts and by
 # local and master orchestrators.
 #
@@ -13,8 +13,8 @@
 #   - Seed prices:           conventional and biofortified seed cost (Q/mz) by
 #                            farmer segment, keyed by segment name to decouple
 #                            vector order from the segment_final factor levels.
-#   - NewSeed subsidy:       newseed_subsidy_per_mz, the per-area direct
-#                            financial commitment made by NewSeed under the
+#   - New Seed subsidy:      newseed_subsidy_per_mz, the per-area direct
+#                            financial commitment made by New Seed under the
 #                            active regime.
 #
 # Cost structure under each regime
@@ -23,15 +23,15 @@
 # price (`bio_cost_no_subsidy_per_mz`, top-level constant) and the price
 # effectively paid by the farmer for biofortified seed:
 #
-#   1. NewSeed (subsidy provider): pays `newseed_subsidy_per_mz` per area
+#   1. New Seed (subsidy provider): pays `newseed_subsidy_per_mz` per area
 #      planted by each farmer.
 #   2. Local seed producer (intermediary): absorbs half of the difference
-#      between the current-regime NewSeed subsidy and the active-regime
-#      NewSeed subsidy, via improved producibility.
+#      between the current-regime New Seed subsidy and the active-regime
+#      New Seed subsidy, via improved producibility.
 #   3. Farmer: pays the remaining half through a higher biofortified seed
 #      price relative to the current regime.
 #
-# Under the current regime, NewSeed covers the full gap between the
+# Under the current regime, New Seed covers the full gap between the
 # unsubsidized commercial price and the farmer-facing price; the producer
 # absorbs nothing and the farmer pays the baseline price.
 #
@@ -49,12 +49,12 @@
 # Script 02_03 (farmer segmentation). Any change to segment nomenclature
 # must be reflected here and in the parametrized scripts simultaneously.
 #
-# Source: NewSeed refined seed prices and ex-ante subsidy values
+# Source: New Seed refined seed prices and ex-ante subsidy values
 # (April 2026).
 # ==============================================================================
 
 # Reference unsubsidized biofortified price (Q/mz). Equals the current
-# subsidized farmer price (305) plus the full per-area NewSeed subsidy
+# subsidized farmer price (305) plus the full per-area New Seed subsidy
 # under the current regime (242). Used to compute the absolute monetary
 # value of the subsidy received by the farmer (subsidy_amount_absolute).
 bio_cost_no_subsidy_per_mz: 547

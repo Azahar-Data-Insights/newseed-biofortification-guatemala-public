@@ -16,8 +16,8 @@
 #   - 06_04  Consolidation and overview        (sub-orchestrator, pathway)
 #
 # Dependency chain:
-#   06_01 → 06_02 (needs market_baseline + saturation from 06_01)
-#   06_01 → 06_03 (needs market_baseline + saturation from 06_01)
+#   06_01 → 06_02 (needs market_baseline + saturation + lookup from 06_01)
+#   06_01 → 06_03 (needs market_baseline + saturation + lookup from 06_01)
 #   06_02 → 06_04 (needs departmental parquets from 06_02)
 #   06_03 → 06_04 (needs national parquets from 06_03)
 #
@@ -27,7 +27,7 @@
 #   cores internally.
 #
 # Outputs (under 01_data/02_processed/scenarios/):
-#   - 06_01: 9 market_baseline + 9 saturation_scenarios parquets
+#   - 06_01: 9 market_baseline + 9 saturation_scenarios + 9 penetration_lookup parquets
 #   - 06_02: 18 departmental_scenarios parquets (9 combos x 2 pathways)
 #   - 06_03: 18 national_scenarios parquets (9 combos x 2 pathways)
 #   - 06_04: 2 consolidated_dept + 2 consolidated_nat + 2 overview parquets + 2 CSV
@@ -270,7 +270,7 @@ run_pipeline <- function() {
   # scenarios/); intermediate artefacts (web_resources .rds, HTML
   # renders) are the sub-orchestrator's responsibility.
 
-  # 06_01: 2 parquets per (seed, subsidy) = 9 combos = 18 parquets
+  # 06_01: 3 parquets per (seed, subsidy) = 9 combos = 27 parquets
   outputs_06_01 <- tidyr::expand_grid(
     seed = seed_suffixes,
     sub  = subsidy_suffixes
@@ -278,7 +278,8 @@ run_pipeline <- function() {
     purrr::pmap(function(seed, sub) {
       c(
         file.path(scenario_dir, paste0("06_01_", seed, "_", sub, "_market_baseline.parquet")),
-        file.path(scenario_dir, paste0("06_01_", seed, "_", sub, "_saturation_scenarios.parquet"))
+        file.path(scenario_dir, paste0("06_01_", seed, "_", sub, "_saturation_scenarios.parquet")),
+        file.path(scenario_dir, paste0("06_01_", seed, "_", sub, "_penetration_lookup.parquet"))
       )
     }) |>
     unlist()

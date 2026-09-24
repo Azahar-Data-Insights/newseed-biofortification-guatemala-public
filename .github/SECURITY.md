@@ -41,4 +41,4 @@ There is no commitment to respond to community inquiries. However, critical issu
 
 ## Versions
 
-This public repository starts at v4.0.0. Only the latest release may receive attention for critical issues. Previous releases are archived for reproducibility but will not be updated.
+Only the latest release may receive attention for critical issues. Previous releases are archived for reproducibility but will not be updated.

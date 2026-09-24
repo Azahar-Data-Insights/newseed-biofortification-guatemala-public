@@ -1,6 +1,7 @@
 ---
 title: "Calculating Food Security Scores"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "Rasch model estimation over the FIES items, converting raw affirmative counts into an interval food insecurity score used for stunting prediction."
 ---
 
 ## Overview

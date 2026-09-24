@@ -1,6 +1,7 @@
 ---
 title: "Transfer Model: Tryptophan Intake"
 subtitle: "Module 3: Transfer Models"
+description-meta: "Survey-weighted gamma regression for tryptophan intake, the second amino acid raised by QPM, modeled separately for maize and non-maize sources."
 ---
 
 ## Why Model Tryptophan?

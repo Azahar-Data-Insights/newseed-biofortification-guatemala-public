@@ -1,6 +1,7 @@
 ---
 title: "Calculating Micronutrient Bioavailability"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "Absorbed rather than consumed iron and zinc: Miller equation for zinc by age, and a flat 5% iron absorption justified by plant-dominant diets."
 ---
 
 ## Overview

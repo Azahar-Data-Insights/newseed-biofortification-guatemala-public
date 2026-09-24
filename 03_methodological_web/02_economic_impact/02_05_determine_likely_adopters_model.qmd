@@ -1,6 +1,7 @@
 ---
 title: "Likely Adopters Model Calibration"
 subtitle: "Module 2: Economic Impact"
+description-meta: "Boruta feature selection plus sensitivity sweeps over scoring heuristics, component weights and risk aversion to calibrate a farmer adoption model."
 format:
   html:
     toc-depth: 4
@@ -8,9 +9,9 @@ format:
 
 ## Why Calibrate a Likely Adopters Model?
 
-The economic impact of biofortified maize depends on **which** farmers adopt, not only on **how much** each adopter benefits. Without a model of the adoption process, every farmer would have to be treated as equally likely to adopt, against the empirical evidence that Semilla Nueva's market composition at every observed production coverage level is concentrated in specific farmer profiles.
+The economic impact of biofortified maize depends on **which** farmers adopt, not only on **how much** each adopter benefits. Without a model of the adoption process, every farmer would have to be treated as equally likely to adopt, against the empirical evidence that New Seed's market composition at every observed production coverage level is concentrated in specific farmer profiles.
 
-The Likely Adopters model assigns each farmer a composite score reflecting their expected priority for adoption, and a continuous adoption ratio reflecting the fraction of their white-maize land that they would commit to biofortified seed at any given national production coverage level. The model is **calibrated** rather than fit: its structural parameters are tuned to reproduce five empirical anchors provided by Semilla Nueva (per-segment cohort composition at production coverage levels 5%, 10%, 20%, 30%) plus one structural anchor (population composition at 100% production coverage).
+The Likely Adopters model assigns each farmer a composite score reflecting their expected priority for adoption, and a continuous adoption ratio reflecting the fraction of their white-maize land that they would commit to biofortified seed at any given national production coverage level. The model is **calibrated** rather than fit: its structural parameters are tuned to reproduce five empirical anchors provided by New Seed (per-segment cohort composition at production coverage levels 5%, 10%, 20%, 30%) plus one structural anchor (population composition at 100% production coverage).
 
 This module documents the determination of the model parameters: variable selection (Phase A–C), construction of the calibration anchor set (Phase D), and sequential sensitivity sweeps over the architectural components of the scoring engine (Phase E), the risk-aversion penalty (Phase F), and the continuous-adoption curve (Phase G). The final consolidated configuration is summarised in the integrated evaluation section and consumed downstream when [applying the model](02_06_apply_likely_adopters_model.qmd).
 
@@ -161,6 +162,13 @@ fig_h3_trajectory_vs_anchors <- import(
   trust = TRUE
 )
 
+# The brand is spelled New Seed in English text. The anchor roles come
+# from the pipeline, which has also written it as one word, so they are
+# normalised on import. The shape scale of the figure is keyed on this label: a
+# role it does not name gets no shape, and ggplot2 drops those points.
+fig_h3_trajectory_vs_anchors$anchors <- fig_h3_trajectory_vs_anchors$anchors |>
+  mutate(role = str_replace(role, "NewSeed", "New Seed"))
+
 tbl_h5_final_config <- import(
   here("..", "01_data", "02_processed", "web_resources",
        "02_05_tbl_h5_final_config.rds"),
@@ -233,7 +241,7 @@ The selection pipeline operates on the joined economic impact and segmentation d
 2. **Near-zero variance filter** — discards variables with frequency ratio above 19 and percent unique below 10%, indicating insufficient variation to support prediction.
 3. **Boruta feature selection** — applies the Boruta algorithm (Random Forest importance against shadow-permuted variables) to identify variables with statistically significant association with an adoption priority proxy.
 
-The adoption priority proxy is a five-level ordinal score derived from segment positioning and projected income increment, reflecting Semilla Nueva's strategic targeting logic.
+The adoption priority proxy is a five-level ordinal score derived from segment positioning and projected income increment, reflecting New Seed's strategic targeting logic.
 
 
 ### Correlation Filter
@@ -311,7 +319,7 @@ tbl_b4_selection_summary |>
 
 ### Adoption Priority Proxy
 
-The proxy outcome reflects Semilla Nueva's strategic targeting priorities: it captures the logic of which farmers should be prioritised for outreach, on a five-level ordinal scale:
+The proxy outcome reflects New Seed's strategic targeting priorities: it captures the logic of which farmers should be prioritised for outreach, on a five-level ordinal scale:
 
 - **Level 5** — Low segment with positive income increment: high improvement potential among farmers using mid-level hybrid seeds.
 - **Level 4** — Non-hybrid segment with positive income increment: largest yield increases, conditional on a technology transition.
@@ -462,25 +470,25 @@ tbl_c5_correlation_direction |>
 
 ## Phase D: Calibration Anchors
 
-The Likely Adopters model is calibrated against a structured anchor set rather than fit to an outcome variable: the model parameters are tuned to reproduce, as closely as possible, the empirical adoption composition observed under the Semilla Nueva programme at multiple production coverage levels. The calibration anchors are of two kinds.
+The Likely Adopters model is calibrated against a structured anchor set rather than fit to an outcome variable: the model parameters are tuned to reproduce, as closely as possible, the empirical adoption composition observed under the New Seed programme at multiple production coverage levels. The calibration anchors are of two kinds.
 
-**Empirical anchors (Semilla Nueva market composition).** The Semilla Nueva market composition matrix reports the per-segment share of purchasing farmers at four production coverage levels: 5%, 10%, 20%, and 30%. The values at 5% and 10% correspond to the directly observed production coverage range of the 2022–2025 commercial period; the values at 20% and 30% are extrapolated from the same observational base using Gompertz sigmoid fits per segment. The revised matrix used here satisfies two structural requirements: per-segment cohort size is monotonically non-decreasing across production coverage levels, and no per-segment cohort size at any intermediate production coverage exceeds the corresponding population total at full production coverage.
+**Empirical anchors (New Seed market composition).** The New Seed market composition matrix reports the per-segment share of purchasing farmers at four production coverage levels: 5%, 10%, 20%, and 30%. The values at 5% and 10% correspond to the directly observed production coverage range of the 2022–2025 commercial period; the values at 20% and 30% are extrapolated from the same observational base using Gompertz sigmoid fits per segment. The revised matrix used here satisfies two structural requirements: per-segment cohort size is monotonically non-decreasing across production coverage levels, and no per-segment cohort size at any intermediate production coverage exceeds the corresponding population total at full production coverage.
 
 A complementary land-size trajectory reports the average land planted in biofortified maize among purchasing farmers at the same four production coverage levels, interpreted as a P5–P95 trimmed-mean property of the adopting cohort, consistent with the trimming convention applied throughout the framework. Source values are reported in hectares and converted to manzanas using the conversion `1 ha = 1.4308 mz`.
 
-**Calibration anchor set.** The table below collates the five anchors used throughout this script: four empirical points from Semilla Nueva (`Empirical`) plus the structural anchor at full production coverage (`Structural`).
+**Calibration anchor set.** The table below collates the five anchors used throughout this script: four empirical points from New Seed (`Empirical`) plus the structural anchor at full production coverage (`Structural`).
 
 | Anchor type | p | w_p | % OPV | % Low | % Mid | % High | Land overall (ha) | Land overall (mz) |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Empirical (Semilla Nueva)     |   5% | 1.0 | 17.8 | 59.6 | 12.6 | 10.0 | 0.44 | 0.6296 |
-| Empirical (Semilla Nueva)     |  10% | 1.0 | 22.6 | 32.0 | 20.0 | 25.4 | 0.35 | 0.5008 |
-| Empirical (Semilla Nueva)     |  20% | 1.0 | 41.6 | 17.0 | 15.7 | 25.7 | 0.53 | 0.7583 |
-| Empirical (Semilla Nueva)     |  30% | 1.0 | 56.4 | 12.0 | 12.5 | 19.1 | 0.92 | 1.3163 |
+| Empirical (New Seed)          |   5% | 1.0 | 17.8 | 59.6 | 12.6 | 10.0 | 0.44 | 0.6296 |
+| Empirical (New Seed)          |  10% | 1.0 | 22.6 | 32.0 | 20.0 | 25.4 | 0.35 | 0.5008 |
+| Empirical (New Seed)          |  20% | 1.0 | 41.6 | 17.0 | 15.7 | 25.7 | 0.53 | 0.7583 |
+| Empirical (New Seed)          |  30% | 1.0 | 56.4 | 12.0 | 12.5 | 19.1 | 0.92 | 1.3163 |
 | Structural (population) | 100% | 0.5 | --- | --- | --- | --- | --- | --- |
 
-The empirical row composition values are per-segment shares (%) of the purchasing-farmer cohort at each production coverage level (source: Semilla Nueva ex-ante segment composition estimate, April 2026). The land columns report the overall trimmed-mean land per farmer in the adopting cohort. The structural row at p = 100% is recovered from the segmented dataset itself: per-segment shares equal the population composition under survey-calibrated weights, and the land value equals the P5–P95 weighted trimmed mean of `land_wtcorn` across the universe.
+The empirical row composition values are per-segment shares (%) of the purchasing-farmer cohort at each production coverage level (source: New Seed ex-ante segment composition estimate, April 2026). The land columns report the overall trimmed-mean land per farmer in the adopting cohort. The structural row at p = 100% is recovered from the segmented dataset itself: per-segment shares equal the population composition under survey-calibrated weights, and the land value equals the P5–P95 weighted trimmed mean of `land_wtcorn` across the universe.
 
-**Structural anchor (population at full production coverage).** The composition at full production coverage equals the population composition by definition: at p = 1.0 every farmer in the segmented dataset has fully converted to biofortified maize. This anchor is recovered directly from the calibrated dataset using survey-calibrated weights and provides a natural asymptotic constraint that anchors the trajectory beyond the empirical range of Semilla Nueva observations.
+**Structural anchor (population at full production coverage).** The composition at full production coverage equals the population composition by definition: at p = 1.0 every farmer in the segmented dataset has fully converted to biofortified maize. This anchor is recovered directly from the calibrated dataset using survey-calibrated weights and provides a natural asymptotic constraint that anchors the trajectory beyond the empirical range of New Seed observations.
 
 **A-priori weights.** The four empirical anchors carry the direct empirical signal about adoption dynamics under the biofortification programme and are weighted equally with `w_emp = 1.0`. The population anchor at p = 1.0 represents the asymptotic composition of the universe; it is weighted at half the empirical anchors with `w_str = 0.5`, reflecting its auxiliary role.
 
@@ -921,7 +929,7 @@ tbl_h2_integrated_mad |>
 
 ### Trajectory Visualization Against Anchors
 
-The integrated model's trajectory is visualised against the five calibration anchors: four empirical points from the Semilla Nueva market composition matrix (circles) and one structural point recovered from the population at full production coverage (triangle). The four segment trajectories appear as solid lines on a percentage-share basis.
+The integrated model's trajectory is visualised against the five calibration anchors: four empirical points from the New Seed market composition matrix (circles) and one structural point recovered from the population at full production coverage (triangle). The four segment trajectories appear as solid lines on a percentage-share basis.
 
 ```{r}
 #| label: fig-h3-trajectory-vs-anchors
@@ -931,7 +939,7 @@ The integrated model's trajectory is visualised against the five calibration anc
 #|   cohort share (percent) on the y-axis. Four solid lines, one per farmer
 #|   segment, trace the integrated model's composition trajectory as coverage
 #|   grows. Overlaid markers show the calibration anchors: circles for the four
-#|   empirical Semilla Nueva points and a triangle for the structural point at full
+#|   empirical New Seed points and a triangle for the structural point at full
 #|   coverage. The model lines pass close to their corresponding anchor markers,
 #|   showing the calibrated fit.
 #| fig-width: 11
@@ -949,7 +957,7 @@ ggplot(
   ) +
   scale_color_manual(values = segment_colors) +
   scale_shape_manual(
-    values = c("Empirical (Semilla Nueva)" = 21,
+    values = c("Empirical (New Seed)" = 21,
                "Structural (population)" = 24)
   ) +
   labs(
@@ -1007,4 +1015,4 @@ The determination is performed once on the baseline configuration (2022 seed × 
 
 ### Anchor-Based Calibration
 
-The calibration targets are five anchor points derived from the Semilla Nueva market composition matrix (four empirical production coverage levels) plus one structural anchor (population composition at full production coverage). The MAD distance ranks every configuration on a common dimensionless basis, enabling sequential one-axis optimisation across the four phases. The integrated model trajectory reproduces the empirical anchors with low residual deviation, which is what the continuous-adoption projections downstream rest on.
+The calibration targets are five anchor points derived from the New Seed market composition matrix (four empirical production coverage levels) plus one structural anchor (population composition at full production coverage). The MAD distance ranks every configuration on a common dimensionless basis, enabling sequential one-axis optimisation across the four phases. The integrated model trajectory reproduces the empirical anchors with low residual deviation, which is what the continuous-adoption projections downstream rest on.

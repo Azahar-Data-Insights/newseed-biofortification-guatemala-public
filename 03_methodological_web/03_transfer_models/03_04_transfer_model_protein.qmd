@@ -1,6 +1,7 @@
 ---
 title: "Transfer Model: Digestible Protein Intake"
 subtitle: "Module 3: Transfer Models"
+description-meta: "Survey-weighted gamma regression for digestible protein intake, with PDCAAS applied at food level so protein is modeled directly, not adjusted after."
 ---
 
 ## Why Model Digestible Protein?

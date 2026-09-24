@@ -1,6 +1,7 @@
 ---
 title: "Preparing Stunting Modeling Data"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "Merging SIVESNU anthropometry with predicted intake, then block PCA, correlation filtering, Boruta and VIF checks to select stunting predictors."
 ---
 
 ## Overview

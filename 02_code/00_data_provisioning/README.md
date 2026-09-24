@@ -3,7 +3,7 @@
 ## Purpose
 
 This folder contains scripts that provision and verify the data assets
-used by the NewSeed biofortification framework. These scripts are
+used by the New Seed biofortification framework. These scripts are
 **not required** for day-to-day analysis — the framework operates on
 Parquet files and pre-computed matrices that are already present in
 `01_data/`.

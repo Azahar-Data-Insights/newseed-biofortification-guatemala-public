@@ -1,6 +1,7 @@
 ---
 title: "Height Transfer Model"
 subtitle: "Module 5: Meta-analysis"
+description-meta: "GAM predicting child height from demographic and socioeconomic covariates, cross-validated tenfold and assessed by age band and department."
 ---
 
 ## Why a Height Transfer Model?

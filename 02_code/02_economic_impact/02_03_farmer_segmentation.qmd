@@ -311,7 +311,7 @@ dist_matrix <- dist(mat_clustering, method = "euclidean")
 
 ## B2. PAM Clustering (k=4)
 
-Apply Partitioning Around Medoids with k=4 clusters, corresponding to the expected technology adoption profiles: traditional/OPV-like behavior, low adopters, moderate adopters, and intensive/high-tech farmers. The choice of k=4 aligns with Semilla Nueva's operational segmentation.
+Apply Partitioning Around Medoids with k=4 clusters, corresponding to the expected technology adoption profiles: traditional/OPV-like behavior, low adopters, moderate adopters, and intensive/high-tech farmers. The choice of k=4 aligns with New Seed's operational segmentation.
 
 ```{r}
 #| label: b2-pam-clustering
@@ -1865,7 +1865,7 @@ rm(agreement_rate, cor_primary)
 
 # Phase E: Threshold Determination and Segment Assignment
 
-This phase determines optimal score thresholds that achieve estimated land distribution across farmer segments (estimates of land distribution across farmer segments based on a survey of select Semilla Nueva personnel and representatives of multiple seed companies in Guatemala in October of 2025). Thresholds are calculated to match the targets set from current seed purchasing behavior.
+This phase determines optimal score thresholds that achieve estimated land distribution across farmer segments (estimates of land distribution across farmer segments based on a survey of select New Seed personnel and representatives of multiple seed companies in Guatemala in October of 2025). Thresholds are calculated to match the targets set from current seed purchasing behavior.
 
 The segmentation classifies farmers by their **current technology adoption level**:
 
@@ -1880,7 +1880,7 @@ The approach uses cumulative land distribution: starting from the highest OPV-li
 
 Estimated cultivated land area currently under each seed technology adoption level. These targets are converted to cumulative percentages for threshold calculation.
 
-**Target distribution (targets set based on Semilla Nueva market data on current seed purchasing, Oct 2025):**
+**Target distribution (targets set based on New Seed market data on current seed purchasing, Oct 2025):**
 
 - **OPV/Criollo**: Residual (land currently under traditional/saved seed)
 - **Low**: 40,000 hectares (57,200 manzanas) 
@@ -1897,7 +1897,7 @@ Estimated cultivated land area currently under each seed technology adoption lev
 # Total cultivated maize land from MAGA calibration
 total_land_mz <- sum(df_farmers_scored$land_wtcorn * df_farmers_scored$weight_calibrated)
 
-# Estimated distribution from Semilla Nueva (hectares converted to manzanas: 1 ha = 1.43 mz)
+# Estimated distribution from New Seed (hectares converted to manzanas: 1 ha = 1.43 mz)
 target_distribution <- tibble(
   segment = c("OPV/Criollo", "Low", "Mid", "High"),
   hectares = c(NA_real_, 40000, 53750, 56250),
@@ -1987,7 +1987,7 @@ optimal_thresholds |>
   gt() |>
   tab_header(
     title = "Optimal Score Thresholds for Farmer Segmentation",
-    subtitle = "Based on target land distribution (estimates from Semilla Nueva market data, 2025)"
+    subtitle = "Based on target land distribution (estimates from New Seed market data, 2025)"
   ) |>
   cols_label(
     segment = "Segment",
@@ -2015,7 +2015,7 @@ optimal_thresholds |>
     locations = cells_column_labels()
   ) |>
   tab_source_note(
-    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Target distribution from Semilla Nueva market data (Oct 2025).")
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Target distribution from New Seed market data (Oct 2025).")
   ) |>
   tab_options(
     table.font.size = px(12),
@@ -2776,7 +2776,7 @@ write_parquet(
 
 4. **Hurdle model structure**: Two-stage classification separating OPV-direct farmers (zero seed expenditure → deterministic score=100) from hybrid-potential farmers (continuous probabilistic scoring).
 
-5. **Target-based threshold determination**: Score thresholds derived from Semilla Nueva market data on current maize seed distribution (87% OPV/Criollo, 3.5% Low, 4.7% Mid, 4.9% High).
+5. **Target-based threshold determination**: Score thresholds derived from New Seed market data on current maize seed distribution (87% OPV/Criollo, 3.5% Low, 4.7% Mid, 4.9% High).
 
 ## Scoring System
 

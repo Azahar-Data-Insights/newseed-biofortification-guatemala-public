@@ -753,19 +753,19 @@ This script consolidates the outputs of:
 
 The three seed variants represent different biofortified maize varieties with distinct yield performance characteristics:
 
-- **S22**: Currently deployed seed (released 2022). Yield factors: OPV +31.6%, Low +25.6%, Mid +1.8%, High -13.8%
-- **S26**: Improved variety (expected release 2026). Yield factors: OPV +45%, Low +40%, Mid +10%, High -7%
-- **S28**: Next-generation variety (expected release 2028). Yield factors: OPV +55%, Low +55%, Mid +20%, High -2%
+- **S22**: Biofortified seed variety (2022). Yield factors: OPV +31.6%, Low +25.6%, Mid +1.8%, High -13.8%
+- **S26**: Improved biofortified seed variety (2026). Yield factors: OPV +45%, Low +40%, Mid +10%, High -7%
+- **S28**: Next-generation biofortified seed variety (2028). Yield factors: OPV +55%, Low +55%, Mid +20%, High -2%
 
 All three share identical biofortification nutritional composition (QPM micronutrient concentrations). Differences in nutritional and stunting outcomes arise exclusively from differential market coverage driven by yield performance (more production per hectare enables greater redistribution and adoption).
 
 ## Subsidy Regime Architecture
 
-The three subsidy regimes represent progressive reductions of the NewSeed contribution to the biofortified seed price relative to the current commercial price (547 GTQ/mz without subsidy):
+The three subsidy regimes represent progressive reductions of the New Seed contribution to the biofortified seed price relative to the current commercial price (547 GTQ/mz without subsidy):
 
-- **sub00 (current subsidy)**: NewSeed pays 242 GTQ/mz; farmer pays 305 GTQ/mz
-- **sub50 (subsidy reduced 50%)**: NewSeed pays 121 GTQ/mz; farmer pays 366 GTQ/mz
-- **sub75 (subsidy reduced 75%)**: NewSeed pays 61 GTQ/mz; farmer pays 396 GTQ/mz
+- **sub00 (current subsidy)**: New Seed pays 242 GTQ/mz; farmer pays 305 GTQ/mz
+- **sub50 (subsidy reduced 50%)**: New Seed pays 121 GTQ/mz; farmer pays 366 GTQ/mz
+- **sub75 (subsidy reduced 75%)**: New Seed pays 61 GTQ/mz; farmer pays 396 GTQ/mz
 
 The subsidy regime affects the farmer adoption ranking and the monetary aggregations in the SUBSIDY block of the overview table; it does not alter physical production capacity, consumption demand, or the road network.
 

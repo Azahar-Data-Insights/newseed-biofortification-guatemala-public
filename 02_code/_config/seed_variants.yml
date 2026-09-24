@@ -2,7 +2,7 @@
 # Seed Variants Configuration
 # ==============================================================================
 #
-# Single source of truth for seed variant parameters used across the NewSeed
+# Single source of truth for seed variant parameters used across the New Seed
 # biofortification framework. Consumed by parametrized Quarto scripts and by
 # local and master orchestrators.
 #
@@ -16,7 +16,7 @@
 # Script 02_03 (farmer segmentation). Any change to segment nomenclature
 # must be reflected here and in the parametrized scripts simultaneously.
 #
-# Source: Semilla Nueva yield data and market analysis (November 2025).
+# Source: New Seed yield data and market analysis (November 2025).
 # ==============================================================================
 
 variants:
@@ -24,7 +24,7 @@ variants:
   s22:
     seed_year: "2022"
     seed_label: "2022 Seed"
-    seed_description: "currently deployed biofortified seed variety (released 2022)"
+    seed_description: "biofortified seed variety (2022)"
     seed_suffix: "s22"
     yield_change:
       OPV_Criollo:  0.316
@@ -35,7 +35,7 @@ variants:
   s26:
     seed_year: "2026"
     seed_label: "2026 Seed"
-    seed_description: "improved biofortified seed variety (expected release 2026)"
+    seed_description: "improved biofortified seed variety (2026)"
     seed_suffix: "s26"
     yield_change:
       OPV_Criollo:  0.450
@@ -46,7 +46,7 @@ variants:
   s28:
     seed_year: "2028"
     seed_label: "2028 Seed"
-    seed_description: "next-generation biofortified seed variety (expected release 2028)"
+    seed_description: "next-generation biofortified seed variety (2028)"
     seed_suffix: "s28"
     yield_change:
       OPV_Criollo:  0.550

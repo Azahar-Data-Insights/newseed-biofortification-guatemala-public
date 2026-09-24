@@ -1,6 +1,7 @@
 ---
 title: "Intake Calculation"
 subtitle: "Module 1: Nutrient Intakes"
+description-meta: "Converting household food acquisition into individual daily nutrient intake using adult male equivalents, keeping maize and non-maize sources separate."
 ---
 
 ## Overview

@@ -1,6 +1,7 @@
 ---
 title: "Integrating Micronutrient Supplementation"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "Chispitas MNP adherence cascade of access, administration and dosing, converted into adherence factors added to non-maize micronutrient intake."
 ---
 
 ## Overview

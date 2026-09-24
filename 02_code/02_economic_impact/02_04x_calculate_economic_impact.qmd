@@ -20,7 +20,7 @@ params:
   # --- Seed identification & yield change factors ---
   seed_year: "2022"
   seed_label: "2022 Seed"
-  seed_description: "currently deployed biofortified seed variety (released 2022)"
+  seed_description: "biofortified seed variety (2022)"
   seed_suffix: "s22"
   yield_opv:   0.316
   yield_low:   0.256
@@ -151,9 +151,9 @@ ensure_output_dir(here("01_data", "02_processed", "web_resources"))
 
 # Overview
 
-This script calculates the economic impact of transitioning from conventional/OPV seeds to NewSeed's biofortified maize for each farmer in the segmented population, under a specific combination of seed variant and subsidy regime.
+This script calculates the economic impact of transitioning from conventional/OPV seeds to New Seed's biofortified maize for each farmer in the segmented population, under a specific combination of seed variant and subsidy regime.
 
-> **Seed Variant:** Yield-change parameters correspond to the **`r seed_label`** \u2014 NewSeed's `r seed_description`.
+> **Seed Variant:** Yield-change parameters correspond to the **`r seed_label`** \u2014 New Seed's `r seed_description`.
 >
 > **Subsidy Regime:** Seed prices reflect the **`r subsidy_label`** \u2014 `r subsidy_description`.
 
@@ -176,7 +176,7 @@ The model holds non-seed input costs constant, under the assumption that biofort
 
 # Phase A: Setup and Parameters
 
-Load segmented farmer data and define the economic parameters provided by NewSeed for impact calculations.
+Load segmented farmer data and define the economic parameters provided by New Seed for impact calculations.
 
 ## A1. Load Segmented Farmer Data
 
@@ -516,7 +516,7 @@ tbl_a5_subsidy_reference |>
     value = "Value"
   ) |>
   tab_source_note(
-    source_note = md("**Source:** NewSeed refined subsidy values, April 2026.")
+    source_note = md("**Source:** New Seed refined subsidy values, April 2026.")
   ) |>
   tab_options(
     table.font.size = px(12),
@@ -1084,7 +1084,7 @@ tbl_current_segment |>
     locations = cells_body(columns = income_net, rows = income_net <= 0)
   ) |>
   tab_source_note(
-    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Seed costs modeled by segment per NewSeed parameters.")
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Seed costs modeled by segment per New Seed parameters.")
   ) |>
   tab_footnote(
     footnote = "Self-consumption valued at purchase price proxy (210 Q/qq)",
@@ -1243,7 +1243,7 @@ rm(tbl_aggregate)
 
 # Phase D: Projected Economic Situation with Biofortified Seed
 
-Calculate the projected economic situation if farmers adopt NewSeed's biofortified maize, applying segment-specific yield changes and the biofortified seed prices that correspond to the active subsidy regime.
+Calculate the projected economic situation if farmers adopt New Seed's biofortified maize, applying segment-specific yield changes and the biofortified seed prices that correspond to the active subsidy regime.
 
 **Allocation logic for projections (Conservative Approach):**
 
@@ -1704,14 +1704,14 @@ Quantify the monetary value of the seed subsidy received by each farmer under th
 |---|---|---|
 | `subsidy_amount_absolute` | `(bio_cost_no_subsidy_per_mz - seed_cost_biofortified) \u00d7 land_wtcorn` | Absolute monetary value of the subsidy received, relative to the unsubsidized commercial reference price (`r bio_cost_no_subsidy_per_mz` Q/mz) |
 | `subsidy_reduction_cost` | `(seed_cost_biofortified - seed_cost_biofortified_current_regime) \u00d7 land_wtcorn` | Additional out-of-pocket cost the farmer absorbs when the subsidy is reduced relative to the current regime |
-| `newseed_subsidy` | `newseed_subsidy_per_mz \u00d7 land_wtcorn` | NewSeed's per-area direct financial commitment under the active regime, scaled by area planted |
+| `newseed_subsidy` | `newseed_subsidy_per_mz \u00d7 land_wtcorn` | New Seed's per-area direct financial commitment under the active regime, scaled by area planted |
 | `producer_absorption` | `subsidy_amount_absolute - newseed_subsidy` | Share of the absolute subsidy value covered by the local seed producer (intermediary) via improved producibility. Zero under the current regime |
-| `newseed_savings_vs_current` | `(newseed_subsidy_current - newseed_subsidy_active) \u00d7 land_wtcorn` | Reduction in NewSeed's per-farmer financial commitment when moving from the current regime to the active regime |
+| `newseed_savings_vs_current` | `(newseed_subsidy_current - newseed_subsidy_active) \u00d7 land_wtcorn` | Reduction in New Seed's per-farmer financial commitment when moving from the current regime to the active regime |
 
 Two identities hold by construction:
 
-1. **Absolute subsidy decomposition**: `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total per-farmer subsidy value is jointly funded by NewSeed (direct subsidy) and the local seed producer (improved producibility absorption). The farmer's out-of-pocket cost is **not** part of the subsidy by definition.
-2. **NewSeed savings reallocation**: `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. When NewSeed reduces its commitment, the freed amount is reallocated between the local producer (who absorbs part via improved producibility) and the farmer (who pays the rest out of pocket).
+1. **Absolute subsidy decomposition**: `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total per-farmer subsidy value is jointly funded by New Seed (direct subsidy) and the local seed producer (improved producibility absorption). The farmer's out-of-pocket cost is **not** part of the subsidy by definition.
+2. **New Seed savings reallocation**: `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. When New Seed reduces its commitment, the freed amount is reallocated between the local producer (who absorbs part via improved producibility) and the farmer (who pays the rest out of pocket).
 
 Both identities are validated row-by-row in `subsidy_decomposition_check` and `newseed_delta_check`, exported to the parquet for downstream auditing. Both are expected to be zero up to floating-point precision.
 
@@ -1719,7 +1719,7 @@ All measures are exported to the parquet so that downstream consumers can choose
 
 ## E1. Compute Subsidy Benefit Variables
 
-Construct subsidy-related variables at farmer level. The biofortified price under the current regime (305 Q/mz) and the NewSeed per-area subsidy under the current regime (242 Q/mz) are hard-coded as references; both correspond to the values set in `subsidy_variants.yml` for the `current` variant.
+Construct subsidy-related variables at farmer level. The biofortified price under the current regime (305 Q/mz) and the New Seed per-area subsidy under the current regime (242 Q/mz) are hard-coded as references; both correspond to the values set in `subsidy_variants.yml` for the `current` variant.
 
 ```{r}
 #| label: e1-compute-subsidy-benefits
@@ -1733,7 +1733,7 @@ Construct subsidy-related variables at farmer level. The biofortified price unde
 # configuration in subsidy_variants.yml (variant: current).
 bio_cost_current_regime_per_mz <- 305
 
-# NewSeed direct subsidy under the current regime (Q/mz). Reference for
+# New Seed direct subsidy under the current regime (Q/mz). Reference for
 # computing the producer-absorption share of any subsidy reduction.
 # Equals bio_cost_no_subsidy_per_mz - bio_cost_current_regime_per_mz
 # (547 - 305 = 242) per the configuration in subsidy_variants.yml.
@@ -1755,8 +1755,8 @@ df_subsidy_benefits <- df_projected_economics |>
     cost_seeds_bio_current_regime = bio_cost_current_regime_per_mz * land_wtcorn,
     subsidy_reduction_cost        = cost_seeds_projected - cost_seeds_bio_current_regime,
 
-    # --- NewSeed direct subsidy under the active regime (per farmer) ---
-    # Per-area financial commitment made by NewSeed under the active
+    # --- New Seed direct subsidy under the active regime (per farmer) ---
+    # Per-area financial commitment made by New Seed under the active
     # regime, scaled by area planted.
     newseed_subsidy = newseed_subsidy_per_mz * land_wtcorn,
 
@@ -1766,15 +1766,15 @@ df_subsidy_benefits <- df_projected_economics |>
     # the residual of the absolute-subsidy identity:
     #   subsidy_amount_absolute = newseed_subsidy + producer_absorption.
     # Residual derivation, so the identity closes
-    # despite the rounding applied by NewSeed when publishing the
+    # despite the rounding applied by New Seed when publishing the
     # farmer-facing biofortified prices (366 and 396 Q/mz under sub50
     # and sub75 are integer roundings of the theoretical 365.5 and
     # 395.5 implied by a strict fifty-fifty split of the cost
     # reduction). Zero under the current regime by construction.
     producer_absorption = subsidy_amount_absolute - newseed_subsidy,
 
-    # --- NewSeed savings relative to the current regime (per farmer) ---
-    # Reduction in NewSeed's per-farmer financial commitment when moving
+    # --- New Seed savings relative to the current regime (per farmer) ---
+    # Reduction in New Seed's per-farmer financial commitment when moving
     # from the current regime to the active regime. Zero under the
     # current regime by construction.
     newseed_savings_vs_current =
@@ -1789,8 +1789,8 @@ df_subsidy_benefits <- df_projected_economics |>
     subsidy_decomposition_check = subsidy_amount_absolute -
       (newseed_subsidy + producer_absorption),
 
-    # Identity 2 (NewSeed savings reallocation):
-    # The reduction in NewSeed's commitment relative to the current
+    # Identity 2 (New Seed savings reallocation):
+    # The reduction in New Seed's commitment relative to the current
     # regime is reallocated between the local producer (improved
     # producibility) and the farmer (extra out-of-pocket cost):
     #   newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost.
@@ -2021,7 +2021,7 @@ rm(tbl_subsidy_national)
 
 ## E3. Subsidy Cost Decomposition
 
-Decompose the absolute subsidy value received by the farmer into the two actors that fund it (NewSeed and the local seed producer), and report separately the farmer's extra out-of-pocket cost relative to the current regime, together with NewSeed's savings.
+Decompose the absolute subsidy value received by the farmer into the two actors that fund it (New Seed and the local seed producer), and report separately the farmer's extra out-of-pocket cost relative to the current regime, together with New Seed's savings.
 
 ```{r}
 #| label: tbl-e3-subsidy-decomposition
@@ -2057,12 +2057,12 @@ tbl_subsidy_decomp <- df_subsidy_benefits |>
     metric_label = case_when(
       metric == "total_land_mz"         ~ "Total Land (mz)",
       metric == "total_subsidy_value"   ~ "Total Subsidy Value (absolute)",
-      metric == "total_newseed"         ~ "  NewSeed direct subsidy",
+      metric == "total_newseed"         ~ "  New Seed direct subsidy",
       metric == "total_producer"        ~ "  Local seed producer absorption",
-      metric == "pct_newseed"           ~ "  NewSeed share of subsidy",
+      metric == "pct_newseed"           ~ "  New Seed share of subsidy",
       metric == "pct_producer"          ~ "  Producer share of subsidy",
       metric == "total_farmer_extra"    ~ "Farmer extra cost vs current",
-      metric == "total_newseed_savings" ~ "NewSeed Savings vs Current Regime"
+      metric == "total_newseed_savings" ~ "New Seed Savings vs Current Regime"
     )
   )
 
@@ -2109,12 +2109,12 @@ tbl_subsidy_decomp |>
   tab_style(
     style = cell_text(weight = "bold"),
     locations = cells_body(
-      rows = str_detect(metric_label, "^Total|^NewSeed Savings|^Farmer extra")
+      rows = str_detect(metric_label, "^Total|^New Seed Savings|^Farmer extra")
     )
   ) |>
   tab_source_note(
     source_note = md(
-      "**Total Subsidy Value** is jointly funded by NewSeed (direct subsidy) and the local seed producer (improved producibility absorption); both shares sum to 100%. **Farmer extra cost** and **NewSeed Savings vs Current Regime** are reported separately: the farmer's out-of-pocket cost is not part of the subsidy by definition, and NewSeed's savings equal the producer absorption plus the farmer extra cost. All three are zero under the current regime by construction."
+      "**Total Subsidy Value** is jointly funded by New Seed (direct subsidy) and the local seed producer (improved producibility absorption); both shares sum to 100%. **Farmer extra cost** and **New Seed Savings vs Current Regime** are reported separately: the farmer's out-of-pocket cost is not part of the subsidy by definition, and New Seed's savings equal the producer absorption plus the farmer extra cost. All three are zero under the current regime by construction."
     )
   ) |>
   tab_options(
@@ -2908,13 +2908,13 @@ The monetary value of the subsidy is exported from three complementary perspecti
 
 - **Absolute value (farmer perspective, `subsidy_amount_absolute`)**: difference between the unsubsidized commercial reference price (`r bio_cost_no_subsidy_per_mz` Q/mz) and the biofortified price effectively paid under the active regime, scaled by area planted. Captures the total subsidy benefit irrespective of regime.
 - **Relative value (farmer perspective, `subsidy_reduction_cost`)**: additional out-of-pocket cost the farmer absorbs under the active regime relative to the current regime (305 Q/mz biofortified). Captures the marginal cost of subsidy reduction for the farmer. Zero under the current regime by construction.
-- **NewSeed perspective (`newseed_subsidy`, `newseed_savings_vs_current`)**: per-farmer financial commitment by NewSeed under the active regime, and the corresponding savings relative to the current regime. NewSeed savings under the current regime are zero by construction.
+- **New Seed perspective (`newseed_subsidy`, `newseed_savings_vs_current`)**: per-farmer financial commitment by New Seed under the active regime, and the corresponding savings relative to the current regime. New Seed savings under the current regime are zero by construction.
 - **Local seed producer perspective (`producer_absorption`)**: share of the absolute subsidy value covered by the intermediary seed producer through improved producibility. Derived as the residual of the absolute-subsidy identity. Zero under the current regime by construction.
 
 Two identities hold by construction and are validated row-by-row:
 
-1. **Absolute subsidy decomposition**: `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total subsidy received by the farmer is jointly funded by NewSeed and the local producer; the farmer's out-of-pocket cost is not part of the subsidy.
-2. **NewSeed savings reallocation**: `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. The amount NewSeed stops contributing under the active regime is reallocated between the producer (improved producibility) and the farmer (extra out-of-pocket cost).
+1. **Absolute subsidy decomposition**: `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total subsidy received by the farmer is jointly funded by New Seed and the local producer; the farmer's out-of-pocket cost is not part of the subsidy.
+2. **New Seed savings reallocation**: `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. The amount New Seed stops contributing under the active regime is reallocated between the producer (improved producibility) and the farmer (extra out-of-pocket cost).
 
 The columns `subsidy_decomposition_check` and `newseed_delta_check` carry the residuals of the two identities (expected to be zero up to floating-point precision) for downstream auditing.
 

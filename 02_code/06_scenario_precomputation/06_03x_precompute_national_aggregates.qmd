@@ -107,19 +107,19 @@ ensure_output_dir(here("01_data", "02_processed", "web_resources"))
 
 > **Seed `r seed_code` · `r subsidy_label` · `r pathway_label` Pathway** — This script corresponds to the Seed `r params$seed_year` (`r seed_code`) scenario under the **`r subsidy_label`** subsidy regime and the `r tolower(pathway_label)` pathway. The methodology is identical across all 18 combinations (3 seeds x 3 subsidy regimes x 2 pathways); differences arise from the upstream yield factors (seed) and the upstream seed-price structure (subsidy regime) that together shape the farmer adoption ranking and economic metrics.
 
-This script calculates national-level impact metrics across 11 biofortification penetration scenarios (0% to 100% in 10% increments). It uses the same methodology as Script `r paste0("06_02_", seed_suffix, "_", subsidy_suffix, "_", pathway)` and aggregates directly to national level from individual-level data. It combines farmer adoption data with the `r if (is_pco) "synthetic child population" else "ENCOVI child population"` to estimate nutrient and stunting outcomes under different market penetration levels.
+This script calculates national-level impact metrics across 11 simulation levels of national biofortified maize land share (0% to 100% in 10-percentage-point increments). It uses the same methodology as Script `r paste0("06_02_", seed_suffix, "_", subsidy_suffix, "_", pathway)` and aggregates directly to national level from individual-level data. It combines farmer adoption data with the `r if (is_pco) "synthetic child population" else "ENCOVI child population"` to estimate nutrient and stunting outcomes at each level of biofortified seed adoption.
 
-Penetration is implemented through the continuous adoption model: each farmer has a per-farmer entry point (`p_entry`) and a behavioural profile (`S`, `M`, `L`), which together determine the conversion ratio $r_i(p)$ at each national penetration level $p$. At the farmer's entry point, the conversion ratio equals the profile-specific floor; it then rises along a sigmoid curve towards 1 as $p$ increases. At full penetration ($p = 1$), all farmers have $r_i(1) = 1$ by construction. Economically scalable quantities (production, land, income, seed costs, subsidy flows) are weighted by $r_i(p)$, while farmer counts reflect pool membership (a farmer either has entered the pool or has not).
+Each simulation level is labelled by `penetration`, the national share of maize land cultivated with biofortified seed. Farmer-level adoption at each level is evaluated at the internal adoption index `p_internal` associated with that level in the land share lookup of Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`. Each farmer has a per-farmer entry point (`p_entry`) and a behavioural profile (`S`, `M`, `L`), which together determine the conversion ratio $r_i(p_{\text{internal}})$. At the farmer's entry point, the conversion ratio equals the profile-specific floor; it then rises along a sigmoid curve towards 1 as $p_{\text{internal}}$ increases. At full adoption ($p_{\text{internal}} = 1$), all farmers have $r_i(1) = 1$ by construction. Economically scalable quantities (production, land, income, seed costs, subsidy flows) are weighted by $r_i(p_{\text{internal}})$, while farmer counts reflect pool membership (a farmer either has entered the pool or has not).
 
 ## Main Operations
 
 1. Load calibrated model configuration for continuous adoption curves (02_05 output)
 2. Define helper functions for national scenario simulation pipeline
-3. Load `r if (is_pco) "synthetic population with pre-calculated baseline and QPM nutritional/stunting profiles (from 04_08)" else "ENCOVI children with pre-calculated baseline and QPM nutritional/stunting profiles (from 05_06)"`, farmer data, market baseline, and saturation scenarios
-4. Calculate baseline metrics at 0% penetration (no biofortification)
-5. For each penetration level (10% to 100%):
-   - Filter adopting farmers using `p_entry <= p` and compute per-farmer conversion ratio $r_i(p)$
-   - Calculate economic metrics at national level, weighting scalable quantities by $r_i(p)$
+3. Load `r if (is_pco) "synthetic population with pre-calculated baseline and QPM nutritional/stunting profiles (from 04_08)" else "ENCOVI children with pre-calculated baseline and QPM nutritional/stunting profiles (from 05_06)"`, farmer data, market baseline, saturation scenarios, and land share lookup
+4. Calculate baseline metrics at the 0% simulation level (no biofortified maize land)
+5. For each simulation level (10% to 100% biofortified maize land):
+   - Retrieve the associated internal adoption index `p_internal`, filter adopting farmers using `p_entry <= p_internal`, and compute per-farmer conversion ratio $r_i(p_{\text{internal}})$
+   - Calculate economic metrics at national level, weighting scalable quantities by $r_i(p_{\text{internal}})$
    - Calculate national coverage from departmental saturation scenarios
    - Assign biofortification flag to children using hierarchical priority
    - Select pre-calculated baseline or QPM nutritional values based on flag
@@ -149,15 +149,17 @@ Therefore, `delta_zlen_qpm`, the difference between the two fitted values, is a 
 }
 ```
 
-**Continuous Adoption Model**: At each national penetration level $p$, every farmer with $p_{\text{entry}} \leq p$ is in the adoption pool. The effective contribution of farmer $i$ to any scalable economic quantity is `quantity_i * weight_calibrated_i * r_i(p)`, where $r_i(p)$ is the profile-specific sigmoid conversion ratio from `apply_adoption_curve()`. Farmer counts (number of adopters) are not scaled by $r_i$: a farmer either has entered the pool or has not.
+**Continuous Adoption Model**: At each simulation level, every farmer with $p_{\text{entry}} \leq p_{\text{internal}}$ is in the adoption pool, where $p_{\text{internal}}$ is the internal adoption index associated with the level; the value $p_{\text{internal}} = 0$ denotes the empty adoption pool. The effective contribution of farmer $i$ to any scalable economic quantity is `quantity_i * weight_calibrated_i * r_i(p_internal)`, where $r_i(p_{\text{internal}})$ is the profile-specific sigmoid conversion ratio from `apply_adoption_curve()`. Farmer counts (number of adopters) are not scaled by $r_i$: a farmer either has entered the pool or has not.
 
-**Subsidy Variables**: The seven monetary subsidy columns (`cost_seeds_bio_no_subsidy`, `cost_seeds_bio_current_regime`, `subsidy_amount_absolute`, `newseed_subsidy`, `producer_absorption`, `subsidy_reduction_cost`, `newseed_savings_vs_current`) are computed at farmer level in Script 02_04 and propagated through Script 02_06. This script aggregates them at national level using the same `r_i(p)` weighting applied to all scalable economic quantities.
+**Subsidy Variables**: The seven monetary subsidy columns (`cost_seeds_bio_no_subsidy`, `cost_seeds_bio_current_regime`, `subsidy_amount_absolute`, `newseed_subsidy`, `producer_absorption`, `subsidy_reduction_cost`, `newseed_savings_vs_current`) are computed at farmer level in Script 02_04 and propagated through Script 02_06. This script aggregates them at national level using the same `r_i(p_internal)` weighting applied to all scalable economic quantities.
 
 **Hierarchical Biofortification Assignment**: Children are assigned biofortified maize consumption following a priority hierarchy that reflects realistic distribution patterns. The assignment follows a hierarchy based on each household's likelihood of accessing locally-produced biofortified maize, prioritizing in descending order: cereal-producing farm households, other farming households, households of agricultural workers, rural non-agricultural households, and urban households. Within each tier, assignment is randomized until the departmental coverage target is reached.
 
 **Data-linkage limitation:** ENCOVI (farmer survey) and SIVESNU (child anthropometry) cannot be linked at the household level as they share no common identifier. Children of adopting farmers cannot therefore be identified deterministically. The hierarchy uses observable proxies (head-of-household occupation, rural/urban residence) to approximate the probability of biofortified maize access under realistic distribution patterns.
 
-**Pre-calculated Coverage**: Departmental coverage at each penetration level is retrieved from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`, which already applied the gravity-based redistribution model. National coverage is calculated as a consumption-weighted average of departmental coverages.
+**Biofortified Land Share Lookup**: The association between each simulation level (`penetration`) and its internal adoption index (`p_internal`) is read from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`, the same association that generates the pre-calculated departmental coverage. Outputs are labelled exclusively with `penetration`.
+
+**Pre-calculated Coverage**: Departmental coverage at each simulation level is retrieved from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`, which already applied the gravity-based redistribution model. National coverage is calculated as a consumption-weighted average of departmental coverages.
 
 # Phase A: Function Definitions
 
@@ -216,14 +218,14 @@ tibble(
   )
 ```
 
-## A2. Filter Adopters by Penetration Level
+## A2. Filter Adopters by Internal Adoption Index
 
-At each national penetration level $p$, farmers with $p_{\text{entry}} \leq p$ are admitted to the adoption pool. For each admitted farmer, the per-farmer conversion ratio $r_i(p)$ is computed via `apply_adoption_curve()`.
+At each simulation level, farmers with $p_{\text{entry}} \leq p_{\text{internal}}$ are admitted to the adoption pool, where $p_{\text{internal}}$ is the internal adoption index associated with the level. The value $p_{\text{internal}} = 0$ denotes the empty adoption pool. For each admitted farmer, the per-farmer conversion ratio $r_i(p_{\text{internal}})$ is computed via `apply_adoption_curve()`.
 
 **Parameters:**
 
 - `df_farmers`: Data frame of ranked farmers with `p_entry` and `profile`
-- `penetration`: National penetration level (0-1)
+- `p_internal`: Internal adoption index associated with the simulation level (0-1)
 
 **Returns:** Data frame of admitted farmers with `r_i` column appended.
 
@@ -231,15 +233,17 @@ At each national penetration level $p$, farmers with $p_{\text{entry}} \leq p$ a
 #| label: a2-filter-adopters
 
 # =============================================================================
-# A2. Filter Adopters by Penetration Level (Continuous Adoption Model)
+# A2. Filter Adopters by Internal Adoption Index (Continuous Adoption Model)
 # =============================================================================
 
-filter_adopters_by_penetration <- function(df_farmers, penetration) {
+filter_adopters_by_adoption_index <- function(df_farmers, p_internal) {
 
+  # Farmers in the adoption pool at this internal adoption index
+  # (p_internal = 0 denotes the empty adoption pool)
   df_adopters <- df_farmers |>
-    filter(p_entry <= penetration) |>
+    filter(p_entry <= p_internal, p_internal > 0) |>
     mutate(
-      r_i = apply_adoption_curve(penetration, p_entry, profile,
+      r_i = apply_adoption_curve(p_internal, p_entry, profile,
                                  floor_S, floor_M, floor_L,
                                  k_S, k_M, k_L)
     )
@@ -250,11 +254,11 @@ filter_adopters_by_penetration <- function(df_farmers, penetration) {
 
 ## A3. Calculate Economic Metrics at National Level
 
-Aggregate economic impact metrics for adopting farmers at national level. Scalable quantities (land, production, income, seed costs, subsidy flows) are weighted by `r_i(p)` and `weight_calibrated`. Farmer counts reflect pool membership and are weighted by `weight_calibrated` only.
+Aggregate economic impact metrics for adopting farmers at national level. Scalable quantities (land, production, income, seed costs, subsidy flows) are weighted by `r_i(p_internal)` and `weight_calibrated`. Farmer counts reflect pool membership and are weighted by `weight_calibrated` only.
 
 **Parameters:**
 
-- `df_adopters`: Data frame of farmers adopting at current penetration level, with `r_i` column
+- `df_adopters`: Data frame of farmers adopting at the current simulation level, with `r_i` column
 
 **Returns:** Data frame with one row containing national economic metrics:
 
@@ -308,7 +312,8 @@ calculate_economic_national <- function(df_adopters) {
 
       # -----------------------------------------------------------------------
       # Land area in manzanas (survey-weighted, scaled by r_i)
-      # At penetration p, farmer i converts land_wtcorn * r_i(p) manzanas.
+      # At internal adoption index p_internal, farmer i converts
+      # land_wtcorn * r_i(p_internal) manzanas.
       # -----------------------------------------------------------------------
 
       land_bio_mz = sum(land_wtcorn * r_i * weight_calibrated, na.rm = TRUE),
@@ -317,7 +322,7 @@ calculate_economic_national <- function(df_adopters) {
       # -----------------------------------------------------------------------
       # Income metrics (scaled by r_i)
       # Total is weighted (population estimate), median is the typical
-      # effective per-farmer increment at this penetration level.
+      # effective per-farmer increment at this simulation level.
       # -----------------------------------------------------------------------
 
       income_increment_total = sum(
@@ -356,8 +361,9 @@ calculate_economic_national <- function(df_adopters) {
       # Subsidy block (survey-weighted, GTQ, scaled by r_i)
       #
       # All subsidy variables are computed at farmer level in Script 02_04
-      # and propagated through Script 02_06. At penetration p, the
-      # effective monetary flow for farmer i is quantity_i * r_i(p),
+      # and propagated through Script 02_06. At internal adoption index
+      # p_internal, the effective monetary flow for farmer i is
+      # quantity_i * r_i(p_internal),
       # reflecting the fraction of land under biofortified seed.
       #
       # Linear identities preserved at aggregate level:
@@ -994,9 +1000,10 @@ aggregate_nutritional_national <- function(df_children) {
 This phase loads all required datasets for scenario simulation:
 
 1. **`r if (is_pco) "Synthetic population" else "ENCOVI children"`**: Children 6-59 months with pre-calculated baseline and QPM nutritional/stunting profiles (from `r if (is_pco) "04_08" else "05_06"`)
-2. **Farmer adoption data**: Ranked farmers with economic metrics, adoption scores, per-farmer entry penetration `p_entry`, and behavioural profile (from 02_06)
+2. **Farmer adoption data**: Ranked farmers with economic metrics, adoption scores, per-farmer entry point `p_entry`, and behavioural profile (from 02_06)
 3. **Market baseline**: Departmental baseline metrics (farmers, land, consumption) (from 06_01)
-4. **Saturation scenarios**: Pre-calculated coverage by department x penetration level (from 06_01)
+4. **Saturation scenarios**: Pre-calculated coverage by department x simulation level (from 06_01)
+5. **Land share lookup**: Internal adoption index `p_internal` associated with each simulation level (from 06_01)
 
 ## B1. Load `r if (is_pco) "Synthetic Population with Pre-Computed Profiles" else "ENCOVI Children with Priority Assignment"`
 
@@ -1040,9 +1047,9 @@ if (is_pco) {
 
 ## B2. Load Farmer Adoption Data
 
-Load farmer-level data with adoption scores, economic metrics, per-farmer entry penetration point (`p_entry`), and behavioural profile (`profile`) from Script `r paste0("02_06_", seed_suffix, "_", subsidy_suffix)`. The parquet integrates the seed-specific yield assumptions and the subsidy-specific seed prices applied in Script `r paste0("02_04_", seed_suffix, "_", subsidy_suffix)`, including the seven monetary subsidy decomposition columns computed in Phase E of Script 02_04.
+Load farmer-level data with adoption scores, economic metrics, per-farmer entry point (`p_entry`), and behavioural profile (`profile`) from Script `r paste0("02_06_", seed_suffix, "_", subsidy_suffix)`. The parquet integrates the seed-specific yield assumptions and the subsidy-specific seed prices applied in Script `r paste0("02_04_", seed_suffix, "_", subsidy_suffix)`, including the seven monetary subsidy decomposition columns computed in Phase E of Script 02_04.
 
-Farmers are sorted by `adoption_score` (descending). The per-farmer entry penetration point `p_entry` is already present in the parquet; filtering adopters at each penetration level uses `p_entry <= p` and then computes the conversion ratio $r_i(p)$ via `apply_adoption_curve()`.
+Farmers are sorted by `adoption_score` (descending). The per-farmer entry point `p_entry` is already present in the parquet; filtering adopters at each simulation level uses `p_entry <= p_internal` and then computes the conversion ratio $r_i(p_{\text{internal}})$ via `apply_adoption_curve()`.
 
 ```{r}
 #| label: b2-load-farmer-data
@@ -1058,8 +1065,8 @@ df_farmers_raw <- read_parquet(
 )
 
 # ===========================================================================
-# Sort by adoption score (best candidates first). The entry penetration
-# point p_entry and behavioural profile are already present in the parquet.
+# Sort by adoption score (best candidates first). The entry point p_entry
+# and behavioural profile are already present in the parquet.
 # ===========================================================================
 
 df_farmers_ranked <- df_farmers_raw |>
@@ -1086,7 +1093,7 @@ df_market_baseline <- read_parquet(
 
 ## B4. Load Saturation Scenarios
 
-Load pre-calculated departmental coverage across penetration levels from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`. The original dataset contains 101 levels (0-100% in 1% increments); we filter to the 11 levels needed for scenario simulation (0%, 10%, 20%... 100%).
+Load pre-calculated departmental coverage at the eleven simulation levels of national biofortified maize land share from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`. The filter below retains the 11 levels used in scenario simulation (0%, 10%, 20%... 100%).
 
 **Key insight:** The gravity-based redistribution is already applied in this dataset. Each row represents the final coverage a department achieves after surplus production flows through the gravity model network.
 
@@ -1119,6 +1126,76 @@ df_saturation <- df_saturation_raw |>
 # Clean up raw data
 rm(df_saturation_raw)
 ```
+
+## B5. Load Land Share Lookup
+
+Load the association between the simulation levels and the internal adoption index from Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`. Each simulation level (`penetration`) is the national share of maize land cultivated with biofortified seed, and `p_internal` is the internal adoption index at which farmer-level adoption is evaluated for that level. The same association generates the departmental coverage stored in the saturation scenarios, so economic and nutritional metrics refer to the same adoption state at every level. The check below confirms that the lookup contains exactly the eleven simulation levels of the saturation scenarios, with a non-decreasing internal adoption index; the script halts otherwise.
+
+```{r}
+#| label: tbl-b5-land-share-lookup
+#| tbl-cap: "Internal adoption index by simulation level (from 06_01)"
+
+# =============================================================================
+# B5. Load Land Share Lookup
+# =============================================================================
+
+df_penetration_lookup <- read_parquet(
+  here("01_data", "02_processed",
+       "scenarios", paste0("06_01_", seed_suffix, "_", subsidy_suffix,
+                           "_penetration_lookup.parquet"))
+)
+
+# ---------------------------------------------------------------------------
+# Consistency with the saturation scenarios: the same eleven simulation
+# levels, one internal adoption index per level, non-decreasing order
+# ---------------------------------------------------------------------------
+
+lookup_is_consistent <-
+  nrow(df_penetration_lookup) == 11 &&
+  isTRUE(all.equal(sort(df_penetration_lookup$penetration),
+                   sort(unique(df_saturation$penetration)))) &&
+  !anyNA(df_penetration_lookup$p_internal) &&
+  all(diff(df_penetration_lookup$p_internal) >= 0)
+
+df_tbl_b5 <- df_penetration_lookup |>
+  select(penetration, p_internal, land_pct_achieved, error_pp)
+
+export(df_tbl_b5, here("01_data", "02_processed", "web_resources", paste0(file_prefix, "_tbl_b5_land_share_lookup.rds")))
+
+df_tbl_b5 |>
+  gt() |>
+  tab_header(
+    title = "Internal Adoption Index by Simulation Level",
+    subtitle = glue("Biofortified maize land share lookup from 06_01 — Seed: {seed_code} | Subsidy: {subsidy_label}")
+  ) |>
+  cols_label(
+    penetration = "Biofortified Maize Land Target",
+    p_internal = "Internal Adoption Index",
+    land_pct_achieved = "Biofortified Maize Land Achieved",
+    error_pp = "Difference (pp)"
+  ) |>
+  fmt_percent(columns = penetration, decimals = 0) |>
+  fmt_number(columns = p_internal, decimals = 4) |>
+  fmt_number(columns = land_pct_achieved, decimals = 2, pattern = "{x}%") |>
+  fmt_number(columns = error_pp, decimals = 3, force_sign = TRUE) |>
+  tab_source_note(
+    source_note = glue("Consistent with saturation scenarios (11 simulation levels, non-decreasing internal adoption index): {if (lookup_is_consistent) 'Yes' else 'No'}. The script halts otherwise.")
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12)
+  )
+
+# Halt the pipeline if the lookup is inconsistent with the saturation scenarios
+if (!lookup_is_consistent) {
+  stop("Phase B halted: land share lookup inconsistent with saturation scenarios.")
+}
+
+# Clean up
+rm(df_tbl_b5, lookup_is_consistent)
+```
+
 
 ---
 
@@ -1175,7 +1252,7 @@ if (is_pco) {
 
 ## C2. Aggregate Baseline at National Level
 
-Aggregate baseline metrics using the `aggregate_nutritional_national()` function. This produces the reference values for calculating improvements at each penetration level.
+Aggregate baseline metrics using the `aggregate_nutritional_national()` function. This produces the reference values for calculating improvements at each simulation level.
 
 ```{r}
 #| label: c2-aggregate-baseline-national
@@ -1338,23 +1415,23 @@ rm(df_tbl_c4)
 
 # Phase D: Scenario Simulation
 
-Simulate biofortification impact across 10 penetration levels (10% to 100%). For each level:
+Simulate biofortification impact across 10 simulation levels (10% to 100% biofortified maize land). For each level:
 
-1. Filter adopting farmers using `p_entry <= p` and compute per-farmer conversion ratio $r_i(p)$
-2. Calculate economic impact at national level, weighting scalable quantities by $r_i(p)$
+1. Retrieve the associated internal adoption index `p_internal`, filter adopting farmers using `p_entry <= p_internal`, and compute per-farmer conversion ratio $r_i(p_{\text{internal}})$
+2. Calculate economic impact at national level, weighting scalable quantities by $r_i(p_{\text{internal}})$
 3. Get pre-calculated coverage from saturation scenarios (consumption-weighted national average)
 4. Assign biofortification to children `r if (is_pco) "hierarchically" else "using household-level priority"`
 5. Select pre-calculated baseline or QPM values per child
 6. Aggregate nutritional metrics at national level
 7. Combine economic and nutritional results
 
-The loop produces one row per penetration level, which is then combined with baseline for the final output.
+The loop produces one row per simulation level, which is then combined with baseline for the final output.
 
 ## D1. Define Scenario Simulation Wrapper
 
-This function orchestrates the complete simulation pipeline for a single penetration level at national level by chaining all Phase A functions in sequence:
+This function orchestrates the complete simulation pipeline for a single simulation level at national level by chaining all Phase A functions in sequence:
 
-1. **A2**: Filter adopting farmers by `p_entry <= p` and compute $r_i(p)$
+1. **A2**: Retrieve `p_internal` for the simulation level, filter adopting farmers by `p_entry <= p_internal`, and compute $r_i(p_{\text{internal}})$
 2. **A3**: Calculate economic metrics at national level (scalable quantities weighted by $r_i$)
 3. **Coverage**: Calculate consumption-weighted national coverage from departmental saturation
 4. **A4**: Assign biofortification flag to children hierarchically
@@ -1364,14 +1441,15 @@ This function orchestrates the complete simulation pipeline for a single penetra
 
 **Parameters:**
 
-- `pen`: Penetration level (0-1)
+- `pen`: Simulation level (`penetration`, national biofortified maize land share, 0-1)
 - `df_farmers`: Ranked farmer data with `p_entry` and `profile`
 - `df_saturation`: Pre-calculated saturation scenarios from 06_01
+- `df_lookup`: Land share lookup from 06_01 (`penetration` to `p_internal`)
 - `df_children`: `r if (is_pco) "Synthetic population with pre-calculated profiles (from 04_08)" else "ENCOVI children with pre-calculated profiles and priority (from 05_06)"`
 - `df_market_baseline`: Market baseline for reference variables
 - `seed`: Random seed for hierarchical assignment reproducibility
 
-**Returns:** Data frame with one row containing economic and nutritional metrics at the specified penetration level.
+**Returns:** Data frame with one row containing economic and nutritional metrics at the specified simulation level.
 
 ```{r}
 #| label: d1-simulation-wrapper
@@ -1383,17 +1461,24 @@ This function orchestrates the complete simulation pipeline for a single penetra
 simulate_scenario_national <- function(pen,
                                        df_farmers,
                                        df_saturation,
+                                       df_lookup,
                                        df_children,
                                        df_market_baseline,
                                        seed = 789) {
 
   # ===========================================================================
-  # STEP 1: Filter adopting farmers and compute r_i(p) (A2)
+  # STEP 1: Retrieve p_internal, filter adopting farmers and compute
+  #         r_i(p_internal) (A2)
   # ===========================================================================
 
-  df_adopters <- filter_adopters_by_penetration(
+  # Internal adoption index associated with this simulation level
+  p_int <- df_lookup |>
+    filter(near(penetration, pen)) |>
+    pull(p_internal)
+
+  df_adopters <- filter_adopters_by_adoption_index(
     df_farmers = df_farmers,
-    penetration = pen
+    p_internal = p_int
   )
 
   # ===========================================================================
@@ -1473,7 +1558,7 @@ simulate_scenario_national <- function(pen,
 
 ## D2. Execute Scenario Simulation
 
-Execute the simulation wrapper across 10 penetration levels (10% to 100%). The baseline (0%) was already calculated in Phase C and will be combined in the next step.
+Execute the simulation wrapper across 10 simulation levels (10% to 100% biofortified maize land). The baseline (0%) was already calculated in Phase C and will be combined in the next step.
 
 ```{r}
 #| label: d2-execute-scenarios
@@ -1483,13 +1568,13 @@ Execute the simulation wrapper across 10 penetration levels (10% to 100%). The b
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# Define penetration levels to simulate (0% already calculated as baseline)
+# Simulation levels to simulate (0% already calculated as baseline)
 # ---------------------------------------------------------------------------
 
 penetration_levels_to_simulate <- seq(0.1, 1.0, by = 0.1)
 
 # ---------------------------------------------------------------------------
-# Execute simulation across all penetration levels
+# Execute simulation across all simulation levels
 # ---------------------------------------------------------------------------
 
 df_scenarios_simulated <- map_dfr(
@@ -1498,6 +1583,7 @@ df_scenarios_simulated <- map_dfr(
     pen = .x,
     df_farmers = df_farmers_ranked,
     df_saturation = df_saturation,
+    df_lookup = df_penetration_lookup,
     df_children = df_children_raw,
     df_market_baseline = df_market_baseline,
     seed = 789
@@ -2390,12 +2476,12 @@ write_parquet(
 
 ## Processing Summary
 
-This script generates pre-computed national scenarios for the Shiny dashboard, simulating biofortification impact across 11 penetration levels (0% to 100% in 10% increments). The output dataset contains 11 rows (one per penetration level) with comprehensive metrics for economic impact, nutrient intake, and stunting outcomes at the Guatemala national level.
+This script generates pre-computed national scenarios for the Shiny dashboard, simulating biofortification impact across 11 simulation levels of national biofortified maize land share (0% to 100% in 10-percentage-point increments). The output dataset contains 11 rows (one per penetration level) with comprehensive metrics for economic impact, nutrient intake, and stunting outcomes at the Guatemala national level.
 
 **Pipeline stages:**
 
-1. **Farmer filtering**: Farmers with `p_entry <= p` are admitted to the adoption pool; each receives a per-farmer conversion ratio $r_i(p)$ via `apply_adoption_curve()`
-2. **Economic aggregation**: Survey-weighted totals for adopting farmers, with scalable quantities (land, production, income, seed costs, subsidy flows) weighted by $r_i(p)$
+1. **Farmer filtering**: For each simulation level, the internal adoption index `p_internal` is read from the land share lookup of Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`; farmers with `p_entry <= p_internal` are admitted to the adoption pool, and each receives a per-farmer conversion ratio $r_i(p_{\text{internal}})$ via `apply_adoption_curve()`
+2. **Economic aggregation**: Survey-weighted totals for adopting farmers, with scalable quantities (land, production, income, seed costs, subsidy flows) weighted by $r_i(p_{\text{internal}})$
 3. **Coverage calculation**: Consumption-weighted national coverage from departmental saturation scenarios (Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`, includes gravity-based redistribution)
 4. **Child assignment**: Hierarchical biofortification assignment based on `r if (is_pco) "household occupation" else "pre-existing priority level"` (departmental coverage targets maintained)
 5. **Profile selection**: Pre-calculated baseline or QPM nutritional values selected per child based on biofortification flag (from Script `r if (is_pco) "04_08" else "05_06"`)
@@ -2414,9 +2500,9 @@ The output schema matches the standard Shiny dashboard schema.
 
 ## Continuous Adoption Model
 
-The per-farmer conversion ratio $r_i(p) = \text{sigmoid\_curve}(p, p_{\text{entry}}, \text{floor}_{\text{profile}}, k_{\text{profile}})$ determines the fraction of each farmer's economic activity that is realized at penetration $p$. The model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05. At the farmer's entry point, the conversion ratio equals the profile-specific floor; at full penetration ($p = 1$), all farmers have $r_i(1) = 1$ by construction.
+The per-farmer conversion ratio $r_i(p_{\text{internal}}) = \text{sigmoid\_curve}(p_{\text{internal}}, p_{\text{entry}}, \text{floor}_{\text{profile}}, k_{\text{profile}})$ determines the fraction of each farmer's economic activity that is realized at the internal adoption index $p_{\text{internal}}$ associated with each simulation level. Each simulation level (`penetration`) is the national share of maize land cultivated with biofortified seed, and its internal adoption index is read from the land share lookup produced by Script `r paste0("06_01_", seed_suffix, "_", subsidy_suffix)`. The model parameters (per-profile floors and steepness coefficients) are loaded from the calibrated model configuration produced by Script 02_05. At the farmer's entry point, the conversion ratio equals the profile-specific floor; at full adoption ($p_{\text{internal}} = 1$), all farmers have $r_i(1) = 1$ by construction.
 
-Scalable economic quantities (land, production, income, seed costs, subsidy flows) are aggregated as $\sum_i \text{quantity}_i \times r_i(p) \times w_i$, where $w_i$ is the survey-calibrated weight. Farmer counts reflect pool membership: a farmer either has entered the pool ($p_{\text{entry}} \leq p$) or has not.
+Scalable economic quantities (land, production, income, seed costs, subsidy flows) are aggregated as $\sum_i \text{quantity}_i \times r_i(p_{\text{internal}}) \times w_i$, where $w_i$ is the survey-calibrated weight. Farmer counts reflect pool membership: a farmer either has entered the pool ($p_{\text{entry}} \leq p_{\text{internal}}$) or has not.
 
 ## Subsidy Variables
 

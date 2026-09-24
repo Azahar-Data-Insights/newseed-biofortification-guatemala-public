@@ -1,10 +1,10 @@
 {
     "title": "Biofortified Maize Impact Assessment Framework for Guatemala",
-    "description": "Analytical framework for assessing the nutritional and economic impact of biofortified maize adoption on child stunting in Guatemala. Developed for Semilla Nueva.",
+    "description": "Analytical framework for assessing the nutritional and economic impact of biofortified maize adoption on child stunting in Guatemala. Developed for New Seed.",
     "upload_type": "software",
-    "license": "AGPL-3.0",
-    "version": "4.0.0",
-    "publication_date": "2026-08-14",
+    "license": "agpl-3.0-only",
+    "version": "4.4.0",
+    "publication_date": "2026-09-24",
     "creators": [
         {
             "name": "Sánchez Tormo, Julia María",
@@ -23,17 +23,17 @@
         },
         {
             "name": "Adams, Katherine P.",
-            "affiliation": "Semilla Nueva",
+            "affiliation": "New Seed",
             "orcid": "0000-0002-1060-2473"
         },
         {
             "name": "Bowen, Curt",
-            "affiliation": "Semilla Nueva"
+            "affiliation": "New Seed"
         }
     ],
     "contributors": [
         {
-            "name": "Semilla Nueva",
+            "name": "New Seed",
             "type": "Sponsor"
         }
     ],
@@ -47,12 +47,5 @@
         "iron",
         "quality protein",
         "modeled impacts"
-    ],
-    "related_identifiers": [
-        {
-            "identifier": "https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public",
-            "relation": "isSupplementTo",
-            "scheme": "url"
-        }
     ]
 }

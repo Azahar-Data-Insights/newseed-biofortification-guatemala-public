@@ -1,6 +1,7 @@
 ---
 title: "Transfer Model: Iron Intake"
 subtitle: "Module 3: Transfer Models"
+description-meta: "Survey-weighted gamma regression predicting child iron intake from maize and non-maize sources separately, gamma selected over lognormal by fit."
 ---
 
 ## Why Model Iron?

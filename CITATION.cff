@@ -17,14 +17,14 @@ authors:
   - family-names: "Adams"
     given-names: "Katherine P."
     orcid: "https://orcid.org/0000-0002-1060-2473"
-    affiliation: "Semilla Nueva"
+    affiliation: "New Seed"
   - family-names: "Bowen"
     given-names: "Curt"
-    affiliation: "Semilla Nueva"
+    affiliation: "New Seed"
 type: software
-license: AGPL-3.0
-version: 4.0.0
-date-released: 2026-08-14
+license: AGPL-3.0-only
+version: 4.4.0
+date-released: 2026-09-24
 repository-code: "https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public"
 keywords:
   - biofortification

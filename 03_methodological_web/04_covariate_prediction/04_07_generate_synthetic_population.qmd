@@ -1,6 +1,7 @@
 ---
 title: "Generating Synthetic Population"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "Donating dietary profiles from ENCOVI to SIVESNU children through a bridge model with regional candidate cells and departmental anchoring."
 ---
 
 ## Overview

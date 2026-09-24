@@ -1,6 +1,7 @@
 ---
 title: "Prepare SIVESNU Height Data"
 subtitle: "Module 5: Meta-analysis"
+description-meta: "Building the predictor set for the Gunaratna meta-analysis pathway: harmonization, random forest imputation, Yeo-Johnson and Boruta selection."
 ---
 
 ## Why Prepare SIVESNU Height Data?

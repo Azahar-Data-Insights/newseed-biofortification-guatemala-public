@@ -1,6 +1,7 @@
 ---
 title: "Farmer Segmentation"
 subtitle: "Module 2: Economic Impact"
+description-meta: "ENCOVI does not record seed type. PAM clustering with LDA validation and quadrant segmentation infer maize farmer segments from yield and seed spend."
 ---
 
 ## Why Segment Farmers?
@@ -1095,7 +1096,7 @@ tbl_d5_score_summary |>
 
 ## Threshold Determination
 
-Score thresholds are determined from a target land distribution taken from Semilla Nueva market data on current seed purchasing. Rather than fixing score cutoffs directly, the thresholds are solved so that the share of cultivated land in each segment matches that distribution.
+Score thresholds are determined from a target land distribution taken from New Seed market data on current seed purchasing. Rather than fixing score cutoffs directly, the thresholds are solved so that the share of cultivated land in each segment matches that distribution.
 
 ```{r}
 #| label: tbl-e3-optimal-thresholds
@@ -1195,7 +1196,7 @@ ggplot(fig_e4_cumulative_land, aes(x = score_total, y = land_pct_cumsum)) +
 
 ::: {.callout-important}
 ## Threshold-Based Segmentation
-The thresholds are read off the **cumulative land distribution curve** so that each segment holds its target share of cultivated land, taken from Semilla Nueva's field estimates of current seed technology adoption. Those targets are heavily concentrated: 87.0% of white maize land sits in the non-hybrid segment, against 3.5%, 4.7% and 4.9% for Low, Mid and High. The resulting cutoffs are 44.5, 40.4 and 32.8 points, so the three purchased-seed segments are separated by a narrow band at the top of the score scale.
+The thresholds are read off the **cumulative land distribution curve** so that each segment holds its target share of cultivated land, taken from New Seed's field estimates of current seed technology adoption. Those targets are heavily concentrated: 87.0% of white maize land sits in the non-hybrid segment, against 3.5%, 4.7% and 4.9% for Low, Mid and High. The resulting cutoffs are 44.5, 40.4 and 32.8 points, so the three purchased-seed segments are separated by a narrow band at the top of the score scale.
 :::
 
 
@@ -1431,7 +1432,7 @@ tbl_f3_segment_means |>
 | Scoring | Hurdle model: deterministic zero-expenditure branch + continuous branch | Matches the zero-inflated expenditure distribution |
 | Weights | LDA-derived from cluster separation | Read from the data rather than set by hand |
 | Modulators | Poverty + Land ownership | Stratified correlation analysis shows different slopes |
-| Thresholds | Cumulative land distribution | Reproduces the target land distribution from Semilla Nueva market data |
+| Thresholds | Cumulative land distribution | Reproduces the target land distribution from New Seed market data |
 
 ### Key Findings
 
@@ -1446,7 +1447,7 @@ tbl_f3_segment_means |>
    agricultural performance with different slopes across strata, which is what
    places them in the scoring as secondary modulators.
 
-4. **Target-based thresholds**: The score boundaries reproduce Semilla Nueva's
+4. **Target-based thresholds**: The score boundaries reproduce New Seed's
    field estimates of current seed technology adoption, under which 87.0% of
    white maize land is non-hybrid.
 

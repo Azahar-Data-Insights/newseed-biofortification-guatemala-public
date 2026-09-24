@@ -1,6 +1,7 @@
 ---
 title: "QPM Stunting Impact"
 subtitle: "Module 5: Meta-analysis"
+description-meta: "Meta-analysis pathway: growth velocity by baseline HAZ and a protein adequacy sigmoid turn QPM intake gains into height and stunting change."
 ---
 
 ## Why Calculate QPM Stunting Impact?

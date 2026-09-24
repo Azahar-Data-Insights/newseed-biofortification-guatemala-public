@@ -1,6 +1,7 @@
 ---
 title: "Continuous Stunting Model"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "GAM predicting height-for-age Z-score magnitude from a composite nutritional index, evaluated by residual diagnostics and survey-weighted ROC."
 ---
 
 ## Overview

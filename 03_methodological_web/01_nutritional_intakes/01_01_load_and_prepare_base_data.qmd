@@ -1,6 +1,7 @@
 ---
 title: "Data Sources and Integration"
 subtitle: "Module 1: Nutrient Intakes"
+description-meta: "Integrating ENCOVI 2023 consumption records with INCAP food composition tables and PDCAAS protein quality scores into one nutrient intake base."
 ---
 
 ## Overview

@@ -1,6 +1,7 @@
 ---
 title: "Prepare Nutrient Transfer Modeling Data"
 subtitle: "Module 3: Transfer Models"
+description-meta: "SIVESNU children have anthropometry but no diet, ENCOVI the reverse. Preparing shared predictors with random forest imputation and Yeo-Johnson."
 ---
 
 

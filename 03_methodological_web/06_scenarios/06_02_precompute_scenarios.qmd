@@ -1,13 +1,14 @@
 ---
 title: "Precompute Biofortification Scenarios"
 subtitle: "Module 6: Scenarios"
+description-meta: "Pre-computing the seed-by-subsidy scenario grid across departments and coverage levels so the dashboard aggregates instead of simulating live."
 ---
 
 ## Why Precompute Scenarios?
 
 The Shiny dashboard requires real-time response to user interactions. Computing biofortification impacts on-the-fly would involve:
 
-- Resolving each farmer's conversion ratio along the continuous adoption curve for every national production coverage level.
+- Resolving each farmer's conversion ratio along the continuous adoption curve at the internal adoption index associated with every national production coverage level.
 - Looking up pre-computed individual profiles (baseline intake, QPM intake, baseline stunting, QPM stunting) for the 4,065 children of the synthetic population or the 4,134 ENCOVI children, depending on the pathway.
 - Allocating biofortified maize across departments using the gravity-based redistribution from the market baseline.
 - Aggregating survey-weighted metrics across 22 departments and 11 production coverage levels.
@@ -52,23 +53,23 @@ For each production coverage level (0% to 100% in 10% increments) the pipeline e
 
 ### Step 1: Determine Each Farmer's Conversion Ratio
 
-Production coverage is implemented as a continuous adoption process driven by the per-farmer parameters calibrated in Module 2. At national production coverage `p`, every farmer with entry point `p_entry ≤ p` is in the adoption pool, and contributes a fraction of their potential biofortified production determined by the profile-specific sigmoid:
+Production coverage is implemented as a continuous adoption process driven by the per-farmer parameters calibrated in Module 2. Each production coverage level is evaluated at its internal adoption index `p_internal`, the position on the national adoption ranking that plants that share of maize-growing area with biofortified seed. Every farmer with entry point `p_entry ≤ p_internal` is in the adoption pool, and converts a fraction of their maize land, and of their potential biofortified production, determined by the profile-specific sigmoid:
 
 $$
-r_i(p) = \text{sigmoid}(p, p_{entry,i}, \text{floor}_{profile}, k_{profile})
+r_i(p_{internal}) = \text{sigmoid}(p_{internal}, p_{entry,i}, \text{floor}_{profile}, k_{profile})
 $$
 
-The effective biofortified production of farmer `i` at production coverage `p` is:
+The effective biofortified production of farmer `i` at that production coverage level is:
 
 $$
-\text{bio}_i(p) = \text{production\_biofortified}_i \times \text{weight\_calibrated}_i \times r_i(p)
+\text{bio}_i(p_{internal}) = \text{production\_biofortified}_i \times \text{weight\_calibrated}_i \times r_i(p_{internal})
 $$
 
-This formulation expresses adoption as a smooth conversion intensity per farmer. The conversion curves and their calibration are documented in detail in the [Market Baseline Calculation](06_01_calculate_market_baseline.qmd#continuous-adoption-model) page.
+This formulation expresses adoption as a smooth conversion intensity per farmer. The conversion curves and their calibration are documented in the [Market Baseline Calculation](06_01_calculate_market_baseline.qmd#continuous-adoption-model) page, together with the [production coverage scale](06_01_calculate_market_baseline.qmd#production-coverage-scale) that associates each level with its internal adoption index.
 
 ### Step 2: Calculate Economic Metrics
 
-For adopting farmers (those with `p_entry ≤ p`), the script calculates survey-weighted aggregates:
+For adopting farmers (those with `p_entry ≤ p_internal`), the script calculates survey-weighted aggregates:
 
 - **n_farmers_bio** — Total adopting farmers (with conversion ratio applied).
 - **land_bio_ha** — Biofortified land area (hectares).
@@ -76,7 +77,9 @@ For adopting farmers (those with `p_entry ≤ p`), the script calculates survey-
 - **income_increment_total** — Additional farmer income (Q).
 - **cost_seeds_increment_total** — Change in seed costs (Q).
 
-The seed cost component depends on the active subsidy regime: under the current regime the per-area subsidy is funded entirely by Semilla Nueva, while under the reduced regimes part of the cost becomes producer subsidy absorption and part is passed to the farmer. The decomposition by actor is documented in [Module 2](../02_economic_impact/02_04_calculate_economic_impact.qmd).
+At national level, `land_bio_ha` over the total maize land reproduces the production coverage level of each scenario, within the association error of the production coverage scale.
+
+The seed cost component depends on the active subsidy regime: under the current regime the per-area subsidy is funded entirely by New Seed, while under the reduced regimes part of the cost becomes producer subsidy absorption and part is passed to the farmer. The decomposition by actor is documented in [Module 2](../02_economic_impact/02_04_calculate_economic_impact.qmd).
 
 ### Step 3: Retrieve Departmental Coverage
 
@@ -639,7 +642,7 @@ format_nutritional_table(
 
 The economic dimension is invariant to the stunting pathway: the same farmers adopt the same land under the same conversion curves regardless of whether the downstream stunting impact is estimated via covariate prediction or meta-analysis. The economic block therefore consolidates the full grid of nine combinations — three seed variants (2022, 2026 and 2028 seed) and three subsidy regimes (current, 50% reduction, 75% reduction) — drawing from the covariate prediction pathway outputs.
 
-The subsidy regime affects the seed cost structure faced by farmers. Under the current regime the per-area subsidy is funded entirely by Semilla Nueva, at 242 Q/mz of direct commitment, with no producer subsidy absorption and no extra cost to the farmer. Under the reduced regimes the reduction is split equally between producer subsidy absorption, through improved producibility, and the farmer, through a higher biofortified seed price. The complete decomposition by actor is documented in [Module 2](../02_economic_impact/02_04_calculate_economic_impact.qmd).
+The subsidy regime affects the seed cost structure faced by farmers. Under the current regime the per-area subsidy is funded entirely by New Seed, at 242 Q/mz of direct commitment, with no producer subsidy absorption and no extra cost to the farmer. Under the reduced regimes the reduction is split equally between producer subsidy absorption, through improved producibility, and the farmer, through a higher biofortified seed price. The complete decomposition by actor is documented in [Module 2](../02_economic_impact/02_04_calculate_economic_impact.qmd).
 
 The seed variant affects yield change factors per farmer segment. The 2022 variety reflects current field performance; the 2026 and 2028 varieties reflect expected improvements from ongoing breeding pipelines. Higher yield change factors translate into higher per-farmer income increments and larger production volumes at the same production coverage level.
 
@@ -797,7 +800,7 @@ Both datasets share identical variable schemas for compatibility with downstream
 
 ### Adoption Mechanism
 
-The continuous adoption mechanism assumes that farmers with higher adoption scores (better technology fit, larger scale, prior hybrid experience) enter the adoption pool at lower national production coverage levels. Within each farmer, the conversion intensity follows the profile-specific sigmoid calibrated against empirical adoption anchors in Module 2.
+The continuous adoption mechanism assumes that farmers with higher adoption scores (better technology fit, larger scale, prior hybrid experience) enter the adoption pool earlier along the national adoption ranking, and therefore at lower production coverage levels. Within each farmer, the conversion intensity follows the profile-specific sigmoid calibrated against empirical adoption anchors in Module 2.
 
 ### Consumption Coverage Assignment
 
@@ -829,7 +832,7 @@ The scenario precomputation step generates the analytical backbone for the Shiny
 
 ### Key methodological elements
 
-1. **Continuous adoption** — Per-farmer conversion intensity along profile-specific sigmoid curves produces smooth saturation trajectories.
+1. **Continuous adoption** — Per-farmer conversion intensity along profile-specific sigmoid curves, evaluated at the internal adoption index that reproduces each production coverage level, produces smooth saturation trajectories.
 
 2. **Pre-computed individual profiles** — Module 6 receives baseline and QPM profiles from Modules 4 and 5 and is responsible only for assignment and aggregation, not for the underlying nutritional and stunting modelling.
 

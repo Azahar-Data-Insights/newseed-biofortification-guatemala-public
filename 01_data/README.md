@@ -1,6 +1,6 @@
 # Data Directory
 
-Root directory for all data used by the NewSeed biofortification
+Root directory for all data used by the New Seed biofortification
 framework. Organized into three subdirectories by data lifecycle stage.
 
 ## Directory Structure
@@ -9,7 +9,7 @@ framework. Organized into three subdirectories by data lifecycle stage.
 01_data/
 ├── 01_raw/                  # Parquet conversions of official survey data
 │   ├── ENCOVI_2023/         #   National Living Conditions Survey 2023
-│   ├── SIVESNU_2018/        #   Epidemiological Surveillance System 2018
+│   ├── SIVESNU_2018/        #   Health and Nutrition Epidemiological Surveillance System 2018–2019
 │   ├── INE_NACIMIENTOS/     #   INE birth registry 2019-2023 (downloads)
 │   ├── WHO_GROWTH/          #   WHO child growth standards (downloads)
 │   ├── _originals/          #   ZIP archive of pre-conversion originals

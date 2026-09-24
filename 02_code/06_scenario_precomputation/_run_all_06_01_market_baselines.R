@@ -12,6 +12,7 @@
 # Outputs per combination:
 #   - 06_01_{seed_suffix}_{subsidy_suffix}_market_baseline.parquet
 #   - 06_01_{seed_suffix}_{subsidy_suffix}_saturation_scenarios.parquet
+#   - 06_01_{seed_suffix}_{subsidy_suffix}_penetration_lookup.parquet
 #
 # Prerequisites:
 #   - 02_05 output: calibrated model configuration (model_config.rds)
@@ -226,6 +227,18 @@ safe_render_combo <- function(combo, qmd_input, parquet_output_dir) {
         stop("saturation_scenarios parquet is empty: ", expected_parquet_scenarios)
       }
 
+      expected_parquet_lookup <- file.path(
+        parquet_output_dir,
+        paste0(
+          "06_01_", combo$seed_suffix, "_", combo$subsidy_suffix,
+          "_penetration_lookup.parquet"
+        )
+      )
+
+      if (!file.exists(expected_parquet_lookup)) {
+        stop("Expected penetration_lookup parquet not generated: ", expected_parquet_lookup)
+      }
+
       tibble::tibble(
         seed_suffix      = combo$seed_suffix,
         seed_label       = combo$seed_label,
@@ -422,12 +435,14 @@ run_pipeline <- function() {
 
   mirai::everywhere(
     {
-      suppressPackageStartupMessages({
-        library(quarto)
-        library(arrow)
-        library(here)
-        library(tibble)
-      })
+      suppressPackageStartupMessages(
+        pacman::p_load(
+          quarto,         # Parametrized rendering
+          arrow,          # Parquet read for post-render validation
+          here,           # Robust file paths
+          tibble          # Log rows returned by the worker
+        )
+      )
       if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
         RhpcBLASctl::blas_set_num_threads(1)
         RhpcBLASctl::omp_set_num_threads(1)

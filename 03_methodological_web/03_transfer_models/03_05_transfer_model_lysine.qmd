@@ -1,6 +1,7 @@
 ---
 title: "Transfer Model: Lysine Intake"
 subtitle: "Module 3: Transfer Models"
+description-meta: "Survey-weighted gamma regression for lysine intake, the limiting amino acid QPM biofortification targets, from maize and non-maize sources."
 ---
 
 ## Why Model Lysine?

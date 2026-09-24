@@ -1,6 +1,7 @@
 ---
 title: "Biofortification Priority Assignment"
 subtitle: "Module 5: Meta-analysis"
+description-meta: "Classifying households into mutually exclusive priority levels by how biofortified maize would reach them: own production, local market or neither."
 ---
 
 ## Why Assign Biofortification Priority?

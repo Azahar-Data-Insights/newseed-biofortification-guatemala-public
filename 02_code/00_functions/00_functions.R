@@ -16,7 +16,7 @@
 # 7. Scenario Simulation & Market Modeling
 #
 # Author: Azahar Data Insights (ADI)
-# Project: NewSeed - Guatemala
+# Project: New Seed - Guatemala
 # ==============================================================================
 
 

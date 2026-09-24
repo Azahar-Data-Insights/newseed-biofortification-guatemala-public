@@ -1,6 +1,7 @@
 ---
 title: "Applying Transfer Models to SIVESNU"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "Harmonizing SIVESNU predictors with ENCOVI, applying the transfer models, and calibrating predicted intake by quantile mapping to ENCOVI distributions."
 ---
 
 ## Overview

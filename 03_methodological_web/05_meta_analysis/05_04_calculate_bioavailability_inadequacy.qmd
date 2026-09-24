@@ -1,6 +1,7 @@
 ---
 title: "Bioavailability and Nutrient Inadequacy"
 subtitle: "Module 5: Meta-analysis"
+description-meta: "Converting intake into absorbed nutrients and classifying inadequacy against H-AR thresholds, at baseline and under full QPM coverage."
 ---
 
 ## Why Calculate Bioavailability and Inadequacy?

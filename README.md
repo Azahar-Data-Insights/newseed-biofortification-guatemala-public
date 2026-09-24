@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-An analytical framework for evaluating the nutritional and economic impact of biofortified maize adoption on child stunting in Guatemala. Developed by [Azahar Data Insights](https://azahardata.com/) for [New Seed (Semilla Nueva)](https://www.semillanueva.org/), with nutritional methodology advisory from [FINUT](https://www.finut.org/).
+An analytical framework for evaluating the nutritional and economic impact of biofortified maize adoption on child stunting in Guatemala. Developed by [Azahar Data Insights](https://azahardata.com/) for [New Seed](https://www.semillanueva.org/), with nutritional methodology advisory from [FINUT](https://www.finut.org/).
 
 ---
 
@@ -40,7 +40,7 @@ Combines the upstream modules to precompute departmental and national scenarios 
 
 The two impact pathways (Covariate prediction and Meta-analysis) are reported side by side so that estimates can be compared across methodologies.
 
-📖 [Methodological Documentation](https://newseed.azahardata.com/web-guatemala) — Complete model specifications, distribution choices, and validation results.
+📖 [Methodological Documentation](https://newseed.azahardata.com/web-guatemala/) — Complete model specifications, distribution choices, and validation results.
 
 ---
 
@@ -55,7 +55,7 @@ The interactive dashboard enables exploration of biofortification scenarios acro
 - **Nutritional outcomes**: projected changes in stunting prevalence and height-for-age z-score distributions
 - **Stunting methodology**: results under both the Covariate prediction and Meta-analysis (Gunaratna) pathways
 
-🌐 [Interactive Dashboard](https://newseed.azahardata.com/app-guatemala) — Explore scenarios and download results.
+🌐 [Interactive Dashboard](https://newseed.azahardata.com/app-guatemala/) — Explore scenarios and download results.
 
 ---
 
@@ -88,7 +88,7 @@ The interactive dashboard enables exploration of biofortification scenarios acro
 │   ├── 06_scenario_precomputation/
 │   └── _run_all_project.R       # Top-level pipeline orchestrator
 │
-├── 03_methodological_web/       # Quarto sources of the methodological site
+├── 03_methodological_web/       # Page sources of the methodological site
 │   └── references.bib           # Bibliography for sources and methods
 │
 ├── renv/                        # R environment for reproducibility
@@ -108,7 +108,7 @@ The pipeline is launched through orchestrators (`_run_all_*.R`): module orchestr
 | Source | Year | Description | Access |
 |--------|------|-------------|--------|
 | ENCOVI | 2023 | National Living Conditions Survey — household consumption, socioeconomic characteristics, agricultural production | [INE Guatemala](https://www.ine.gob.gt/pobreza-menu/) |
-| SIVESNU | 2018 | Nutrition Surveillance System — child anthropometry, maternal characteristics, health indicators | [SIINSAN](https://portal.siinsan.gob.gt/monitoreo-y-evaluacion/) |
+| SIVESNU | 2018–2019 | Health and Nutrition Epidemiological Surveillance System — child anthropometry, maternal characteristics, health indicators | [SIINSAN](https://portal.siinsan.gob.gt/monitoreo-y-evaluacion/) |
 | MAGA | 2023 | Official agricultural statistics — departmental basic grains production | [Production report (PDF)](https://precios.maga.gob.gt/archivos/produccion/Informe%20de%20Producci%C3%B3n%20de%20Granos%20B%C3%A1sicos%20Diciembre%202023.pdf) |
 | INCAP / FINUT | — | Food composition tables, PDCAAS values, amino acid profiles, local unit equivalences | Included in repository |
 | WHO Child Growth Standards | — | Length/height-for-age standards (0–19 years) for z-score computation | [who.int](https://www.who.int/tools/child-growth-standards) |
@@ -187,7 +187,7 @@ Module 01 requires raw ENCOVI/SIVESNU microdata, which are not distributed here.
 If you use this framework in your research, please cite it using the metadata in [CITATION.cff](CITATION.cff), or the following:
 
 ```bibtex
-@software{sanchez_tormo_biofortification_guatemala,
+@software{newseed_biofortification_guatemala,
   author    = {Sánchez Tormo, Julia María and
                Palomo Llinares, Rubén and
                Soto Méndez, María José and
@@ -196,7 +196,7 @@ If you use this framework in your research, please cite it using the metadata in
   title     = {{Biofortified Maize Impact Assessment Framework
                 for Guatemala}},
   year      = {2026},
-  version   = {4.0.0},
+  version   = {4.4.0},
   license   = {AGPL-3.0},
   url       = {https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public}
 }
@@ -218,13 +218,13 @@ See [LICENSE](LICENSE) for the full text.
 
 The AGPL-3.0 license applies to the code in this repository. The nutrition tables in `01_data/03_external/` are distributed to make the analysis reproducible. The food composition base is transcribed from published INCAP sources; the protein-quality layer was compiled by FINUT from the literature cited in that directory's README. Reuse of these tables should cite the original sources rather than this repository.
 
-The methodological website in `03_methodological_web/` is part of this release: its Quarto sources are published here as auditable material, and the rendered site is available at [newseed.azahardata.com/web-guatemala](https://newseed.azahardata.com/web-guatemala). The interactive Shiny dashboard is a separate component developed by Azahar Data Insights and its source code is not part of this open-source release; all the figures it displays are precomputed by Module 06 and included here, so its absence does not affect the reproducibility of any reported result.
+The methodological website in `03_methodological_web/` is part of this release: the source of each page is published here as auditable material, with the code that reads its tables, figures and numbers from the pipeline outputs; the configuration that builds and serves the site is not included. The rendered site is available at [newseed.azahardata.com/web-guatemala](https://newseed.azahardata.com/web-guatemala/). The interactive Shiny dashboard is a separate component developed by Azahar Data Insights and its source code is not part of this open-source release; all the figures it displays are precomputed by Module 06 and included here, so its absence does not affect the reproducibility of any reported result.
 
 ---
 
 ## Acknowledgments
 
-This work was commissioned and funded by New Seed (Semilla Nueva), with nutritional methodology advisory from FINUT. We gratefully acknowledge the institutions that provided data access. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) and [FUNDERS.md](FUNDERS.md) for details.
+This work was commissioned and funded by New Seed, with nutritional methodology advisory from FINUT. We gratefully acknowledge the institutions that provided data access. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) and [FUNDERS.md](FUNDERS.md) for details.
 
 ---
 

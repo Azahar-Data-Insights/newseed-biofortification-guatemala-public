@@ -1,6 +1,7 @@
 ---
 title: "Market Baseline Calculation"
 subtitle: "Module 6: Scenarios"
+description-meta: "Departmental white maize supply and demand balance across Guatemala's 22 departments, redistributed with a gravity model over OSRM travel times."
 ---
 
 ## Why Calculate a Market Baseline?
@@ -11,9 +12,9 @@ Scenario modeling requires establishing the supply-demand balance for white maiz
 - **Consumption demand** — How much maize does each department's population require?
 - **Structural surplus/deficit** — Which departments produce more than they consume, and which face structural deficits?
 
-This baseline enables realistic scenario projections that account for geographic heterogeneity in agricultural capacity and population density. It also feeds two structural elements that govern how production reaches consumption across the country: the continuous adoption curves that determine each farmer's contribution at any national production coverage level, and the gravity-based redistribution model that channels surplus from producing departments to deficit departments along real travel times.
+This baseline enables realistic scenario projections that account for geographic heterogeneity in agricultural capacity and population density. It also feeds three structural elements that govern how production reaches consumption across the country: the continuous adoption curves that determine each farmer's contribution, the production coverage scale that places each national production coverage level on the adoption ranking, and the gravity-based redistribution model that channels surplus from producing departments to deficit departments along real travel times.
 
-The figures presented here correspond to the **baseline scenario** combining the **2022 biofortified seed variety** (currently deployed in the field) with the **current subsidy regime** as of April 2026. Alternative seed variants and subsidy regimes are evaluated in the Shiny dashboard.
+The figures presented here correspond to the **baseline scenario** combining the **2022 biofortified seed variety** with the **current subsidy regime** as of April 2026. Alternative seed variants and subsidy regimes are evaluated in the Shiny dashboard.
 
 ```{r}
 #| label: setup
@@ -48,7 +49,8 @@ options(scipen = 999, digits = 4)
 #
 #   (1) RDS exported by framework 06_01x under the baseline variant
 #       (seed S22, subsidy sub00). Artefacts covering data
-#       dimensions, baseline metrics, saturation curves, conservation
+#       dimensions, baseline metrics, production coverage scale
+#       (lookup table and curve), saturation curves, conservation
 #       check, saturation order, post-redistribution metrics.
 #
 #   (2) Parquets exported by framework 06_00 (one-shot OSRM script).
@@ -81,33 +83,51 @@ tbl_b7_baseline_summary <- import(
   trust = TRUE
 )
 
-fig_c1_saturation_curves <- import(
+tbl_c4_land_share_lookup <- import(
   here("..", "01_data", "02_processed", "web_resources",
-       "06_01_s22_sub00_fig_c1_saturation_curves.rds"),
+       "06_01_s22_sub00_tbl_c4_land_share_lookup.rds"),
   trust = TRUE
 )
 
-tbl_c3_conservation_check <- import(
+fig_c5_land_share_curve <- import(
   here("..", "01_data", "02_processed", "web_resources",
-       "06_01_s22_sub00_tbl_c3_conservation_check.rds"),
+       "06_01_s22_sub00_fig_c5_land_share_curve.rds"),
   trust = TRUE
 )
 
-tbl_c4_saturation_order <- import(
+fig_c5_land_share_points <- import(
   here("..", "01_data", "02_processed", "web_resources",
-       "06_01_s22_sub00_tbl_c4_saturation_order.rds"),
+       "06_01_s22_sub00_fig_c5_land_share_points.rds"),
   trust = TRUE
 )
 
-fig_c5_saturation_after <- import(
+fig_d1_saturation_curves <- import(
   here("..", "01_data", "02_processed", "web_resources",
-       "06_01_s22_sub00_fig_c5_saturation_after.rds"),
+       "06_01_s22_sub00_fig_d1_saturation_curves.rds"),
   trust = TRUE
 )
 
-tbl_c6_market_metrics_after <- import(
+tbl_d3_conservation_check <- import(
   here("..", "01_data", "02_processed", "web_resources",
-       "06_01_s22_sub00_tbl_c6_market_metrics_after.rds"),
+       "06_01_s22_sub00_tbl_d3_conservation_check.rds"),
+  trust = TRUE
+)
+
+tbl_d4_saturation_order <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_d4_saturation_order.rds"),
+  trust = TRUE
+)
+
+fig_d5_saturation_after <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_fig_d5_saturation_after.rds"),
+  trust = TRUE
+)
+
+tbl_d6_market_metrics_after <- import(
+  here("..", "01_data", "02_processed", "web_resources",
+       "06_01_s22_sub00_tbl_d6_market_metrics_after.rds"),
   trust = TRUE
 )
 
@@ -161,8 +181,24 @@ max_travel_time <- gravity_value("Max travel time (min)")
 # Departmental coverage before and after the gravity redistribution
 n_dept_saturating <- sum(tbl_b7_baseline_summary$max_coverage_pct >= 100)
 n_dept_total      <- nrow(tbl_b7_baseline_summary)
-min_coverage_after <- round(min(tbl_c6_market_metrics_after$coverage_after), 1)
-max_coverage_gain  <- round(max(tbl_c6_market_metrics_after$coverage_change), 1)
+min_coverage_after <- round(min(tbl_d6_market_metrics_after$coverage_after), 1)
+max_coverage_gain  <- round(max(tbl_d6_market_metrics_after$coverage_change), 1)
+
+# Production coverage scale: grid size, internal adoption index at selected
+# levels, and maximum association error (rounded up, so the text never
+# understates it)
+n_grid_values <- format(nrow(fig_c5_land_share_curve), big.mark = ",")
+
+p_internal_at <- function(level_pct) {
+  tbl_c4_land_share_lookup |>
+    filter(near(target_pct, level_pct)) |>
+    pull(p_internal) |>
+    round(2)
+}
+
+p_internal_10 <- p_internal_at(10)
+p_internal_50 <- p_internal_at(50)
+max_error_pp  <- ceiling(max(abs(tbl_c4_land_share_lookup$error_pp)) * 1000) / 1000
 ```
 
 
@@ -302,36 +338,175 @@ Even at 100% biofortified production coverage, 6 of the 22 departments satisfy t
 
 ## Continuous Adoption Model
 
-Production coverage is implemented as a continuous adoption process rather than a binary admit / exclude rule. Each farmer carries two attributes calibrated in Module 2:
+Adoption is implemented as a continuous process rather than a binary admit / exclude rule. Each farmer carries two attributes calibrated in Module 2:
 
-- A **per-farmer entry point** `p_entry` — the national production coverage level at which the farmer begins adopting biofortified seed.
+- A **per-farmer entry point** `p_entry` — the farmer's position on the national adoption ranking. Farmers are ordered by adoption score and the ranking is scaled by cumulative maize production, so `p_entry` runs from 0 for the first farmer to 1.
 - A **behavioural profile** `S`, `M`, or `L` (Small, Medium, Large entry-size) — that governs the steepness of conversion intensity from the entry point onwards.
 
-At national production coverage `p`, every farmer with `p_entry ≤ p` is in the adoption pool. The fraction of that farmer's potential biofortified production realised at production coverage `p` is the conversion ratio:
+Farmer-level adoption is evaluated at an **internal adoption index** `p_internal`, measured on the same ranking scale. Every farmer with `p_entry ≤ p_internal` is in the adoption pool. The fraction of that farmer's maize land, and of their potential biofortified production, converted at `p_internal` is the conversion ratio:
 
 $$
-r_i(p) = \text{sigmoid}(p, p_{entry,i}, \text{floor}_{profile}, k_{profile})
+r_i(p_{internal}) = \text{sigmoid}(p_{internal}, p_{entry,i}, \text{floor}_{profile}, k_{profile})
 $$
 
-where `floor_{profile}` is the conversion fraction at the entry point itself, and `k_{profile}` controls how rapidly conversion rises from the floor towards 1 as `p` increases. The six scalar parameters (`floor_S`, `floor_M`, `floor_L`, `k_S`, `k_M`, `k_L`) come from the model configuration calibrated in [Module 2](../02_economic_impact/02_05_determine_likely_adopters_model.qmd) against empirical adoption anchors via median absolute deviation. At `p = 0` no farmer is in the pool; at `p = 1` every farmer is in the pool with `r_i(1) = 1` by construction.
+where `floor_{profile}` is the conversion fraction at the entry point itself, and `k_{profile}` controls how rapidly conversion rises from the floor towards 1 as `p_internal` increases. The six scalar parameters (`floor_S`, `floor_M`, `floor_L`, `k_S`, `k_M`, `k_L`) come from the model configuration calibrated in [Module 2](../02_economic_impact/02_05_determine_likely_adopters_model.qmd) against empirical adoption anchors via median absolute deviation. At `p_internal = 0` no farmer is in the pool; at `p_internal = 1` every farmer is in the pool with `r_i(1) = 1` by construction.
 
-The effective biofortified production of farmer `i` at production coverage `p` is therefore:
+The effective biofortified production of farmer `i` at internal adoption index `p_internal` is therefore:
 
 $$
-\text{bio}_i(p) = \text{production\_biofortified}_i \times \text{weight\_calibrated}_i \times r_i(p)
+\text{bio}_i(p_{internal}) = \text{production\_biofortified}_i \times \text{weight\_calibrated}_i \times r_i(p_{internal})
 $$
 
-This formulation captures realistic adoption patterns where early adopters are not uniformly distributed across departments, and where each farmer's conversion intensity varies by behavioural profile and position along the production coverage curve. It also produces smooth saturation trajectories (shown in the consumption coverage analysis below) that converge to the maximum biofortified production capacity at full production coverage.
+This formulation captures realistic adoption patterns where early adopters are not uniformly distributed across departments, and where each farmer's conversion intensity varies by behavioural profile and position along the adoption ranking. It also produces smooth saturation trajectories (shown in the consumption coverage analysis below) that converge to the maximum biofortified production capacity at full production coverage.
+
+The internal adoption index records a position on a ranking scaled by production; production coverage records how much maize-growing area is planted with biofortified seed. The next section builds the scale that connects the two.
+
+
+## Production Coverage Scale
+
+The scenarios are defined on **production coverage**, the share of maize-growing area planted with biofortified seed, at eleven levels from 0% to 100% in steps of 10 percentage points. Each production coverage level is evaluated at the internal adoption index that plants that share of maize land with biofortified seed. The association is computed separately for each seed variant and subsidy regime, since both shape the adoption ranking.
+
+The framework evaluates the internal adoption index on a grid of `r n_grid_values` equally spaced values between 0 and 1. At each value, national production coverage is the converted maize land over the total maize land:
+
+$$
+\text{production coverage}(p_{internal}) = \frac{\sum_i \text{land\_wtcorn}_i \times r_i(p_{internal}) \times \text{weight\_calibrated}_i}{\sum_i \text{land\_wtcorn}_i \times \text{weight\_calibrated}_i}
+$$
+
+Numerator and denominator share the same land unit, so the ratio needs no conversion. Each of the eleven levels is assigned the grid value whose production coverage is closest to its target, and the two endpoints are fixed: 0% corresponds to an empty adoption pool and 100% to full adoption, where every farmer has `r_i(1) = 1`.
+
+```{r}
+#| label: tbl-c4-land-share-lookup
+#| tbl-cap: "Production coverage levels and their internal adoption index"
+
+tbl_c4_land_share_lookup |>
+  gt() |>
+  tab_header(
+    title = "Production Coverage Scale",
+    subtitle = "Internal adoption index associated with each production coverage level (2022 seed, current subsidy)"
+  ) |>
+  cols_label(
+    target_pct = "Production Coverage Target",
+    p_internal = "Internal Adoption Index",
+    land_pct_achieved = "Production Coverage Achieved",
+    error_pp = "Difference (pp)",
+    land_bio_ha = "Biofortified Land (ha)",
+    land_total_ha = "Total Maize Land (ha)"
+  ) |>
+  cols_align(align = "right", columns = everything()) |>
+  fmt_number(columns = target_pct, decimals = 0, pattern = "{x}%") |>
+  fmt_number(columns = p_internal, decimals = 4) |>
+  fmt_number(columns = land_pct_achieved, decimals = 2, pattern = "{x}%") |>
+  fmt_number(columns = error_pp, decimals = 3, force_sign = TRUE) |>
+  fmt_number(columns = c(land_bio_ha, land_total_ha), use_seps = TRUE, decimals = 0) |>
+  tab_source_note(
+    source_note = "Source: ENCOVI 2023 (MAGA-calibrated). Production coverage = share of maize-growing area planted with biofortified seed. Internal adoption index = position on the adoption ranking at which farmer-level adoption is evaluated. Difference = achieved minus target, in percentage points. Land converted at 0.7 ha/mz."
+  ) |>
+  tab_options(
+    table.font.size = px(11),
+    heading.title.font.size = px(14),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.size = px(10)
+  )
+```
+
+The association error does not exceed `r max_error_pp` percentage points at any level. Reaching 10% production coverage takes the ranking to an internal adoption index of `r p_internal_10`, and reaching 50% takes it to `r p_internal_50`: farmers enter the adoption pool at their profile floor and convert the rest of their land only as the index advances.
+
+```{r}
+#| label: fig-c5-land-share-curve
+#| fig-cap: "National production coverage by internal adoption index, with the eleven production coverage levels"
+#| fig-alt: >
+#|   Line chart with the internal adoption index (percent) on the x-axis and
+#|   national production coverage (percent) on the y-axis. A single curve runs
+#|   from the origin to the upper right corner. Eleven points on the curve mark
+#|   the production coverage levels from 0 to 100 percent, each labelled with
+#|   its percentage and joined to both axes by dotted guide lines.
+#| fig-width: 10
+#| fig-height: 8
+#| warning: false
+
+ggplot() +
+  # Vertical guide lines (internal adoption index of each level)
+  geom_segment(
+    data = fig_c5_land_share_points,
+    aes(x = p_internal * 100, xend = p_internal * 100,
+        y = 0, yend = land_pct_achieved),
+    linetype = "dotted",
+    color = "gray60",
+    linewidth = 0.4
+  ) +
+  # Horizontal guide lines (production coverage achieved at each level)
+  geom_segment(
+    data = fig_c5_land_share_points,
+    aes(x = 0, xend = p_internal * 100,
+        y = land_pct_achieved, yend = land_pct_achieved),
+    linetype = "dotted",
+    color = "gray60",
+    linewidth = 0.4
+  ) +
+  # Production coverage along the internal adoption grid
+  geom_line(
+    data = fig_c5_land_share_curve,
+    aes(x = p_internal * 100, y = land_pct),
+    color = "#2E86AB",
+    linewidth = 1
+  ) +
+  # Production coverage levels
+  geom_point(
+    data = fig_c5_land_share_points,
+    aes(x = p_internal * 100, y = land_pct_achieved),
+    color = "#08306B",
+    size = 3,
+    shape = 16
+  ) +
+  geom_text(
+    data = fig_c5_land_share_points,
+    aes(x = p_internal * 100, y = land_pct_achieved,
+        label = point_label, hjust = label_hjust),
+    vjust = -0.6,
+    size = 3.3,
+    color = "#08306B",
+    fontface = "bold"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  labs(
+    title = "National Production Coverage by Internal Adoption Index",
+    subtitle = "Points mark the eleven production coverage levels (2022 seed, current subsidy)",
+    x = "Internal Adoption Index",
+    y = "National Production Coverage"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 12),
+    axis.title = element_text(color = "gray40")
+  )
+```
+
+::: {.callout-note}
+## Reading the Scenario Levels
+
+Every result reported by production coverage level, in this module and in the dashboard, refers to the share of maize-growing area planted with biofortified seed. The internal adoption index stays inside the calculation: it selects the adopting farmers and their conversion ratios, and it is not reported as a scenario level.
+:::
 
 
 ## Consumption Coverage Before Redistribution
 
-Before introducing inter-departmental redistribution, we analyse how departmental consumption coverage evolves across the national production coverage range (0–100%) based solely on local production. At each production coverage level `p`, the biofortified production realised in department `d` is the sum of `bio_i(p)` across all farmers `i` located in `d`. Coverage is the ratio between this realised production and the department's annual FSI consumption demand.
+Before introducing inter-departmental redistribution, we analyse how departmental consumption coverage evolves across the national production coverage range (0–100%) based solely on local production. At each production coverage level, the biofortified production realised in department `d` is the sum of `bio_i(p_internal)` across all farmers `i` located in `d`, evaluated at the internal adoption index associated with that level. Coverage is the ratio between this realised production and the department's annual FSI consumption demand.
 
 This analysis surfaces the departments that **saturate early** (reach 100% local coverage at low national production coverage) — these are the natural supply nodes for the redistribution model that follows.
 
 ```{r}
-#| label: fig-c1-saturation-curves
+#| label: fig-d1-saturation-curves
 #| fig-cap: "Departmental consumption coverage evolution by national production coverage level (before redistribution)"
 #| fig-alt: >
 #|   Line chart with national production coverage (percent) on the x-axis and
@@ -348,7 +523,7 @@ This analysis surfaces the departments that **saturate early** (reach 100% local
 
 # Saturation point: lowest production coverage level at which each
 # department reaches 100% consumption coverage, before redistribution
-df_saturation_points <- fig_c1_saturation_curves |>
+df_saturation_points <- fig_d1_saturation_curves |>
   filter(color_group != "Other") |>
   filter(coverage_pct >= 100) |>
   slice_min(penetration, by = departamento)
@@ -356,7 +531,7 @@ df_saturation_points <- fig_c1_saturation_curves |>
 ggplot() +
   # Non-saturating departments (background)
   geom_line(
-    data = filter(fig_c1_saturation_curves, color_group == "Other"),
+    data = filter(fig_d1_saturation_curves, color_group == "Other"),
     aes(x = penetration * 100, y = coverage_pct, group = departamento),
     color = "gray60",
     linewidth = 0.4,
@@ -364,7 +539,7 @@ ggplot() +
   ) +
   # Saturating departments (highlighted)
   geom_line(
-    data = filter(fig_c1_saturation_curves, color_group != "Other"),
+    data = filter(fig_d1_saturation_curves, color_group != "Other"),
     aes(x = penetration * 100, y = coverage_pct, color = departamento),
     linewidth = 1
   ) +
@@ -589,10 +764,10 @@ The gravity model uses real driving times rather than nominal adjacency, capture
 A direct consequence of the proportional allocation is that **total biofortified production is conserved through redistribution**: the volume leaving each donor equals the volume distributed across receivers. The check below evaluates this at full national production coverage, the most demanding case, where every department is simultaneously active in the redistribution network.
 
 ```{r}
-#| label: tbl-c3-conservation-check
+#| label: tbl-d3-conservation-check
 #| tbl-cap: "Production conservation validation at 100% production coverage"
 
-tbl_c3_conservation_check |>
+tbl_d3_conservation_check |>
   gt() |>
   tab_header(
     title = "Production Conservation Check",
@@ -624,10 +799,10 @@ With the gravity model applied, departmental consumption coverage at each produc
 The table below ranks departments by the national production coverage level at which each first reaches 100% consumption coverage after gravity redistribution. Departments that do not reach saturation even at 100% national production coverage are marked with "—", indicating insufficient inflow through the gravity network to close their local deficit.
 
 ```{r}
-#| label: tbl-c4-saturation-order
+#| label: tbl-d4-saturation-order
 #| tbl-cap: "Departmental saturation order by production coverage level (after gravity redistribution)"
 
-tbl_c4_saturation_order |>
+tbl_d4_saturation_order |>
   gt() |>
   tab_header(
     title = "Departmental Saturation Order",
@@ -656,7 +831,7 @@ tbl_c4_saturation_order |>
 The figure below shows the post-redistribution consumption coverage trajectory for every department across the full production coverage range. Compared with the pre-redistribution curves shown earlier, the gravity model raises the deficit departments as national production coverage grows, and caps the apparent surplus of donor departments at 100%, since their excess beyond local demand has been allocated outwards. At full production coverage the lowest departmental coverage rises to `r min_coverage_after`%, and the largest single gain is `r max_coverage_gain` percentage points in Guatemala, which moves from 7.3% to 66.5%.
 
 ```{r}
-#| label: fig-c5-saturation-after
+#| label: fig-d5-saturation-after
 #| fig-cap: "Departmental consumption coverage evolution by national production coverage level (after gravity redistribution)"
 #| fig-alt: >
 #|   Line chart with national production coverage (percent) on the x-axis and
@@ -672,17 +847,17 @@ The figure below shows the post-redistribution consumption coverage trajectory f
 #| warning: false
 
 # Saturation point: lowest production coverage level reaching 100%
-df_saturation_points_after <- fig_c5_saturation_after |>
+df_saturation_points_after <- fig_d5_saturation_after |>
   filter(coverage_pct >= 100) |>
   slice_min(penetration, by = departamento)
 
 # Build colour grouping: saturating vs non-saturating departments
-dept_saturates <- fig_c5_saturation_after |>
+dept_saturates <- fig_d5_saturation_after |>
   filter(penetration == 1) |>
   mutate(saturates = coverage_pct >= 100) |>
   select(departamento, saturates)
 
-df_plot <- fig_c5_saturation_after |>
+df_plot <- fig_d5_saturation_after |>
   left_join(dept_saturates, by = "departamento")
 
 ggplot() +
@@ -761,10 +936,10 @@ ggplot() +
 The final table consolidates the market-level outcomes at full national production coverage, comparing pre- and post-redistribution coverage to quantify the contribution of the gravity model to closing departmental deficits.
 
 ```{r}
-#| label: tbl-c6-market-metrics-after
+#| label: tbl-d6-market-metrics-after
 #| tbl-cap: "Market structure metrics — pre vs post gravity redistribution"
 
-tbl_c6_market_metrics_after |>
+tbl_d6_market_metrics_after |>
   gt() |>
   tab_header(
     title = "Market Structure: Pre vs Post Redistribution",
@@ -787,17 +962,18 @@ tbl_c6_market_metrics_after |>
 
 ### Baseline Framework
 
-The market baseline characterises the supply-demand structure of white maize across Guatemala's 22 departments and supplies three structural elements consumed downstream by the scenario precomputation step:
+The market baseline characterises the supply-demand structure of white maize across Guatemala's 22 departments and supplies four structural elements consumed downstream by the scenario precomputation step:
 
 1. **Per-department baseline metrics** — Farmer counts by segment, land area, FSI consumption demand, current production, and maximum biofortified production capacity.
-2. **Continuous adoption parameters** — The six scalar parameters (`floor_S/M/L`, `k_S/M/L`) calibrated in Module 2 that define the per-farmer conversion ratio at every national production coverage level.
-3. **Gravity redistribution infrastructure** — The 22×22 OSRM travel time matrix and the derived gravity weights that channel surplus from donor departments to deficit departments.
+2. **Continuous adoption parameters** — The six scalar parameters (`floor_S/M/L`, `k_S/M/L`) calibrated in Module 2 that define the per-farmer conversion ratio along the adoption ranking.
+3. **Production coverage scale** — The internal adoption index at which each of the eleven production coverage levels is evaluated, specific to each seed variant and subsidy regime.
+4. **Gravity redistribution infrastructure** — The 22×22 OSRM travel time matrix and the derived gravity weights that channel surplus from donor departments to deficit departments.
 
 ### Key Findings
 
 1. **Structural geographic heterogeneity** — Petén concentrates nearly a quarter of national maize production capacity, while several densely populated departments face structural deficits below 50% of FSI demand even at full local production. This heterogeneity makes inter-departmental redistribution a necessary component of any national consumption coverage target.
 
-2. **Continuous adoption smooths the saturation trajectories** — Per-farmer entry points and profile-specific sigmoid curves replace the prior binary adopt / not-adopt rule. Adoption progresses smoothly across national production coverage, with `r_i(0) = 0` and `r_i(1) = 1` as endpoint constraints by construction.
+2. **Production coverage is measured on maize land** — Farmers enter the adoption pool at their profile floor and convert the rest of their land progressively, so each intermediate production coverage level sits further along the adoption ranking than its nominal value: 50% of maize land corresponds to an internal adoption index of `r p_internal_50`. Every scenario level is evaluated at its associated index, with an association error of at most `r max_error_pp` percentage points.
 
 3. **Gravity redistribution narrows deficits without creating production** — The Anderson & van Wincoop formulation channels surplus to deficit departments along real driving times. At full production coverage the lowest departmental coverage rises from 7.3% to `r min_coverage_after`%, while the number of departments reaching 100% stays at `r n_dept_saturating`: the model closes the distance to saturation without adding saturating departments. Total production before and after redistribution matches to 0 qq.
 

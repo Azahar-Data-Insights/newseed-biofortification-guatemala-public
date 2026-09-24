@@ -1,6 +1,6 @@
 # Code Directory — Pipeline Orchestration
 
-This directory contains the analytical pipeline of the NewSeed
+This directory contains the analytical pipeline of the New Seed
 biofortification framework, organized into six sequential modules plus
 a data-provisioning module. Execution is managed by **orchestrators**:
 top-level `.R` files (prefix `_run_all_`) that render the module

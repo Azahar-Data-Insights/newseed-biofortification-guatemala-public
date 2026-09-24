@@ -1,6 +1,7 @@
 ---
 title: "Pre-computing Baseline and QPM Profiles"
 subtitle: "Module 4: Covariate Prediction"
+description-meta: "Pre-computing each child's baseline and QPM nutrient profile and its GAM stunting effect, so scenario simulation becomes lookup and aggregation."
 ---
 
 ## Overview

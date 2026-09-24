@@ -62,8 +62,8 @@ source(here("02_code", "00_functions", "00_functions.R"))
 #
 # Model determination is performed once on the s22 + sub00 economic impact
 # dataset, which serves as the baseline configuration of the framework: the
-# 2022 seed variant is the currently deployed generation, and sub00 is the
-# active commercial subsidy regime as of April 2026.
+# 2022 seed variant, and sub00, the active commercial subsidy regime as of
+# April 2026.
 #
 # The structural parameters identified through the determination process
 # (component weights, segment scheme, scoring heuristics, risk-aversion
@@ -91,7 +91,7 @@ SEGMENT_COLORS <- c(
 )
 
 # --- Coverage grid ----------------------------------------------------------
-# Anchors at 5%, 10%, 20%, 30% from NewSeed market composition matrix, plus
+# Anchors at 5%, 10%, 20%, 30% from New Seed market composition matrix, plus
 # the structural 100% population anchor. The grid resolution of 0.05 places
 # every anchor point on a grid point.
 p_grid <- seq(0, 1, by = 0.05)
@@ -124,11 +124,11 @@ ensure_output_dir(here("01_data", "02_processed", "web_resources"))
 
 # Overview
 
-This script determines the structural parameters of the Likely Adopters scoring and saturation model from the empirical anchors provided by NewSeed. The determination proceeds in two stages.
+This script determines the structural parameters of the Likely Adopters scoring and saturation model from the empirical anchors provided by New Seed. The determination proceeds in two stages.
 
 The first stage performs variable selection through three complementary filters: a correlation screen to remove redundant predictors, a near-zero variance screen to discard uninformative variables, and Boruta feature selection to identify variables significantly associated with adoption priority. The screening operates on the joined economic impact and segmentation datasets for the **`r seed_suffix` + `r subsidy_suffix`** baseline configuration.
 
-The second stage calibrates the scoring and saturation engine against five anchor points: four empirical anchors from the NewSeed market composition matrix at production coverage levels 5%, 10%, 20%, 30%, and one structural anchor at full coverage recovered from the population. The calibration is decomposed into independent sensitivity sweeps over four architectural components: scoring heuristics, segment-priority schemes, component weights, risk-aversion parameters, and continuous-adoption curve parameters. Each sweep produces a ranked table of mean absolute deviations (MAD) against the anchor set, from which the configuration minimising the global MAD is carried forward to the next stage.
+The second stage calibrates the scoring and saturation engine against five anchor points: four empirical anchors from the New Seed market composition matrix at production coverage levels 5%, 10%, 20%, 30%, and one structural anchor at full coverage recovered from the population. The calibration is decomposed into independent sensitivity sweeps over four architectural components: scoring heuristics, segment-priority schemes, component weights, risk-aversion parameters, and continuous-adoption curve parameters. Each sweep produces a ranked table of mean absolute deviations (MAD) against the anchor set, from which the configuration minimising the global MAD is carried forward to the next stage.
 
 The final consolidated configuration is exported as a single `.rds` artefact consumed by script 02_06 (Likely Adopters scoring engine).
 
@@ -465,7 +465,7 @@ This phase constructs an economically-grounded proxy outcome for adoption priori
 
 ## C1. Construct Adoption Priority Proxy
 
-The proxy reflects NewSeed's strategic targeting priorities based on segment positioning and economic benefit potential. The proxy is a domain-informed ranking that captures the logic of which farmers should be prioritised for outreach.
+The proxy reflects New Seed's strategic targeting priorities based on segment positioning and economic benefit potential. The proxy is a domain-informed ranking that captures the logic of which farmers should be prioritised for outreach.
 
 **Priority logic:**
 
@@ -772,9 +772,9 @@ rm(vars_relevant, cor_with_priority, boruta_result, boruta_stats,
 
 This phase prepares the empirical and structural anchors that define the calibration target, and defines the helper functions used across all sweeps in Phases E-G.
 
-## D1. NewSeed Market Composition Matrix (Empirical Anchors)
+## D1. New Seed Market Composition Matrix (Empirical Anchors)
 
-The NewSeed market composition matrix reports the per-segment share of purchasing farmers at four candidate production coverage levels (5%, 10%, 20%, 30%). The shares are interpreted as the expected segmental composition of the adopting cohort at each coverage level, conditional on the universe of all white-maize producers in Guatemala (the same ENCOVI 2023 universe used throughout the framework).
+The New Seed market composition matrix reports the per-segment share of purchasing farmers at four candidate production coverage levels (5%, 10%, 20%, 30%). The shares are interpreted as the expected segmental composition of the adopting cohort at each coverage level, conditional on the universe of all white-maize producers in Guatemala (the same ENCOVI 2023 universe used throughout the framework).
 
 The values at p = 5% and p = 10% correspond to the directly observed coverage range of the 2022-2025 commercial period. The values at p = 20% and p = 30% are extrapolated from the same observational base using Gompertz sigmoid fits per segment. The matrix satisfies two structural requirements: per-segment cohort size is monotonically non-decreasing across coverage levels, and no per-segment cohort size at any intermediate level exceeds the corresponding population total at full coverage.
 
@@ -782,11 +782,11 @@ The values at p = 5% and p = 10% correspond to the directly observed coverage ra
 #| label: d1-newseed-matrix
 
 # =============================================================================
-# D1. NewSeed Market Composition Matrix (Empirical Anchors)
+# D1. New Seed Market Composition Matrix (Empirical Anchors)
 # =============================================================================
 
 # Per-segment shares (%) of the purchasing-farmer cohort at four coverage
-# levels. Source: NewSeed ex-ante segment composition estimate (April 2026).
+# levels. Source: New Seed ex-ante segment composition estimate (April 2026).
 newseed_composition <- tibble(
   p_anchor = c(0.05, 0.10, 0.20, 0.30),
   pct_OPV  = c(17.8, 22.6, 41.6, 56.4),
@@ -806,7 +806,7 @@ The trajectory is interpreted as a trimmed-mean property of the adopting cohort 
 #| label: d2-newseed-land
 
 # =============================================================================
-# D2. NewSeed Land-Size Trajectory (Empirical Anchors)
+# D2. New Seed Land-Size Trajectory (Empirical Anchors)
 # =============================================================================
 
 newseed_land <- tibble(
@@ -857,7 +857,7 @@ land_overall_p100_mz <- trimmed_mean_p5p95(
 
 ## D4. Assemble Anchor Set and A-priori Weights
 
-The five anchors are assembled into two tibbles (per-segment counts and overall land). The four NewSeed anchors carry the empirical signal about adoption dynamics under the biofortification programme and are weighted with `w_emp = 1.0`. The population anchor at p = 1.0 represents the asymptotic composition of the universe; it is weighted at half the empirical anchors with `w_str = 0.5`, reflecting its auxiliary role.
+The five anchors are assembled into two tibbles (per-segment counts and overall land). The four New Seed anchors carry the empirical signal about adoption dynamics under the biofortification programme and are weighted with `w_emp = 1.0`. The population anchor at p = 1.0 represents the asymptotic composition of the universe; it is weighted at half the empirical anchors with `w_str = 0.5`, reflecting its auxiliary role.
 
 The MAD evaluation operates on relative deviations: each cell at each anchor contributes the absolute model-anchor error divided by the anchor value plus a small offset, so that all anchor cells contribute proportionally regardless of their absolute magnitude.
 
@@ -876,7 +876,7 @@ anchors_farmers <- bind_rows(
       N_Low  = pct_Low  / 100 * p_anchor * N_universe,
       N_Mid  = pct_Mid  / 100 * p_anchor * N_universe,
       N_High = pct_High / 100 * p_anchor * N_universe,
-      role   = "Empirical (NewSeed)"
+      role   = "Empirical (New Seed)"
     ),
   tibble(
     p_anchor = 1.0,
@@ -897,7 +897,7 @@ anchors_farmers <- bind_rows(
 anchors_land <- bind_rows(
   newseed_land |>
     select(p_anchor, land_overall_mz) |>
-    mutate(role = "Empirical (NewSeed)"),
+    mutate(role = "Empirical (New Seed)"),
   tibble(
     p_anchor        = 1.00,
     land_overall_mz = land_overall_p100_mz,
@@ -927,7 +927,7 @@ anchors_farmers |>
   gt() |>
   tab_header(
     title    = "Calibration anchors \u2014 per-segment absolute farmer counts",
-    subtitle = "Five anchors: four empirical (NewSeed market composition) plus one structural (population)"
+    subtitle = "Five anchors: four empirical (New Seed market composition) plus one structural (population)"
   ) |>
   cols_label(
     role     = "Role",
@@ -3149,7 +3149,7 @@ tbl_h2_integrated_mad |>
 
 ## H3. Trajectory Visualization Against Anchors
 
-The integrated model's trajectory is visualised against the five calibration anchors: four empirical points from the NewSeed market composition matrix (circles) and one structural point recovered from the population at full coverage (triangle). The four segment trajectories appear as solid lines on a percentage-share basis.
+The integrated model's trajectory is visualised against the five calibration anchors: four empirical points from the New Seed market composition matrix (circles) and one structural point recovered from the population at full coverage (triangle). The four segment trajectories appear as solid lines on a percentage-share basis.
 
 ```{r}
 #| label: fig-h3-trajectory-vs-anchors
@@ -3199,7 +3199,7 @@ ggplot(traj_integrated_long, aes(x = p * 100, y = pct, color = segment)) +
                  shape = role),
              size = 3, fill = "white", stroke = 1.5) +
   scale_color_manual(values = SEGMENT_COLORS) +
-  scale_shape_manual(values = c("Empirical (NewSeed)"      = 21,
+  scale_shape_manual(values = c("Empirical (New Seed)"      = 21,
                                 "Structural (population)"  = 24)) +
   labs(
     title    = "Integrated model: cohort composition trajectory",
@@ -3493,7 +3493,7 @@ All stochastic operations in this script (Boruta feature selection in Phase C, a
 
 ## Calibration Anchors
 
-The five anchor points combine four empirical observations from the NewSeed market composition matrix at production coverage levels 5%, 10%, 20%, 30%, and one structural anchor at full coverage recovered from the segmented dataset. The four NewSeed anchors carry weight `w_p = 1.0`; the structural anchor carries auxiliary weight `w_p = 0.5`. The MAD evaluation operates on relative deviations: each cell error is normalised by the corresponding anchor value plus a small offset, so that all anchor cells contribute proportionally regardless of their absolute magnitude.
+The five anchor points combine four empirical observations from the New Seed market composition matrix at production coverage levels 5%, 10%, 20%, 30%, and one structural anchor at full coverage recovered from the segmented dataset. The four New Seed anchors carry weight `w_p = 1.0`; the structural anchor carries auxiliary weight `w_p = 0.5`. The MAD evaluation operates on relative deviations: each cell error is normalised by the corresponding anchor value plus a small offset, so that all anchor cells contribute proportionally regardless of their absolute magnitude.
 
 ## Theoretical Framework
 

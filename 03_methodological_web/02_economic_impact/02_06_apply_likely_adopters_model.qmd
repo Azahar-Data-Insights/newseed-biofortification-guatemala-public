@@ -1,6 +1,7 @@
 ---
 title: "Likely Adopters Model Application"
 subtitle: "Module 2: Economic Impact"
+description-meta: "Applying the calibrated adoption score per farmer: composite score, logistic risk-aversion penalty and continuous conversion curves by profile."
 format:
   html:
     toc-depth: 4
@@ -578,4 +579,4 @@ The calibrated model configuration is structurally invariant across the nine see
 
 ### What the Diagnostics Show
 
-The diagnostics in the final section report the applied model against its expected qualitative behaviour. The base score ordering recovers the calibrated segment scheme, Low > High > Mid > OPV/Criollo. The risk penalty is highest in the High segment, at a mean of 62.0 against 40.0 in Low, which matches the structural reluctance the driver is built to represent. The component score correlations stay modest enough to keep the five components non-redundant. The cohort profile at five production coverage points reproduces the anchor pattern of the Semilla Nueva market composition matrix used during calibration: at 10% national coverage the cohort is drawn mostly from the Low and High segments, and the non-hybrid segment enters later, reaching 87.1% of biofortified land only at full coverage.
+The diagnostics in the final section report the applied model against its expected qualitative behaviour. The base score ordering recovers the calibrated segment scheme, Low > High > Mid > OPV/Criollo. The risk penalty is highest in the High segment, at a mean of 62.0 against 40.0 in Low, which matches the structural reluctance the driver is built to represent. The component score correlations stay modest enough to keep the five components non-redundant. The cohort profile at five production coverage points reproduces the anchor pattern of the New Seed market composition matrix used during calibration: at 10% national coverage the cohort is drawn mostly from the Low and High segments, and the non-hybrid segment enters later, reaching 87.1% of biofortified land only at full coverage.

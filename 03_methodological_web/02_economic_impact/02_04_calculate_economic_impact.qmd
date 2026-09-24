@@ -1,6 +1,7 @@
 ---
 title: "Economic Impact Calculation"
 subtitle: "Module 2: Economic Impact"
+description-meta: "Counterfactual estimate of net income change from adopting biofortified seed by farmer segment, decomposing yield, price and subsidy contributions."
 ---
 
 ## Why Calculate Economic Impact?
@@ -14,7 +15,7 @@ The ultimate goal of farmer segmentation is to estimate the economic consequence
 
 This module calculates individual farmer level economic impacts using a counterfactual approach: comparing each farmer's projected situation under biofortified adoption against their current baseline.
 
-The figures presented here correspond to the **baseline scenario** combining the **2022 biofortified seed variety** (currently deployed in the field) with the **current subsidy regime** as of April 2026. Alternative seed variants and subsidy regimes are evaluated in the Shiny dashboard.
+The figures presented here correspond to the **baseline scenario** combining the **2022 biofortified seed variety** with the **current subsidy regime** as of April 2026. Alternative seed variants and subsidy regimes are evaluated in the Shiny dashboard.
 
 ```{r}
 #| label: setup
@@ -123,7 +124,12 @@ tbl_e3_subsidy_decomposition <- import(
   here("..", "01_data", "02_processed", "web_resources",
        "02_04_s22_sub00_tbl_e3_subsidy_decomposition.rds"),
   trust = TRUE
-)
+) |>
+  # The brand is spelled New Seed in English text. The row labels come
+  # from the pipeline, which has also written it as one word, so they are
+  # normalised on import: the table and the rule that sets its bold rows then
+  # read a single spelling, whichever one the resource carries.
+  mutate(metric_label = str_replace(metric_label, "NewSeed", "New Seed"))
 
 tbl_f2_impact_distribution <- import(
   here("..", "01_data", "02_processed", "web_resources",
@@ -252,7 +258,7 @@ tbl_a2_economic_parameters |>
     locations = cells_body(columns = seed_cost_change, rows = seed_cost_change > 0)
   ) |>
   tab_source_note(
-    source_note = md("**Source:** Semilla Nueva refined seed prices and yield data. Green = cost reduction; Red = cost increase.")
+    source_note = md("**Source:** New Seed refined seed prices and yield data. Green = cost reduction; Red = cost increase.")
   ) |>
   tab_options(
     table.font.size = px(12),
@@ -321,7 +327,7 @@ tbl_a5_subsidy_reference |>
     value = "Value"
   ) |>
   tab_source_note(
-    source_note = md("**Source:** Semilla Nueva refined subsidy values, April 2026.")
+    source_note = md("**Source:** New Seed refined subsidy values, April 2026.")
   ) |>
   tab_options(
     table.font.size = px(12),
@@ -473,7 +479,7 @@ tbl_c1_current_economics_segment |>
     locations = cells_body(columns = income_net, rows = income_net <= 0)
   ) |>
   tab_source_note(
-    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Seed costs are modeled by segment from Semilla Nueva refined prices (Q/mz × maize area) rather than taken from reported household seed expenditure (`exp_seeds`).")
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Seed costs are modeled by segment from New Seed refined prices (Q/mz × maize area) rather than taken from reported household seed expenditure (`exp_seeds`).")
   ) |>
   tab_footnote(
     footnote = "Self-consumption is valued using the household-specific market-position price: sale price for net sellers, purchase price for net buyers, and the shadow price for autarkic households.",
@@ -635,7 +641,7 @@ tbl_d2_production_changes |>
     locations = cells_body(columns = cost_seed_change, rows = cost_seed_change > 0)
   ) |>
   tab_source_note(
-    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Yield factors from Semilla Nueva yield data and market analysis; seed prices from refined seed and subsidy values.")
+    source_note = md("**Source:** ENCOVI 2023 (MAGA-calibrated). Yield factors from New Seed yield data and market analysis; seed prices from refined seed and subsidy values.")
   ) |>
   tab_options(
     table.font.size = px(12),
@@ -779,14 +785,14 @@ Quantify the monetary value of the seed subsidy received by each farmer under th
 |---|---|
 | `subsidy_amount_absolute` | Absolute monetary value of the subsidy received, computed against the unsubsidized commercial reference price (`r bio_cost_no_subsidy_per_mz` Q/mz) and scaled by area planted. |
 | `subsidy_reduction_cost` | Additional out-of-pocket cost the farmer absorbs when a subsidy regime reduces the subsidy below the current regime. Zero under the current regime by construction. |
-| `newseed_subsidy` | Semilla Nueva's per-area direct financial commitment under the active regime, scaled by area planted. |
+| `newseed_subsidy` | New Seed's per-area direct financial commitment under the active regime, scaled by area planted. |
 | `producer_absorption` | Share of the absolute subsidy value covered by the local seed producer (intermediary) via improved producibility. Zero under the current regime by construction. |
-| `newseed_savings_vs_current` | Reduction in Semilla Nueva's per-farmer financial commitment when moving from the current regime to an alternative regime. Zero under the current regime by construction. |
+| `newseed_savings_vs_current` | Reduction in New Seed's per-farmer financial commitment when moving from the current regime to an alternative regime. Zero under the current regime by construction. |
 
 Two identities hold by construction:
 
-1. **Absolute subsidy decomposition** — `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total per-farmer subsidy value is jointly funded by Semilla Nueva (direct subsidy) and the local seed producer (improved producibility absorption). The farmer's out-of-pocket cost is **not** part of the subsidy by definition.
-2. **Reallocation of the Semilla Nueva saving** — `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. When Semilla Nueva reduces its commitment, the freed amount is reallocated between the local producer (who absorbs part via improved producibility) and the farmer (who pays the rest out of pocket).
+1. **Absolute subsidy decomposition** — `subsidy_amount_absolute = newseed_subsidy + producer_absorption`. The total per-farmer subsidy value is jointly funded by New Seed (direct subsidy) and the local seed producer (improved producibility absorption). The farmer's out-of-pocket cost is **not** part of the subsidy by definition.
+2. **Reallocation of the New Seed saving** — `newseed_savings_vs_current = producer_absorption + subsidy_reduction_cost`. When New Seed reduces its commitment, the freed amount is reallocated between the local producer (who absorbs part via improved producibility) and the farmer (who pays the rest out of pocket).
 
 ### Subsidy Benefit by Segment
 
@@ -929,11 +935,11 @@ tbl_e3_subsidy_decomposition |>
   ) |>
   tab_style(
     style = cell_text(weight = "bold"),
-    locations = cells_body(rows = str_detect(metric_label, "^Total|^Semilla Nueva Savings|^Farmer extra"))
+    locations = cells_body(rows = str_detect(metric_label, "^Total|^New Seed Savings|^Farmer extra"))
   ) |>
   tab_source_note(
     source_note = md(
-      "**Total Subsidy Value** is jointly funded by Semilla Nueva (direct subsidy) and the local seed producer (improved producibility absorption); both shares sum to 100%. **Farmer extra cost** and **Semilla Nueva Savings vs Current Regime** are reported separately: the farmer's out-of-pocket cost is not part of the subsidy by definition, and Semilla Nueva's savings equal the producer absorption plus the farmer extra cost. All three are zero under the current regime by construction."
+      "**Total Subsidy Value** is jointly funded by New Seed (direct subsidy) and the local seed producer (improved producibility absorption); both shares sum to 100%. **Farmer extra cost** and **New Seed Savings vs Current Regime** are reported separately: the farmer's out-of-pocket cost is not part of the subsidy by definition, and New Seed's savings equal the producer absorption plus the farmer extra cost. All three are zero under the current regime by construction."
     )
   ) |>
   tab_options(
@@ -1251,7 +1257,7 @@ The economic impact model compares, for each farmer, the **current situation** (
 
 3. **Market position matters** — The three positions are close to evenly split, at 32.6% net sellers, 32.0% net buyers and 35.5% autarkic. Pricing self-consumption at the sale, purchase or shadow price according to position is therefore material to the aggregate, and a uniform price would flatten it.
 
-4. **Subsidy decomposition** — Under the current regime the subsidy is funded entirely by Semilla Nueva, at `r bio_cost_no_subsidy_per_mz - bio_cost_current_regime_per_mz` Q/mz of direct commitment, with no producer subsidy absorption and no extra cost to the farmer. Alternative regimes move that burden between the three actors.
+4. **Subsidy decomposition** — Under the current regime the subsidy is funded entirely by New Seed, at `r bio_cost_no_subsidy_per_mz - bio_cost_current_regime_per_mz` Q/mz of direct commitment, with no producer subsidy absorption and no extra cost to the farmer. Alternative regimes move that burden between the three actors.
 
 ### Limitations
 

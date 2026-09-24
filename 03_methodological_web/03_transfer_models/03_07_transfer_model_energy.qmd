@@ -1,6 +1,7 @@
 ---
 title: "Transfer Model: Energy Intake"
 subtitle: "Module 3: Transfer Models"
+description-meta: "Survey-weighted gamma regression for child energy intake, which conditions whether protein and micronutrients can be used for linear growth."
 ---
 
 ## Why Model Energy?

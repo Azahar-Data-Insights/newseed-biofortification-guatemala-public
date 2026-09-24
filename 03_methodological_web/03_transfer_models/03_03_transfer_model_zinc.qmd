@@ -1,6 +1,7 @@
 ---
 title: "Transfer Model: Zinc Intake"
 subtitle: "Module 3: Transfer Models"
+description-meta: "Survey-weighted gamma regression predicting child zinc intake from maize and non-maize sources separately, gamma selected over lognormal by fit."
 ---
 
 ## Why Model Zinc?

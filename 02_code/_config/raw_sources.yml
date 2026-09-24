@@ -68,7 +68,7 @@ encovi_2023:
       description: "Individual-level dataset (INE re-upload 2025-02-18, adds Factor2, renames AÑO→ANO)"
 
 # ---------------------------------------------------------------------
-# SIVESNU - Nutritional Surveillance System
+# SIVESNU - Health and Nutrition Epidemiological Surveillance System
 # Publisher: SESAN / INCAP, accessed via SIINSAN portal
 # License:   Open access (Guatemalan government data portal)
 # Notes:     Single ZIP archive contains years 2013, 2015, 2016, 2017, 2018.

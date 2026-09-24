@@ -15,7 +15,8 @@
 # Prerequisites:
 #   - 02_05 output: 02_05_likely_adopters_model_config.rds (continuous adoption parameters)
 #   - 02_06 outputs: farmer adoption scores per (seed, subsidy) combination
-#   - 06_01 outputs: market baseline and saturation scenarios per (seed, subsidy)
+#   - 06_01 outputs: market baseline, saturation scenarios, and land share
+#     lookup per (seed, subsidy)
 #   - For pathway = "pco": 04_08_baseline_qpm_*.parquet (synthetic population)
 #   - For pathway = "pma": 05_06_encovi_children_priority.parquet
 #
@@ -333,6 +334,16 @@ run_pipeline <- function() {
     if (!file.exists(saturation_path)) {
       missing_inputs <- c(missing_inputs, basename(saturation_path))
     }
+
+    # 06_01 land share lookup
+    lookup_path <- file.path(
+      scenario_dir,
+      paste0("06_01_", ss$seed_suffix, "_", ss$subsidy_suffix,
+             "_penetration_lookup.parquet")
+    )
+    if (!file.exists(lookup_path)) {
+      missing_inputs <- c(missing_inputs, basename(lookup_path))
+    }
   }
 
   # 3. Children population parquets (pathway-specific)
@@ -429,12 +440,14 @@ run_pipeline <- function() {
 
   mirai::everywhere(
     {
-      suppressPackageStartupMessages({
-        library(quarto)
-        library(arrow)
-        library(here)
-        library(tibble)
-      })
+      suppressPackageStartupMessages(
+        pacman::p_load(
+          quarto,         # Parametrized rendering
+          arrow,          # Parquet read for post-render validation
+          here,           # Robust file paths
+          tibble          # Log rows returned by the worker
+        )
+      )
       if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
         RhpcBLASctl::blas_set_num_threads(1)
         RhpcBLASctl::omp_set_num_threads(1)
