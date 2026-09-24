@@ -463,7 +463,9 @@ El modelo se construye sobre estas fuentes de datos.
   title     = {{Biofortified Maize Impact Assessment Framework
                 for Guatemala}},
   year      = {2026},
+  publisher = {Zenodo},
   version   = {4.4.0},
+  doi       = {10.5281/zenodo.22940768},
   license   = {AGPL-3.0},
   url       = {https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public}
 }

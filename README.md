@@ -1,6 +1,7 @@
 # Biofortified Maize Impact Assessment Framework for Guatemala
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22940768.svg)](https://doi.org/10.5281/zenodo.22940768)
 
 An analytical framework for evaluating the nutritional and economic impact of biofortified maize adoption on child stunting in Guatemala. Developed by [Azahar Data Insights](https://azahardata.com/) for [New Seed](https://www.semillanueva.org/), with nutritional methodology advisory from [FINUT](https://www.finut.org/).
 
@@ -196,7 +197,9 @@ If you use this framework in your research, please cite it using the metadata in
   title     = {{Biofortified Maize Impact Assessment Framework
                 for Guatemala}},
   year      = {2026},
+  publisher = {Zenodo},
   version   = {4.4.0},
+  doi       = {10.5281/zenodo.22940768},
   license   = {AGPL-3.0},
   url       = {https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public}
 }

@@ -25,6 +25,7 @@ type: software
 license: AGPL-3.0-only
 version: 4.4.0
 date-released: 2026-09-24
+doi: 10.5281/zenodo.22940768
 repository-code: "https://github.com/Azahar-Data-Insights/newseed-biofortification-guatemala-public"
 keywords:
   - biofortification
